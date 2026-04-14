@@ -104,12 +104,12 @@ def log_fold_summary(
         len(train_patch_records),
         len(val_patch_records),
     )
-    logger.info(
-        "Fold %s split | train_sources=%s | val_sources=%s",
-        fold_index + 1,
-        ", ".join(record.source_id for record in train_originals),
-        ", ".join(record.source_id for record in val_originals),
-    )
+    # logger.info(
+    #     "Fold %s split | train_sources=%s | val_sources=%s",
+    #     fold_index + 1,
+    #     ", ".join(record.source_id for record in train_originals),
+    #     ", ".join(record.source_id for record in val_originals),
+    # )
 
 
 def main() -> None:
