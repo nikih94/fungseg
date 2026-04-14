@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local tooling
+.codex
+.DS_Store
+
+# Training and inference artifacts
+runs/
+outputs/
+checkpoints/
+inference-output/
+
+# Data
+data/
+
+# Logs and notebooks
+*.log
+.ipynb_checkpoints/
+

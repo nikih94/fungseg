@@ -1,0 +1,86 @@
+project:
+  name: fungi_segmentation
+
+paths:
+  images_dir: data/images
+  masks_dir: data/masks
+  runs_dir: runs
+  outputs_dir: outputs
+
+data:
+  image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+  patch_size: 512
+  overlap: 128
+  stride: 384
+  filter_empty_patches: true
+  mask_threshold: 127
+  min_foreground_pixels: 1
+  num_workers: 4
+  pin_memory: true
+  batch_size: 4
+  image_size: null
+
+augmentations:
+  normalize: # do not touch this
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  train: # this can be edited
+    horizontal_flip_p: 0.8
+    vertical_flip_p: 0.6
+    random_rotate_90_p: 0.8
+    affine:
+      translate_x: [-0.05, 0.05]
+      translate_y: [-0.05, 0.05]
+      scale: [0.8, 1.2]
+      rotate: [-30, 30]
+      p: 0.7
+    random_brightness_contrast_p: 0.3
+    gauss_noise_p: 0.3
+
+cv:
+  n_splits: 5
+  shuffle_groups: true
+  random_state: 42
+
+model:
+  name: unetplusplus_resnet50
+  in_channels: 3
+  num_classes: 1
+  encoder_name: resnet50
+  encoder_weights: imagenet
+  decoder_channels: [512, 256, 128, 64, 32]
+
+loss:
+  name: bce_dice
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+optimizer:
+  name: adamw
+  lr: 0.00015
+  weight_decay: 0.00005
+
+scheduler:
+  name: reduce_on_plateau
+  mode: max
+  factor: 0.5
+  patience: 8
+  min_lr: 1.0e-6
+  monitor: val_dice
+
+
+
+train:
+  epochs: 50
+  mixed_precision: true
+  grad_clip: 1.0
+  monitor: val_dice
+  monitor_mode: max
+  threshold: 0.5
+  seed: 42
+  device: auto
+  use_tqdm: true
+
+inference:
+  threshold: 0.5
+  save_probabilities: false

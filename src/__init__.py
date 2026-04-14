@@ -1,0 +1,2 @@
+"""Fungi segmentation training scaffold."""
+
