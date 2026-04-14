@@ -22,7 +22,7 @@ checkpoints/
 inference-output/
 
 # Data
-data/
+/data/
 
 # Logs and notebooks
 *.log
