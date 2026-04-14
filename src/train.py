@@ -38,14 +38,27 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def make_loader(dataset, batch_size: int, num_workers: int, pin_memory: bool, shuffle: bool) -> DataLoader:
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
+def make_loader(
+    dataset,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    shuffle: bool,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+) -> DataLoader:
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**loader_kwargs)
 
 
 def create_run_dir(runs_root: Path, project_name: str) -> Path:
@@ -83,6 +96,13 @@ def log_run_summary(logger, config: dict, device: torch.device, num_images: int)
         data_cfg["patch_size"],
         data_cfg["stride"],
         data_cfg["filter_empty_patches"],
+    )
+    logger.info(
+        "Loader: num_workers=%s | persistent_workers=%s | prefetch_factor=%s | pin_memory=%s",
+        data_cfg["num_workers"],
+        data_cfg.get("persistent_workers", False),
+        data_cfg.get("prefetch_factor"),
+        data_cfg["pin_memory"],
     )
 
 
@@ -212,6 +232,12 @@ def main() -> None:
             num_workers=int(data_cfg["num_workers"]),
             pin_memory=bool(data_cfg["pin_memory"]),
             shuffle=True,
+            persistent_workers=bool(data_cfg.get("persistent_workers", False)),
+            prefetch_factor=(
+                int(data_cfg["prefetch_factor"])
+                if data_cfg.get("prefetch_factor") is not None
+                else None
+            ),
         )
         val_loader = make_loader(
             val_dataset,
@@ -219,6 +245,12 @@ def main() -> None:
             num_workers=int(data_cfg["num_workers"]),
             pin_memory=bool(data_cfg["pin_memory"]),
             shuffle=False,
+            persistent_workers=bool(data_cfg.get("persistent_workers", False)),
+            prefetch_factor=(
+                int(data_cfg["prefetch_factor"])
+                if data_cfg.get("prefetch_factor") is not None
+                else None
+            ),
         )
 
         model = build_model(config["model"]).to(device)

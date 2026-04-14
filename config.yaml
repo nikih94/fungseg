@@ -15,7 +15,9 @@ data:
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 1
-  num_workers: 4
+  num_workers: 24
+  persistent_workers: true
+  prefetch_factor: 8
   pin_memory: true
   batch_size: 4
   image_size: null
