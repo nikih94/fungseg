@@ -11,7 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.data.dataset import SegmentationPatchDataset, get_train_transforms, get_val_transforms
 from src.data.discovery import discover_image_mask_pairs
-from src.data.folds import make_grouped_kfold_splits
+from src.data.folds import make_grouped_kfold_splits, make_manual_train_val_split
 from src.engine.trainer import Trainer
 from src.losses.factory import build_loss
 from src.models.factory import build_model
@@ -24,10 +24,43 @@ from src.utils.logging import setup_logger
 from src.utils.seed import set_seed
 
 
+def _collect_optional_metric(values: list[float | None]) -> tuple[float | None, float | None]:
+    valid_values = [float(value) for value in values if value is not None]
+    if not valid_values:
+        return None, None
+    mean_value = statistics.mean(valid_values)
+    std_value = statistics.pstdev(valid_values) if len(valid_values) > 1 else 0.0
+    return mean_value, std_value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train fungi segmentation with grouped cross-validation.")
     parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
     return parser.parse_args()
+
+
+def build_splits(config: dict, original_records: list) -> tuple[list[tuple[list[str], list[str]]], str]:
+    source_ids = [record.source_id for record in original_records]
+    split_cfg = config.get("split", {})
+    split_mode = str(split_cfg.get("mode", "train_val")).lower()
+
+    if split_mode == "kfold":
+        splits = make_grouped_kfold_splits(
+            source_ids,
+            n_splits=int(config["cv"]["n_splits"]),
+            shuffle_groups=bool(config["cv"]["shuffle_groups"]),
+            random_state=int(config["cv"]["random_state"]),
+        )
+        return splits, split_mode
+
+    if split_mode == "train_val":
+        splits = make_manual_train_val_split(
+            source_ids,
+            val_source_ids=split_cfg.get("val_source_ids", []),
+        )
+        return splits, split_mode
+
+    raise ValueError(f"Unsupported split mode: {split_mode}. Expected 'train_val' or 'kfold'.")
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -72,7 +105,7 @@ def create_run_dir(runs_root: Path, project_name: str) -> Path:
     return run_dir
 
 
-def log_run_summary(logger, config: dict, device: torch.device, num_images: int) -> None:
+def log_run_summary(logger, config: dict, device: torch.device, num_images: int, split_mode: str) -> None:
     model_cfg = config["model"]
     train_cfg = config["train"]
     data_cfg = config["data"]
@@ -90,9 +123,9 @@ def log_run_summary(logger, config: dict, device: torch.device, num_images: int)
         device,
     )
     logger.info(
-        "Dataset: %s images | folds=%s | patch_size=%s | stride=%s | empty_patch_filter=%s",
+        "Dataset: %s images | split_mode=%s | patch_size=%s | stride=%s | empty_patch_filter=%s",
         num_images,
-        config["cv"]["n_splits"],
+        split_mode,
         data_cfg["patch_size"],
         data_cfg["stride"],
         data_cfg["filter_empty_patches"],
@@ -110,13 +143,16 @@ def log_fold_summary(
     logger,
     fold_index: int,
     total_folds: int,
+    split_mode: str,
     train_originals: list,
     val_originals: list,
     train_patch_records: list,
     val_patch_records: list,
 ) -> None:
+    split_label = "Split" if split_mode == "train_val" else "Fold"
     logger.info(
-        "Fold %s/%s | train_images=%s | val_images=%s | train_patches=%s | val_patches=%s",
+        "%s %s/%s | train_images=%s | val_images=%s | train_patches=%s | val_patches=%s",
+        split_label,
         fold_index + 1,
         total_folds,
         len(train_originals),
@@ -161,13 +197,8 @@ def main() -> None:
         logger.warning("Found %s masks without matching images.", len(diagnostics["missing_images"]))
 
     original_records = build_original_image_records(pairs)
-    log_run_summary(logger, config, device, num_images=len(original_records))
-    splits = make_grouped_kfold_splits(
-        [record.source_id for record in original_records],
-        n_splits=int(config["cv"]["n_splits"]),
-        shuffle_groups=bool(config["cv"]["shuffle_groups"]),
-        random_state=int(config["cv"]["random_state"]),
-    )
+    splits, split_mode = build_splits(config, original_records)
+    log_run_summary(logger, config, device, num_images=len(original_records), split_mode=split_mode)
 
     fold_results = []
     all_epoch_rows: list[dict[str, float]] = []
@@ -195,7 +226,7 @@ def main() -> None:
             val_originals,
             patch_size=int(data_cfg["patch_size"]),
             stride=int(data_cfg["stride"]),
-            filter_empty_patches=False,
+            filter_empty_patches=bool(data_cfg["filter_empty_patches"]),
             mask_threshold=int(data_cfg["mask_threshold"]),
             min_foreground_pixels=int(data_cfg["min_foreground_pixels"]),
         )
@@ -203,6 +234,7 @@ def main() -> None:
             logger=logger,
             fold_index=fold_index,
             total_folds=total_folds,
+            split_mode=split_mode,
             train_originals=train_originals,
             val_originals=val_originals,
             train_patch_records=train_patch_records,
@@ -271,6 +303,9 @@ def main() -> None:
             },
             logger=logger,
             fold_dir=Path(fold_dir),
+            data_config=data_cfg,
+            augmentations_config=augmentations_cfg,
+            val_original_records=val_originals,
             tensorboard_writer=writer,
             fold_index=fold_index,
         )
@@ -285,16 +320,31 @@ def main() -> None:
             for row in fold_result["history"]
         )
 
-    dice_values = [float(item["val_dice"]) for item in fold_results]
-    iou_values = [float(item["val_iou"]) for item in fold_results]
+    val_dice_per_patch_values = [float(item["val_dice_per_patch"]) for item in fold_results]
+    val_iou_per_patch_values = [float(item["val_iou_per_patch"]) for item in fold_results]
+    val_dice_per_image_mean, val_dice_per_image_std = _collect_optional_metric(
+        [item.get("val_dice_per_image") for item in fold_results]
+    )
+    val_iou_per_image_mean, val_iou_per_image_std = _collect_optional_metric(
+        [item.get("val_iou_per_image") for item in fold_results]
+    )
     summary = {
         "project": project_name,
         "run_dir": str(run_dir),
+        "split_mode": split_mode,
         "folds": fold_results,
-        "mean_dice": statistics.mean(dice_values),
-        "std_dice": statistics.pstdev(dice_values) if len(dice_values) > 1 else 0.0,
-        "mean_iou": statistics.mean(iou_values),
-        "std_iou": statistics.pstdev(iou_values) if len(iou_values) > 1 else 0.0,
+        "mean_dice_per_patch": statistics.mean(val_dice_per_patch_values),
+        "std_dice_per_patch": (
+            statistics.pstdev(val_dice_per_patch_values) if len(val_dice_per_patch_values) > 1 else 0.0
+        ),
+        "mean_iou_per_patch": statistics.mean(val_iou_per_patch_values),
+        "std_iou_per_patch": (
+            statistics.pstdev(val_iou_per_patch_values) if len(val_iou_per_patch_values) > 1 else 0.0
+        ),
+        "mean_dice_per_image": val_dice_per_image_mean,
+        "std_dice_per_image": val_dice_per_image_std,
+        "mean_iou_per_image": val_iou_per_image_mean,
+        "std_iou_per_image": val_iou_per_image_std,
         "num_original_images": len(original_records),
     }
     save_json(run_dir / "cv_summary.json", summary)

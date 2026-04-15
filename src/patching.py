@@ -34,7 +34,7 @@ def build_original_image_records(pairs: Iterable[tuple[Path, Path]]) -> list[Ori
             width, height = image.size
         records.append(
             OriginalImageRecord(
-                source_id=image_path.stem,
+                source_id=image_path.name,
                 image_path=image_path,
                 mask_path=mask_path,
                 width=width,

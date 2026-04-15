@@ -1,4 +1,4 @@
-Build a clean, modular PyTorch project for binary semantic segmentation of fungi in RGB microscopy/macroscopy images.
+A modular PyTorch project for binary semantic segmentation of fungi in RGB microscopy/macroscopy images.
 
 Goal
 - Train binary segmentation models on RGB images with associated binary masks.
@@ -432,16 +432,3 @@ Implementation notes
 - Avoid hardcoding fold logic in the dataset
 - Avoid coupling patch extraction to one specific architecture
 
-Deliverables
-- Full project scaffold with working code
-- Clear README with:
-  - installation
-  - training command
-  - inference command
-  - config explanation
-- `requirements.txt`
-- A minimal example command such as:
-  - `python -m src.train --config config.yaml`
-  - `python -m src.inference --config config.yaml --checkpoint path/to/best.pt --input path/to/images`
-
-Please implement the project in a clean, research-friendly style suitable for later experimentation with custom segmentation models.
