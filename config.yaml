@@ -9,9 +9,9 @@ paths:
 
 data:
   image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
-  patch_size: 512
-  overlap: 128
-  stride: 384
+  patch_size: 256
+  overlap: 64
+  stride: 192
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 128
