@@ -15,7 +15,7 @@ data:
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 128
-  num_workers: 16
+  num_workers: 22
   persistent_workers: true
   prefetch_factor: 8
   pin_memory: true
@@ -84,7 +84,7 @@ train:
   monitor_mode: max
   threshold: 0.5
   enable_per_image_validation: true
-  per_image_validation_interval: 1
+  per_image_validation_interval: 10
   seed: 42
   device: auto
   use_tqdm: true
