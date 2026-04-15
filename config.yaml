@@ -10,8 +10,8 @@ paths:
 data:
   image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
   patch_size: 256
-  overlap: 64
-  stride: 192
+  overlap: 128
+  stride: 128
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 128
@@ -55,6 +55,7 @@ model:
   encoder_name: resnet34
   encoder_weights: imagenet
   decoder_channels: [512, 256, 128, 64, 32]
+  decoder_attention_type: scse # set to scse to enable SMP scSE attention in the decoder
 
 loss:
   name: bce_dice

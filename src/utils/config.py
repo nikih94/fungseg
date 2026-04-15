@@ -62,6 +62,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "encoder_name": "resnet18",
         "encoder_weights": "imagenet",
         "decoder_channels": [512, 256, 128, 64, 32],
+        "decoder_attention_type": None,
     },
     "loss": {"name": "bce_dice", "bce_weight": 0.5, "dice_weight": 0.5},
     "optimizer": {"name": "adamw", "lr": 1e-4, "weight_decay": 1e-4},

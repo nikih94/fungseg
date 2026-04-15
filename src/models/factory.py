@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 
+def _normalize_decoder_attention_type(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
 def build_model(config: dict[str, Any]):
     model_name = config["name"].lower()
     encoder_name = config.get("encoder_name", "resnet18")
@@ -24,6 +31,9 @@ def build_model(config: dict[str, Any]):
             in_channels=config.get("in_channels", 3),
             classes=config.get("num_classes", 1),
             decoder_channels=tuple(config.get("decoder_channels", [512, 256, 128, 64, 32])),
+            decoder_attention_type=_normalize_decoder_attention_type(
+                config.get("decoder_attention_type")
+            ),
             activation=None,
         )
 

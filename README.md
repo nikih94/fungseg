@@ -35,4 +35,5 @@ python -m src.inference \
 
 Inference uses the same patch size and overlap as training, averages probabilities in overlapping regions, and writes binary masks, green overlay previews, and optional probability maps.
 
-The current default model in `config.yaml` is `Unet++` with an ImageNet-pretrained `resnet50` encoder. The model factory also supports `unetplusplus_resnet18` and `unetplusplus_resnet34`.
+The current default model in `config.yaml` is `Unet++` with an ImageNet-pretrained `resnet34` encoder. The model factory also supports `unetplusplus_resnet18` and `unetplusplus_resnet50`.
+For SMP `Unet++` models, you can enable decoder attention from config with `model.decoder_attention_type: scse`.
