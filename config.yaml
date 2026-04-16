@@ -78,9 +78,9 @@ loss:
   name: tversky_soft_cldice
   alpha: 0.3
   beta: 0.7
-  tversky_weight: 0.7
-  soft_cldice_weight: 0.3
-  iterations: 3
+  tversky_weight: 0.5
+  soft_cldice_weight: 0.5
+  iterations: 11
   smooth: 1.0e-6
   cldice_smooth: 1.0
 
