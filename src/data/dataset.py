@@ -25,6 +25,10 @@ def get_train_transforms(
 ) -> A.Compose:
     train_config = (augmentations_config or {}).get("train", {})
     affine_config = train_config.get("affine", {})
+    brightness_contrast_config = train_config.get("random_brightness_contrast", {})
+    gamma_config = train_config.get("random_gamma", {})
+    clahe_config = train_config.get("clahe", {})
+    blur_config = train_config.get("blur", {})
     ops = []
     if image_size is not None:
         ops.append(A.Resize(image_size, image_size))
@@ -42,7 +46,35 @@ def get_train_transforms(
                 rotate=tuple(affine_config.get("rotate", [-30, 30])),
                 p=float(affine_config.get("p", 0.6)),
             ),
-            A.RandomBrightnessContrast(p=float(train_config.get("random_brightness_contrast_p", 0.3))),
+            A.RandomBrightnessContrast(
+                brightness_limit=tuple(brightness_contrast_config.get("brightness_limit", [-0.2, 0.2])),
+                contrast_limit=tuple(brightness_contrast_config.get("contrast_limit", [-0.2, 0.2])),
+                p=float(brightness_contrast_config.get("p", train_config.get("random_brightness_contrast_p", 0.3))),
+            ),
+            A.RandomGamma(
+                gamma_limit=tuple(gamma_config.get("gamma_limit", [90, 110])),
+                p=float(gamma_config.get("p", 0.2)),
+            ),
+            A.CLAHE(
+                clip_limit=tuple(clahe_config.get("clip_limit", [1.0, 3.0])),
+                tile_grid_size=tuple(clahe_config.get("tile_grid_size", [8, 8])),
+                p=float(clahe_config.get("p", 0.15)),
+            ),
+            A.OneOf(
+                [
+                    A.GaussianBlur(
+                        blur_limit=tuple(blur_config.get("gaussian_blur_limit", [3, 5])),
+                        sigma_limit=tuple(blur_config.get("gaussian_sigma_limit", [0.1, 1.0])),
+                        p=1.0,
+                    ),
+                    A.Defocus(
+                        radius=tuple(blur_config.get("defocus_radius", [1, 3])),
+                        alias_blur=tuple(blur_config.get("defocus_alias_blur", [0.1, 0.3])),
+                        p=1.0,
+                    ),
+                ],
+                p=float(blur_config.get("p", 0.2)),
+            ),
             A.GaussNoise(p=float(train_config.get("gauss_noise_p", 0.2))),
             _build_normalize(augmentations_config),
             ToTensorV2(),

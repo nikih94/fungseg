@@ -31,13 +31,29 @@ augmentations:
     vertical_flip_p: 0.5
     random_rotate_90_p: 0.8
     affine:
-      translate_x: [-0.05, 0.05]
-      translate_y: [-0.05, 0.05]
-      scale: [0.9, 1.1]
-      rotate: [-20, 20]
-      p: 0.6
-    random_brightness_contrast_p: 0.2
-    gauss_noise_p: 0.2
+      translate_x: [-0.02, 0.02]
+      translate_y: [-0.02, 0.02]
+      scale: [0.90, 1.1]
+      rotate: [-10, 10]
+      p: 0.4
+    random_brightness_contrast:
+      brightness_limit: [-0.15, 0.15]
+      contrast_limit: [-0.15, 0.15]
+      p: 0.2
+    random_gamma:
+      gamma_limit: [90, 110]
+      p: 0.2
+    clahe:
+      clip_limit: [1.0, 2.0]
+      tile_grid_size: [8, 8]
+      p: 0.1
+    blur:
+      gaussian_blur_limit: [3, 5]
+      gaussian_sigma_limit: [0.2, 0.8]
+      defocus_radius: [2, 3]
+      defocus_alias_blur: [0.1, 0.3]
+      p: 0.1
+    gauss_noise_p: 0.05
 
 cv:
   n_splits: 5
@@ -54,13 +70,19 @@ model:
   num_classes: 1
   encoder_name: resnet34
   encoder_weights: imagenet
-  decoder_channels: [512, 256, 128, 64, 32]
+  decoder_normalization: instancenorm
+  decoder_channels: [256, 128, 64, 32, 16]
   decoder_attention_type: scse # set to scse to enable SMP scSE attention in the decoder
 
 loss:
-  name: bce_dice
-  bce_weight: 0.3
-  dice_weight: 0.7
+  name: tversky_soft_cldice
+  alpha: 0.3
+  beta: 0.7
+  tversky_weight: 0.7
+  soft_cldice_weight: 0.3
+  iterations: 3
+  smooth: 1.0e-6
+  cldice_smooth: 1.0
 
 optimizer:
   name: adamw

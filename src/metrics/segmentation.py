@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 
 
+# PyTorch core does not currently ship Dice/IoU segmentation metrics,
+# so these remain lightweight project-local implementations.
 def _prepare_predictions(logits: torch.Tensor, threshold: float) -> torch.Tensor:
     probabilities = torch.sigmoid(logits)
     return (probabilities >= threshold).float()
