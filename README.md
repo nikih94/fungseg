@@ -161,6 +161,8 @@ All important settings live in `config.yaml`.
 ### `loss`
 
 - `name`: loss name used by the loss factory.
+- `bce_weight`: weight of the BCE term when `loss.name` is `bce_dice`.
+- `dice_weight`: weight of the Dice term when `loss.name` is `bce_dice`.
 - `alpha`: Tversky false-positive weight.
 - `beta`: Tversky false-negative weight.
 - `tversky_weight`: weight of the Tversky term in the combined loss.

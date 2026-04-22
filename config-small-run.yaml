@@ -2,8 +2,8 @@ project:
   name: fungi_segmentation
 
 paths:
-  images_dir: data/images
-  masks_dir: data/masks
+  images_dir: data/images-small
+  masks_dir: data/masks-small
   runs_dir: runs
   outputs_dir: outputs
 
@@ -62,13 +62,13 @@ cv:
 
 split:
   mode: train_val # train_val or kfold
-  val_source_ids: ['job_7_IN183 YNA 48h x500 1.tif','job_4_IN183 Agar 48h x500 3.tif','job_2_IN125 Agar 48h x500 2.tif','job_3_IN125 SNA 48h x500 3.tif','job_6_IN183 SNA 48h x500 4.tif']
+  val_source_ids: ['job_6_IN183 SNA 48h x500 4.tif']
 
 model:
-  name: unetplusplus_resnet34
+  name: unetplusplus_resnet18
   in_channels: 3
   num_classes: 1
-  encoder_name: resnet34
+  encoder_name: resnet18
   encoder_weights: imagenet
   decoder_normalization: instancenorm
   decoder_channels: [256, 128, 64, 32, 16]
@@ -96,18 +96,18 @@ scheduler:
 
 
 train:
-  epochs: 150
+  epochs: 2
   mixed_precision: true
   grad_clip: 1.0
   monitor: val_dice_per_patch
   monitor_mode: max
   threshold: 0.5
   enable_per_image_validation: true
-  per_image_validation_interval: 10
+  per_image_validation_interval: 1
   seed: 42
   device: auto
   use_tqdm: true
 
 inference:
   threshold: 0.5
-  save_probabilities: true
+  save_probabilities: false
