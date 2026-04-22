@@ -4,7 +4,14 @@ from typing import Any
 
 from torch import nn
 
-from src.losses.combined import BCEDiceLoss, CLDiceLoss, SoftCLDiceLoss, TverskyLoss, TverskySoftCLDiceLoss
+from src.losses.combined import (
+    BCEDiceLoss,
+    BCEDiceSoftCLDiceLoss,
+    CLDiceLoss,
+    SoftCLDiceLoss,
+    TverskyLoss,
+    TverskySoftCLDiceLoss,
+)
 
 
 def build_loss(config: dict[str, Any]):
@@ -15,6 +22,15 @@ def build_loss(config: dict[str, Any]):
         return BCEDiceLoss(
             bce_weight=float(config.get("bce_weight", 0.5)),
             dice_weight=float(config.get("dice_weight", 0.5)),
+        )
+    if loss_name in {"bce_dice_cldice", "bce_dice_soft_cldice", "bcedicecldice"}:
+        return BCEDiceSoftCLDiceLoss(
+            bce_weight=float(config.get("bce_weight", 0.3)),
+            dice_weight=float(config.get("dice_weight", 0.6)),
+            soft_cldice_weight=float(config.get("soft_cldice_weight", 0.1)),
+            iterations=int(config.get("iterations", 5)),
+            smooth=float(config.get("smooth", 1e-6)),
+            cldice_smooth=float(config.get("cldice_smooth", 1.0)),
         )
     if loss_name == "tversky":
         return TverskyLoss(

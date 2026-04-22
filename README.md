@@ -163,13 +163,13 @@ All important settings live in `config.yaml`.
 - `name`: loss name used by the loss factory.
 - `bce_weight`: weight of the BCE term when `loss.name` is `bce_dice`.
 - `dice_weight`: weight of the Dice term when `loss.name` is `bce_dice`.
+- `soft_cldice_weight`: weight of the soft-clDice term when `loss.name` is `bce_dice_cldice` or `tversky_soft_cldice`.
+- `iterations`: number of soft skeletonization iterations for clDice-based losses.
+- `cldice_smooth`: smoothing term for soft-clDice and clDice-based combined losses.
 - `alpha`: Tversky false-positive weight.
 - `beta`: Tversky false-negative weight.
 - `tversky_weight`: weight of the Tversky term in the combined loss.
-- `soft_cldice_weight`: weight of the soft-clDice term in the combined loss.
-- `iterations`: number of soft skeletonization iterations for clDice.
 - `smooth`: smoothing term for Tversky-style calculations.
-- `cldice_smooth`: smoothing term for soft-clDice.
 
 ### `optimizer`
 

@@ -86,10 +86,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "decoder_attention_type": None,
     },
     "loss": {
-        "name": "bce_dice",
+        "name": "bce_dice_cldice",
         "bce_weight": 0.3,
-        "dice_weight": 0.7,
+        "dice_weight": 0.6,
+        "soft_cldice_weight": 0.1,
+        "iterations": 5,
         "smooth": 1e-6,
+        "cldice_smooth": 1.0,
     },
     "optimizer": {"name": "adamw", "lr": 1e-4, "weight_decay": 1e-4},
     "scheduler": {

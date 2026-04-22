@@ -75,10 +75,13 @@ model:
   decoder_attention_type: scse # set to scse to enable SMP scSE attention in the decoder
 
 loss:
-  name: bce_dice
+  name: bce_dice_cldice
   bce_weight: 0.3
-  dice_weight: 0.7
+  dice_weight: 0.5
+  soft_cldice_weight: 0.2
+  iterations: 3
   smooth: 1.0e-6
+  cldice_smooth: 1.0
 
 optimizer:
   name: adamw

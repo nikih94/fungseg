@@ -87,6 +87,36 @@ class BCEDiceLoss(nn.Module):
         return (self.bce_weight * bce_loss) + (self.dice_weight * dice_loss)
 
 
+class BCEDiceSoftCLDiceLoss(nn.Module):
+    def __init__(
+        self,
+        bce_weight: float = 0.3,
+        dice_weight: float = 0.6,
+        soft_cldice_weight: float = 0.1,
+        iterations: int = 5,
+        smooth: float = 1e-6,
+        cldice_smooth: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.soft_cldice_weight = soft_cldice_weight
+        self.bce_dice = BCEDiceLoss(
+            bce_weight=bce_weight,
+            dice_weight=dice_weight,
+            smooth=smooth,
+        )
+        self.soft_cldice = SoftCLDiceLoss(
+            iterations=iterations,
+            smooth=cldice_smooth,
+        )
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_dice_loss = self.bce_dice(logits, targets)
+        soft_cldice_loss = self.soft_cldice(logits, targets)
+        return bce_dice_loss + (self.soft_cldice_weight * soft_cldice_loss)
+
+
 class TverskyLoss(nn.Module):
     def __init__(self, alpha: float = 0.3, beta: float = 0.7, smooth: float = 1e-6) -> None:
         super().__init__()
