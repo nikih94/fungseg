@@ -29,6 +29,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pin_memory": True,
         "batch_size": 8,
         "image_size": None,
+        "multiscale": {
+            "enabled": True,
+            "include_native": True,
+            "target_long_edges": [1200, 1600, 2400, 3200],
+            "max_scale": 1.0,
+            "deduplicate_scale_tolerance": 0.03,
+            "image_resampling": "lanczos",
+            "mask_resampling": "foreground_preserving",
+        },
+        "sampling": {
+            "strategy": "balanced_resolution_source",
+            "samples_per_epoch": "native_patch_count",
+            "replacement": True,
+        },
     },
     "augmentations": {
         "normalize": {
@@ -101,14 +115,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "factor": 0.5,
         "patience": 5,
         "min_lr": 1.0e-6,
-        "monitor": "val_dice_per_patch",
+        "monitor": "val_dice_macro_resolution",
     },
     "train": {
         "epochs": 50,
         "mixed_precision": True,
         "grad_clip": None,
-        "monitor": "val_dice_per_patch",
+        "monitor": "val_dice_macro_resolution",
         "monitor_mode": "max",
+        "best_interval_checkpoint": {
+            "enabled": True,
+            "interval_epochs": 10,
+        },
         "threshold": 0.5,
         "enable_per_image_validation": True,
         "per_image_validation_interval": 1,
@@ -117,6 +135,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "use_tqdm": True,
     },
     "inference": {"threshold": 0.5, "save_probabilities": False},
+    "qualitative_evaluation": {
+        "enabled": True,
+        "data_root": "data/qualitative_evaluation",
+        "crop_patch_grid": [3, 3],
+        "min_foreground_ratio": 0.005,
+        "max_foreground_ratio": 0.15,
+        "max_checkpoints": None,
+    },
 }
 
 

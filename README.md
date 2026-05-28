@@ -36,20 +36,41 @@ Training does the following:
 6. Builds datasets, dataloaders, model, loss, optimizer, and scheduler.
 7. Trains and validates each fold or manual split.
 8. Saves checkpoints, logs, and metrics under `runs/<project>_<timestamp>/`.
+9. Runs qualitative checkpoint comparison when `qualitative_evaluation.enabled` is true.
 
 Each run folder contains the merged config, per-fold checkpoints, TensorBoard logs, and CSV/JSON metric files.
+
+Each fold saves `best.pt`, `last.pt`, configurable best-in-interval snapshots such as
+`best_epochs_001_010.pt`, and `checkpoint_manifest.csv` with the metrics for each saved checkpoint.
 
 ## Inference
 
 ```bash
 python -m src.inference \
   --config config.yaml \
-  --checkpoint runs/fungi_segmentation_<timestamp>/fold_0/best.pt \
+  --checkpoint runs/fungi_segmentation_20260415_225352/fold_0/best.pt \
   --input data/images \
   --output outputs/inference
 ```
 
 Inference uses the same patch size and stride as training, predicts on overlapping patches, averages overlapping probabilities, and saves binary masks, overlay previews, and optional probability maps.
+
+## Qualitative Evaluation
+
+```bash
+python -m src.qualitative_evaluation \
+  --run-dir runs/fungi_segmentation_20260526_181338
+```
+
+Qualitative evaluation compares all checkpoints listed in each fold's `checkpoint_manifest.csv` on paired images and masks from `data/qualitative_evaluation/images` and `data/qualitative_evaluation/masks`.
+
+For each qualitative image, it selects one configurable mostly-background crop with some foreground, predicts with all manifest checkpoints, and writes comparison grids and crop-level metrics under:
+
+- `runs/<project>_<timestamp>/qualitative_evaluation/grids/`
+- `runs/<project>_<timestamp>/qualitative_evaluation/eval_metrics.csv`
+- `runs/<project>_<timestamp>/qualitative_evaluation/selected_crops.csv`
+
+Training runs this automatically at the end when `qualitative_evaluation.enabled` is true.
 
 ## Models
 
@@ -105,6 +126,22 @@ All important settings live in `config.yaml`.
 - `pin_memory`: whether dataloaders pin host memory for faster device transfer.
 - `batch_size`: patch batch size.
 - `image_size`: optional resize applied after patch extraction and before normalization.
+
+### `data.multiscale`
+
+- `enabled`: whether to create virtual lower-resolution patch records during training and validation.
+- `include_native`: whether to keep native-resolution patch records.
+- `target_long_edges`: synthetic long-edge sizes used to downscale large images before virtual tiling.
+- `max_scale`: maximum allowed virtual scale. Keep this at `1.0` to avoid upscaling smaller images.
+- `deduplicate_scale_tolerance`: scale-difference tolerance used to remove duplicate native/synthetic scales.
+- `image_resampling`: image resize filter used for virtual patches.
+- `mask_resampling`: mask resize mode. `foreground_preserving` is intended to preserve thin filament labels.
+
+### `data.sampling`
+
+- `strategy`: training sampler strategy. `balanced_resolution_source` balances resolution buckets and source images.
+- `samples_per_epoch`: number of training samples drawn per epoch. `native_patch_count` keeps epoch length close to the native-resolution baseline.
+- `replacement`: whether weighted sampling may draw records more than once per epoch.
 
 ### `augmentations.normalize`
 
@@ -193,6 +230,8 @@ All important settings live in `config.yaml`.
 - `grad_clip`: optional gradient clipping value.
 - `monitor`: metric used to select `best.pt`.
 - `monitor_mode`: whether higher or lower values are considered better.
+- `best_interval_checkpoint.enabled`: whether to save best-in-window checkpoint snapshots.
+- `best_interval_checkpoint.interval_epochs`: epoch window size for interval-best snapshots.
 - `threshold`: sigmoid threshold used for binary metrics.
 - `enable_per_image_validation`: whether to run stitched full-image validation.
 - `per_image_validation_interval`: epoch interval for full-image validation.
@@ -205,6 +244,15 @@ All important settings live in `config.yaml`.
 - `threshold`: sigmoid threshold used to export final binary masks.
 - `save_probabilities`: whether to save probability maps in addition to binary masks.
 
+### `qualitative_evaluation`
+
+- `enabled`: whether training should run qualitative comparison after finishing.
+- `data_root`: folder containing qualitative `images/` and `masks/` subfolders.
+- `crop_patch_grid`: number of patch origins in the selected crop, such as `[3, 3]`.
+- `min_foreground_ratio`: minimum foreground fraction for automatic crop selection.
+- `max_foreground_ratio`: maximum foreground fraction for automatic crop selection.
+- `max_checkpoints`: optional cap on manifest checkpoints to evaluate.
+
 ## Repository Guide
 
-- [DESCRIPTION.md](/home/niki/Desktop/funguy/fungseg/DESCRIPTION.md) gives a structural overview of the repository, explains how the modules connect, and lists the main dependencies.
+- [DESCRIPTION.md](/home/niki/fungseg/DESCRIPTION.md) gives a structural overview of the repository, explains how the modules connect, and lists the main dependencies.

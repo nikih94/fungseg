@@ -44,6 +44,18 @@ Responsibilities:
 - average overlapping probabilities
 - write binary masks, overlays, and optional probability maps
 
+### `src/qualitative_evaluation.py`
+
+Checkpoint comparison entrypoint for visual model selection.
+
+Responsibilities:
+
+- discover qualitative image and mask pairs
+- read per-fold `checkpoint_manifest.csv` files from a run
+- select one mostly-background crop with foreground per qualitative image
+- predict the selected crop with each manifest checkpoint
+- save comparison grid PNGs plus crop-level metrics
+
 ### `src/patching.py`
 
 Core patch-generation logic.
@@ -52,6 +64,7 @@ Why it matters:
 
 - turns original image and mask pairs into `OriginalImageRecord` objects
 - creates patch coordinates with full edge coverage
+- creates virtual multi-scale patch records for lower-resolution training views
 - filters empty patches based on mask foreground content
 - preserves the distinction between original-image grouping and patch-level training samples
 
@@ -62,6 +75,7 @@ Dataset and split logic live here.
 - `dataset.py`: patch dataset plus Albumentations train and validation transforms.
 - `discovery.py`: scans image and mask directories and matches files by stem.
 - `folds.py`: creates grouped k-fold splits or a manual train/validation split.
+- `sampling.py`: builds balanced weighted samplers and patch-distribution diagnostics.
 
 This folder is important because it keeps dataset discovery, patch sampling, and split strategy separate from model code.
 
@@ -114,7 +128,8 @@ Why it matters:
 - computes patch-level metrics
 - optionally runs full-image stitched validation
 - tracks the monitored metric
-- saves `best.pt` and `last.pt`
+- saves `best.pt`, `last.pt`, and optional best-in-interval snapshots
+- writes a checkpoint manifest with metrics for saved checkpoints
 - writes per-fold metric history
 
 ### `src/utils/`
@@ -142,12 +157,13 @@ These are useful but not central to the main training loop:
 2. `src/data/discovery.py` matches images and masks by filename stem.
 3. `src/patching.py` creates original-image records containing source identity and image size.
 4. `src/data/folds.py` splits by original image, not by patch.
-5. `src/patching.py` creates patch records for the selected train and validation source images.
-6. `src/data/dataset.py` loads full images lazily, crops patches on the fly, applies Albumentations, and returns tensors.
+5. `src/patching.py` creates native and virtual multi-scale patch records for the selected train and validation source images.
+6. `src/data/dataset.py` loads full images lazily, crops native or virtual scaled patches on the fly, applies Albumentations, and returns tensors.
 7. `src/models/factory.py` builds the requested segmentation model.
 8. `src/losses/factory.py`, `src/optim/factory.py`, and `src/schedulers/factory.py` build the training components from config.
-9. `src/engine/trainer.py` runs training, validation, checkpointing, and metric export.
+9. `src/engine/trainer.py` runs training, validation, per-resolution metrics, checkpointing, and metric export.
 10. `src/train.py` aggregates fold metrics and writes run summaries.
+11. If enabled, `src/qualitative_evaluation.py` compares manifest checkpoints on qualitative crops and writes visual grids plus `eval_metrics.csv`.
 
 ### Inference Flow
 
@@ -157,6 +173,15 @@ These are useful but not central to the main training loop:
 4. Each patch is normalized with validation transforms and passed through the model.
 5. Overlapping patch probabilities are averaged back into a full-size probability map.
 6. The final binary mask is thresholded and written to disk.
+
+### Qualitative Evaluation Flow
+
+1. `src/qualitative_evaluation.py` loads the saved run config from `runs/<project>_<timestamp>/config.yaml`.
+2. It matches qualitative images and masks by filename stem under `data/qualitative_evaluation/`.
+3. It reads each fold's `checkpoint_manifest.csv` and evaluates those checkpoints in manifest order.
+4. For each image, it selects a crop using the configured patch grid and foreground-ratio bounds.
+5. It predicts all overlapping patches that contribute to that crop, averages probabilities, and crops away border-only context.
+6. It writes one grid PNG per image plus `selected_crops.csv` and `eval_metrics.csv`.
 
 ## Why the Folder Boundaries Matter
 

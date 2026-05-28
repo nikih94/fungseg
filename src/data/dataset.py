@@ -9,7 +9,7 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from torch.utils.data import Dataset
 
-from src.patching import PatchRecord, crop_and_pad_array
+from src.patching import PatchRecord, crop_scaled_image_patch, crop_scaled_mask_patch
 
 
 def _build_normalize(augmentations_config: Optional[dict[str, Any]]) -> A.Normalize:
@@ -105,10 +105,14 @@ class SegmentationPatchDataset(Dataset):
         records: list[PatchRecord],
         mask_threshold: int,
         transforms: Optional[A.Compose] = None,
+        image_resampling: str = "lanczos",
+        mask_resampling: str = "foreground_preserving",
     ) -> None:
         self.records = records
         self.mask_threshold = mask_threshold
         self.transforms = transforms
+        self.image_resampling = image_resampling
+        self.mask_resampling = mask_resampling
 
     def __len__(self) -> int:
         return len(self.records)
@@ -122,8 +126,23 @@ class SegmentationPatchDataset(Dataset):
         with Image.open(record.mask_path) as mask:
             mask_array = np.array(mask.convert("L"), dtype=np.uint8)
 
-        image_patch = crop_and_pad_array(image_array, record.x, record.y, record.patch_size)
-        mask_patch = crop_and_pad_array(mask_array, record.x, record.y, record.patch_size)
+        image_patch = crop_scaled_image_patch(
+            image_array,
+            x=record.x,
+            y=record.y,
+            patch_size=record.patch_size,
+            scale=record.scale,
+            resampling=self.image_resampling,
+        )
+        mask_patch = crop_scaled_mask_patch(
+            mask_array,
+            x=record.x,
+            y=record.y,
+            patch_size=record.patch_size,
+            scale=record.scale,
+            mask_threshold=self.mask_threshold,
+            resampling=self.mask_resampling,
+        )
 
         binary_mask = (mask_patch > self.mask_threshold).astype(np.float32)
 
@@ -148,4 +167,9 @@ class SegmentationPatchDataset(Dataset):
             "x": record.x,
             "y": record.y,
             "patch_size": record.patch_size,
+            "scale": record.scale,
+            "scaled_width": record.scaled_width,
+            "scaled_height": record.scaled_height,
+            "resolution_bucket": record.resolution_bucket,
+            "scale_label": record.scale_label,
         }

@@ -21,6 +21,13 @@ outputs/
 checkpoints/
 inference-output/
 
+
+#temporal
+fungi_temporal/
+inf-output-before/
+Fungi_temporal.zip
+funi-temporal-masks.zip
+
 # Data
 /data/
 

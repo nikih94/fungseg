@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from src.data.dataset import SegmentationPatchDataset, get_train_transforms, get_val_transforms
 from src.data.discovery import discover_image_mask_pairs
 from src.data.folds import make_grouped_kfold_splits, make_manual_train_val_split
+from src.data.sampling import build_balanced_resolution_source_sampler, patch_distribution
 from src.engine.trainer import Trainer
 from src.losses.factory import build_loss
 from src.models.factory import build_model
@@ -79,14 +80,17 @@ def make_loader(
     shuffle: bool,
     persistent_workers: bool,
     prefetch_factor: int | None,
+    sampler=None,
 ) -> DataLoader:
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": batch_size,
-        "shuffle": shuffle,
+        "shuffle": shuffle if sampler is None else False,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = persistent_workers
         if prefetch_factor is not None:
@@ -204,6 +208,8 @@ def main() -> None:
     all_epoch_rows: list[dict[str, float]] = []
     data_cfg = config["data"]
     augmentations_cfg = config.get("augmentations", {})
+    multiscale_cfg = data_cfg.get("multiscale", {})
+    sampling_cfg = data_cfg.get("sampling", {})
     total_folds = len(splits)
 
     for fold_index, (train_sources, val_sources) in enumerate(splits):
@@ -221,6 +227,7 @@ def main() -> None:
             filter_empty_patches=bool(data_cfg["filter_empty_patches"]),
             mask_threshold=int(data_cfg["mask_threshold"]),
             min_foreground_pixels=int(data_cfg["min_foreground_pixels"]),
+            multiscale_config=multiscale_cfg,
         )
         val_patch_records = build_patch_records(
             val_originals,
@@ -229,6 +236,7 @@ def main() -> None:
             filter_empty_patches=bool(data_cfg["filter_empty_patches"]),
             mask_threshold=int(data_cfg["mask_threshold"]),
             min_foreground_pixels=int(data_cfg["min_foreground_pixels"]),
+            multiscale_config=multiscale_cfg,
         )
         log_fold_summary(
             logger=logger,
@@ -248,6 +256,8 @@ def main() -> None:
                 data_cfg.get("image_size"),
                 augmentations_config=augmentations_cfg,
             ),
+            image_resampling=str(multiscale_cfg.get("image_resampling", "lanczos")),
+            mask_resampling=str(multiscale_cfg.get("mask_resampling", "foreground_preserving")),
         )
         val_dataset = SegmentationPatchDataset(
             records=val_patch_records,
@@ -256,7 +266,23 @@ def main() -> None:
                 data_cfg.get("image_size"),
                 augmentations_config=augmentations_cfg,
             ),
+            image_resampling=str(multiscale_cfg.get("image_resampling", "lanczos")),
+            mask_resampling=str(multiscale_cfg.get("mask_resampling", "foreground_preserving")),
         )
+
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(int(config["train"]["seed"]) + fold_index)
+        train_sampler, sampler_diagnostics = build_balanced_resolution_source_sampler(
+            train_patch_records,
+            sampling_cfg,
+            generator=sampler_generator,
+        )
+        patch_diagnostics = {
+            "train": patch_distribution(train_patch_records),
+            "val": patch_distribution(val_patch_records),
+            "sampler": sampler_diagnostics,
+        }
+        save_json(fold_dir / "patch_distribution.json", patch_diagnostics)
 
         train_loader = make_loader(
             train_dataset,
@@ -270,6 +296,7 @@ def main() -> None:
                 if data_cfg.get("prefetch_factor") is not None
                 else None
             ),
+            sampler=train_sampler,
         )
         val_loader = make_loader(
             val_dataset,
@@ -314,6 +341,12 @@ def main() -> None:
         fold_result["fold"] = fold_index
         fold_result["num_train_patches"] = len(train_patch_records)
         fold_result["num_val_patches"] = len(val_patch_records)
+        fold_result["num_train_native_patches"] = sum(
+            1 for record in train_patch_records if record.scale_label == "native"
+        )
+        fold_result["num_val_native_patches"] = sum(
+            1 for record in val_patch_records if record.scale_label == "native"
+        )
         fold_results.append(fold_result)
         all_epoch_rows.extend(
             {"fold": fold_index, **row}
@@ -322,6 +355,12 @@ def main() -> None:
 
     val_dice_per_patch_values = [float(item["val_dice_per_patch"]) for item in fold_results]
     val_iou_per_patch_values = [float(item["val_iou_per_patch"]) for item in fold_results]
+    val_dice_macro_resolution_values = [
+        float(item["val_dice_macro_resolution"]) for item in fold_results if item.get("val_dice_macro_resolution") is not None
+    ]
+    val_iou_macro_resolution_values = [
+        float(item["val_iou_macro_resolution"]) for item in fold_results if item.get("val_iou_macro_resolution") is not None
+    ]
     val_dice_per_image_mean, val_dice_per_image_std = _collect_optional_metric(
         [item.get("val_dice_per_image") for item in fold_results]
     )
@@ -341,6 +380,22 @@ def main() -> None:
         "std_iou_per_patch": (
             statistics.pstdev(val_iou_per_patch_values) if len(val_iou_per_patch_values) > 1 else 0.0
         ),
+        "mean_dice_macro_resolution": (
+            statistics.mean(val_dice_macro_resolution_values) if val_dice_macro_resolution_values else None
+        ),
+        "std_dice_macro_resolution": (
+            statistics.pstdev(val_dice_macro_resolution_values)
+            if len(val_dice_macro_resolution_values) > 1
+            else 0.0
+        ),
+        "mean_iou_macro_resolution": (
+            statistics.mean(val_iou_macro_resolution_values) if val_iou_macro_resolution_values else None
+        ),
+        "std_iou_macro_resolution": (
+            statistics.pstdev(val_iou_macro_resolution_values)
+            if len(val_iou_macro_resolution_values) > 1
+            else 0.0
+        ),
         "mean_dice_per_image": val_dice_per_image_mean,
         "std_dice_per_image": val_dice_per_image_std,
         "mean_iou_per_image": val_iou_per_image_mean,
@@ -352,6 +407,20 @@ def main() -> None:
     save_csv(run_dir / "epoch_metrics.csv", all_epoch_rows)
     save_json(outputs_root / "cv_summary.json", summary)
     logger.info("Saved cross-validation summary to %s", run_dir / "cv_summary.json")
+
+    qualitative_cfg = config.get("qualitative_evaluation", {})
+    if bool(qualitative_cfg.get("enabled", False)):
+        from src.qualitative_evaluation import run_qualitative_evaluation
+
+        qualitative_result = run_qualitative_evaluation(
+            run_dir=run_dir,
+            config_path=run_dir / "config.yaml",
+            logger=logger,
+        )
+        if qualitative_result.get("skipped"):
+            logger.warning("Skipped qualitative evaluation: %s", qualitative_result.get("reason"))
+        else:
+            logger.info("Saved qualitative evaluation to %s", qualitative_result["output_dir"])
 
 
 if __name__ == "__main__":

@@ -12,7 +12,14 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.data.dataset import get_val_transforms
-from src.metrics.segmentation import dice_score, dice_score_from_masks, iou_score, iou_score_from_masks
+from src.metrics.segmentation import (
+    dice_score,
+    dice_score_from_masks,
+    dice_scores,
+    iou_score,
+    iou_score_from_masks,
+    iou_scores,
+)
 from src.models.wrappers import extract_logits
 from src.patching import OriginalImageRecord, _compute_positions, crop_and_pad_array
 from src.utils.checkpoint import save_checkpoint
@@ -51,6 +58,9 @@ class Trainer:
         self.fold_index = fold_index
         self.monitor = self._normalize_metric_name(train_config.get("monitor", "val_dice_per_patch"))
         self.monitor_mode = train_config.get("monitor_mode", "max")
+        interval_checkpoint_config = train_config.get("best_interval_checkpoint", {})
+        self.best_interval_checkpoint_enabled = bool(interval_checkpoint_config.get("enabled", False))
+        self.best_interval_checkpoint_epochs = max(1, int(interval_checkpoint_config.get("interval_epochs", 10)))
         self.threshold = float(train_config.get("threshold", 0.5))
         self.use_tqdm = bool(train_config.get("use_tqdm", True))
         self.enable_per_image_validation = bool(train_config.get("enable_per_image_validation", True))
@@ -65,10 +75,18 @@ class Trainer:
 
     def fit(self, train_loader: DataLoader, val_loader: DataLoader, epochs: int) -> dict[str, Any]:
         best_metric = -math.inf if self.monitor_mode == "max" else math.inf
+        interval_best_metric = -math.inf if self.monitor_mode == "max" else math.inf
+        interval_index = 0
         history: list[dict[str, float]] = []
         epoch_rows: list[dict[str, float]] = []
+        checkpoint_manifest: dict[str, dict[str, Any]] = {}
 
         for epoch in range(1, epochs + 1):
+            current_interval_index = self._interval_index(epoch)
+            if current_interval_index != interval_index:
+                interval_index = current_interval_index
+                interval_best_metric = -math.inf if self.monitor_mode == "max" else math.inf
+
             train_metrics = self._run_epoch(train_loader, training=True, epoch=epoch, epochs=epochs)
             val_metrics = self._run_epoch(val_loader, training=False, epoch=epoch, epochs=epochs)
             if self._should_run_per_image_validation(epoch):
@@ -86,8 +104,9 @@ class Trainer:
             is_best = current_metric > best_metric if self.monitor_mode == "max" else current_metric < best_metric
             if is_best:
                 best_metric = current_metric
+                best_path = self.fold_dir / "best.pt"
                 save_checkpoint(
-                    self.fold_dir / "best.pt",
+                    best_path,
                     self.model,
                     self.optimizer,
                     self.scheduler,
@@ -95,9 +114,42 @@ class Trainer:
                     epoch_metrics,
                     self.train_config,
                 )
+                checkpoint_manifest[str(best_path.name)] = self._checkpoint_manifest_row(
+                    best_path,
+                    epoch,
+                    "global_best",
+                    epoch_metrics,
+                )
 
+            if self.best_interval_checkpoint_enabled:
+                interval_is_best = (
+                    current_metric > interval_best_metric
+                    if self.monitor_mode == "max"
+                    else current_metric < interval_best_metric
+                )
+                if interval_is_best:
+                    interval_best_metric = current_metric
+                    interval_path = self.fold_dir / self._interval_checkpoint_name(epoch, epochs)
+                    save_checkpoint(
+                        interval_path,
+                        self.model,
+                        self.optimizer,
+                        self.scheduler,
+                        epoch,
+                        epoch_metrics,
+                        self.train_config,
+                    )
+                    checkpoint_manifest[str(interval_path.name)] = self._checkpoint_manifest_row(
+                        interval_path,
+                        epoch,
+                        "interval_best",
+                        epoch_metrics,
+                        total_epochs=epochs,
+                    )
+
+            last_path = self.fold_dir / "last.pt"
             save_checkpoint(
-                self.fold_dir / "last.pt",
+                last_path,
                 self.model,
                 self.optimizer,
                 self.scheduler,
@@ -105,11 +157,17 @@ class Trainer:
                 epoch_metrics,
                 self.train_config,
             )
+            checkpoint_manifest[str(last_path.name)] = self._checkpoint_manifest_row(
+                last_path,
+                epoch,
+                "last",
+                epoch_metrics,
+            )
 
             self._step_scheduler(epoch_metrics)
             self._log_tensorboard(epoch_metrics, epoch)
             self.logger.info(
-                "Epoch %s/%s - lr=%.8f train_loss=%.4f val_loss=%.4f val_dice_per_patch=%.4f val_iou_per_patch=%.4f val_dice_per_image=%s val_iou_per_image=%s",
+                "Epoch %s/%s - lr=%.8f train_loss=%.4f val_loss=%.4f val_dice_per_patch=%.4f val_iou_per_patch=%.4f val_dice_macro_resolution=%.4f val_dice_per_image=%s val_iou_per_image=%s",
                 epoch,
                 epochs,
                 epoch_metrics["lr"],
@@ -117,6 +175,7 @@ class Trainer:
                 epoch_metrics["val_loss"],
                 epoch_metrics["val_dice_per_patch"],
                 epoch_metrics["val_iou_per_patch"],
+                epoch_metrics["val_dice_macro_resolution"],
                 self._format_optional_metric(epoch_metrics.get("val_dice_per_image")),
                 self._format_optional_metric(epoch_metrics.get("val_iou_per_image")),
             )
@@ -129,6 +188,17 @@ class Trainer:
         }
         save_json(self.fold_dir / "metrics.json", metrics_payload)
         save_csv(self.fold_dir / "metrics.csv", epoch_rows)
+        manifest_rows = sorted(
+            checkpoint_manifest.values(),
+            key=lambda row: (
+                int(row["epoch_start"]),
+                int(row["epoch_end"]),
+                str(row["reason"]),
+                str(row["checkpoint"]),
+            ),
+        )
+        save_csv(self.fold_dir / "checkpoint_manifest.csv", manifest_rows)
+        save_json(self.fold_dir / "checkpoint_manifest.json", {"checkpoints": manifest_rows})
         best_epoch = metrics_payload["best_epoch"]
         best_metrics = next(item for item in history if item["epoch"] == best_epoch)
         return {
@@ -145,6 +215,9 @@ class Trainer:
         total_dice = 0.0
         total_iou = 0.0
         num_batches = 0
+        bucket_dice_totals: dict[str, float] = {}
+        bucket_iou_totals: dict[str, float] = {}
+        bucket_counts: dict[str, int] = {}
 
         autocast_device = self.device.type if self.device.type in {"cuda", "cpu"} else "cpu"
         stage = "train" if training else "val"
@@ -181,6 +254,22 @@ class Trainer:
             total_loss += float(loss.item())
             total_dice += dice_score(logits.detach(), masks.detach(), threshold=self.threshold)
             total_iou += iou_score(logits.detach(), masks.detach(), threshold=self.threshold)
+            if not training and "resolution_bucket" in batch:
+                batch_buckets = self._as_string_list(batch["resolution_bucket"])
+                batch_dice_scores = dice_scores(
+                    logits.detach(),
+                    masks.detach(),
+                    threshold=self.threshold,
+                ).detach().cpu().tolist()
+                batch_iou_scores = iou_scores(
+                    logits.detach(),
+                    masks.detach(),
+                    threshold=self.threshold,
+                ).detach().cpu().tolist()
+                for bucket, dice_value, iou_value in zip(batch_buckets, batch_dice_scores, batch_iou_scores):
+                    bucket_dice_totals[bucket] = bucket_dice_totals.get(bucket, 0.0) + float(dice_value)
+                    bucket_iou_totals[bucket] = bucket_iou_totals.get(bucket, 0.0) + float(iou_value)
+                    bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
             num_batches += 1
             if self.use_tqdm:
                 iterator.set_postfix(
@@ -192,11 +281,27 @@ class Trainer:
 
         prefix = stage
         divisor = max(num_batches, 1)
-        return {
+        metrics = {
             f"{prefix}_loss": total_loss / divisor,
             f"{prefix}_dice_per_patch": total_dice / divisor,
             f"{prefix}_iou_per_patch": total_iou / divisor,
         }
+        if not training and bucket_counts:
+            bucket_dice_values = []
+            bucket_iou_values = []
+            for bucket in sorted(bucket_counts):
+                dice_value = bucket_dice_totals[bucket] / bucket_counts[bucket]
+                iou_value = bucket_iou_totals[bucket] / bucket_counts[bucket]
+                metrics[f"val_dice_{bucket}"] = dice_value
+                metrics[f"val_iou_{bucket}"] = iou_value
+                bucket_dice_values.append(dice_value)
+                bucket_iou_values.append(iou_value)
+            metrics["val_dice_macro_resolution"] = sum(bucket_dice_values) / len(bucket_dice_values)
+            metrics["val_iou_macro_resolution"] = sum(bucket_iou_values) / len(bucket_iou_values)
+        elif not training:
+            metrics["val_dice_macro_resolution"] = metrics["val_dice_per_patch"]
+            metrics["val_iou_macro_resolution"] = metrics["val_iou_per_patch"]
+        return metrics
 
     def _evaluate_full_images(self, epoch: int, epochs: int) -> dict[str, float]:
         patch_size = int(self.data_config["patch_size"])
@@ -337,3 +442,54 @@ class Trainer:
         if value is None:
             return "n/a"
         return f"{value:.4f}"
+
+    @staticmethod
+    def _as_string_list(value) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        return [str(item) for item in value]
+
+    def _interval_index(self, epoch: int) -> int:
+        return (epoch - 1) // self.best_interval_checkpoint_epochs
+
+    def _interval_bounds(self, epoch: int, total_epochs: int | None = None) -> tuple[int, int]:
+        interval_start = self._interval_index(epoch) * self.best_interval_checkpoint_epochs + 1
+        interval_end = interval_start + self.best_interval_checkpoint_epochs - 1
+        if total_epochs is not None:
+            interval_end = min(interval_end, total_epochs)
+        return interval_start, interval_end
+
+    def _interval_checkpoint_name(self, epoch: int, total_epochs: int | None = None) -> str:
+        interval_start, interval_end = self._interval_bounds(epoch, total_epochs=total_epochs)
+        return f"best_epochs_{interval_start:03d}_{interval_end:03d}.pt"
+
+    def _checkpoint_manifest_row(
+        self,
+        path: Path,
+        epoch: int,
+        reason: str,
+        metrics: dict[str, Any],
+        total_epochs: int | None = None,
+    ) -> dict[str, Any]:
+        if reason == "interval_best":
+            epoch_start, epoch_end = self._interval_bounds(epoch, total_epochs=total_epochs)
+        else:
+            epoch_start = epoch
+            epoch_end = epoch
+        row: dict[str, Any] = {
+            "checkpoint": path.name,
+            "path": str(path),
+            "reason": reason,
+            "epoch": epoch,
+            "epoch_start": epoch_start,
+            "epoch_end": epoch_end,
+            "monitor": self.monitor,
+            "monitor_mode": self.monitor_mode,
+            "monitor_value": metrics.get(self.monitor),
+        }
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, str)) or value is None:
+                row[key] = value
+        return row
