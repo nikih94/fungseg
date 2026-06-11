@@ -36,6 +36,45 @@ class QualitativeEvaluationTests(unittest.TestCase):
         self.assertLessEqual(crop.foreground_ratio, 0.15)
         self.assertEqual(crop.selection_reason, "in_range")
 
+    def test_seeded_selection_is_repeatable(self) -> None:
+        mask = np.zeros((100, 600), dtype=np.uint8)
+        for index in range(6):
+            mask[:10, index * 100 : (index + 1) * 100] = 255
+
+        first = select_qualitative_crop(
+            mask_array=mask,
+            patch_size=100,
+            stride=100,
+            crop_patch_grid=(1, 1),
+            mask_threshold=127,
+            min_foreground_ratio=0.005,
+            max_foreground_ratio=0.15,
+            rng=np.random.default_rng(1),
+        )
+        repeat = select_qualitative_crop(
+            mask_array=mask,
+            patch_size=100,
+            stride=100,
+            crop_patch_grid=(1, 1),
+            mask_threshold=127,
+            min_foreground_ratio=0.005,
+            max_foreground_ratio=0.15,
+            rng=np.random.default_rng(1),
+        )
+        different_seed = select_qualitative_crop(
+            mask_array=mask,
+            patch_size=100,
+            stride=100,
+            crop_patch_grid=(1, 1),
+            mask_threshold=127,
+            min_foreground_ratio=0.005,
+            max_foreground_ratio=0.15,
+            rng=np.random.default_rng(2),
+        )
+
+        self.assertEqual(first, repeat)
+        self.assertNotEqual((first.x, first.y), (different_seed.x, different_seed.y))
+
     def test_border_patches_are_included_for_crop_stitching(self) -> None:
         crop = SelectedCrop(
             x=128,

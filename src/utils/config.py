@@ -141,6 +141,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "crop_patch_grid": [3, 3],
         "min_foreground_ratio": 0.005,
         "max_foreground_ratio": 0.15,
+        "selection_seed": 42,
         "max_checkpoints": None,
     },
 }

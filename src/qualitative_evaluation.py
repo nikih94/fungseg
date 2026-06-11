@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-patch-grid", nargs=2, type=int, default=None, metavar=("ROWS", "COLS"))
     parser.add_argument("--min-foreground-ratio", type=float, default=None)
     parser.add_argument("--max-foreground-ratio", type=float, default=None)
+    parser.add_argument("--selection-seed", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--max-checkpoints", type=int, default=None)
@@ -148,6 +149,7 @@ def select_qualitative_crop(
     mask_threshold: int,
     min_foreground_ratio: float,
     max_foreground_ratio: float,
+    rng: np.random.Generator | None = None,
 ) -> SelectedCrop:
     rows, cols = crop_patch_grid
     if rows <= 0 or cols <= 0:
@@ -189,12 +191,19 @@ def select_qualitative_crop(
             if foreground_ratio > 0:
                 non_empty.append((foreground_ratio, y0, x0, crop))
 
+    def choose_candidate(candidates: list[tuple[float, int, int, SelectedCrop]]) -> SelectedCrop:
+        ordered = sorted(candidates, key=lambda item: (item[0], item[1], item[2]))
+        if rng is None:
+            return ordered[0][3]
+        return ordered[int(rng.integers(0, len(ordered)))][3]
+
     if in_range:
-        return sorted(in_range, key=lambda item: (item[0], item[1], item[2]))[0][3]
+        return choose_candidate(in_range)
     if non_empty:
-        crop = sorted(non_empty, key=lambda item: (item[0], item[1], item[2]))[0][3]
-        return replace(crop, selection_reason="lowest_non_empty")
-    crop = sorted(all_crops, key=lambda item: (item[0], item[1], item[2]))[0][3]
+        crop = choose_candidate(non_empty)
+        selection_reason = "lowest_non_empty" if rng is None else "non_empty"
+        return replace(crop, selection_reason=selection_reason)
+    crop = choose_candidate(all_crops)
     return replace(crop, selection_reason="no_foreground")
 
 
@@ -302,11 +311,12 @@ def metric_row(
     }
 
 
-def crop_row(image_path: Path, mask_path: Path, crop: SelectedCrop) -> dict[str, Any]:
+def crop_row(image_path: Path, mask_path: Path, crop: SelectedCrop, selection_seed: int | None) -> dict[str, Any]:
     return {
         "image": image_path.name,
         "mask": mask_path.name,
         "image_stem": image_path.stem,
+        "selection_seed": selection_seed,
         "crop_x": crop.x,
         "crop_y": crop.y,
         "crop_width": crop.width,
@@ -381,6 +391,7 @@ def run_qualitative_evaluation(
     crop_patch_grid: tuple[int, int] | None = None,
     min_foreground_ratio: float | None = None,
     max_foreground_ratio: float | None = None,
+    selection_seed: int | None = None,
     threshold: float | None = None,
     device_name: str | None = None,
     max_checkpoints: int | None = None,
@@ -403,6 +414,11 @@ def run_qualitative_evaluation(
         if max_foreground_ratio is None
         else max_foreground_ratio
     )
+    selection_seed = (
+        qualitative_cfg.get("selection_seed", None) if selection_seed is None else selection_seed
+    )
+    selection_seed = None if selection_seed is None else int(selection_seed)
+    selection_rng = None if selection_seed is None else np.random.default_rng(selection_seed)
     threshold = float(config.get("inference", {}).get("threshold", 0.5) if threshold is None else threshold)
     device = resolve_device(device_name or str(config["train"].get("device", "auto")))
     max_checkpoints = qualitative_cfg.get("max_checkpoints") if max_checkpoints is None else max_checkpoints
@@ -470,9 +486,10 @@ def run_qualitative_evaluation(
             mask_threshold=mask_threshold,
             min_foreground_ratio=min_foreground_ratio,
             max_foreground_ratio=max_foreground_ratio,
+            rng=selection_rng,
         )
         selected_crops[image_path.stem] = crop
-        crop_rows.append(crop_row(image_path, mask_path, crop))
+        crop_rows.append(crop_row(image_path, mask_path, crop, selection_seed))
         image_crop = image_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width]
         target_crop = (mask_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width] > mask_threshold).astype(
             np.uint8
@@ -552,6 +569,7 @@ def main() -> None:
         crop_patch_grid=tuple(args.crop_patch_grid) if args.crop_patch_grid else None,
         min_foreground_ratio=args.min_foreground_ratio,
         max_foreground_ratio=args.max_foreground_ratio,
+        selection_seed=args.selection_seed,
         threshold=args.threshold,
         device_name=args.device,
         max_checkpoints=args.max_checkpoints,

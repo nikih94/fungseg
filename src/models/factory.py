@@ -112,6 +112,23 @@ def build_model(config: dict[str, Any]):
             _replace_decoder_layer_norms(model.decoder)
         return model
 
+    if model_name in {"segformer", "segformer_mit_b3"}:
+        import segmentation_models_pytorch as smp
+
+        if model_name == "segformer_mit_b3":
+            encoder_name = "mit_b3"
+
+        return smp.Segformer(
+            encoder_name=encoder_name,
+            encoder_weights=config.get("encoder_weights", "imagenet"),
+            encoder_depth=int(config.get("encoder_depth", 5)),
+            decoder_segmentation_channels=int(config.get("decoder_segmentation_channels", 256)),
+            in_channels=config.get("in_channels", 3),
+            classes=config.get("num_classes", 1),
+            activation=None,
+            upsampling=int(config.get("upsampling", 4)),
+        )
+
     if model_name == "deeplabv3_resnet50":
         import torchvision.models.segmentation as tv_segmentation
 

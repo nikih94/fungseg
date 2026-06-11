@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,10 @@ from src.patching import _compute_positions, crop_and_pad_array
 from src.utils.checkpoint import load_checkpoint
 from src.utils.config import load_config
 from src.utils.io import ensure_dir, save_mask_image
+
+
+Image.MAX_IMAGE_PIXELS = None
+warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,11 +65,10 @@ def save_rgb_image(path: Path, image_array: np.ndarray) -> None:
     Image.fromarray(image_array.astype(np.uint8)).save(path)
 
 
-def run_inference_on_image(
+def predict_probabilities_on_image(
     model, image_path: Path, config: dict, device: torch.device
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> np.ndarray:
     data_cfg = config["data"]
-    threshold = float(config["inference"]["threshold"])
     transforms = get_val_transforms(
         data_cfg.get("image_size"),
         augmentations_config=config.get("augmentations", {}),
@@ -103,7 +107,21 @@ def run_inference_on_image(
             probability_count[y : y + valid_height, x : x + valid_width] += 1.0
 
     averaged_probabilities = probability_sum / np.clip(probability_count, a_min=1.0, a_max=None)
-    binary_mask = (averaged_probabilities >= threshold).astype(np.uint8) * 255
+    return averaged_probabilities
+
+
+def probabilities_to_binary_mask(probabilities: np.ndarray, threshold: float) -> np.ndarray:
+    return (probabilities >= threshold).astype(np.uint8) * 255
+
+
+def run_inference_on_image(
+    model, image_path: Path, config: dict, device: torch.device
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    threshold = float(config["inference"]["threshold"])
+    averaged_probabilities = predict_probabilities_on_image(model, image_path, config, device)
+    binary_mask = probabilities_to_binary_mask(averaged_probabilities, threshold)
+    with Image.open(image_path) as image:
+        image_array = np.array(image.convert("RGB"))
     overlay = create_overlay(image_array, binary_mask)
     return averaged_probabilities, binary_mask, overlay
 

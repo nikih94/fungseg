@@ -1,5 +1,5 @@
 project:
-  name: fungi_segmentation
+  name: fungi_segmentation_segformer_mit_b3
 
 paths:
   images_dir: data/images
@@ -33,7 +33,6 @@ data:
     strategy: balanced_resolution_source
     samples_per_epoch: native_patch_count
     replacement: true
-
 
 augmentations:
   normalize: # do not touch this
@@ -78,21 +77,21 @@ split:
   val_source_ids: ['job_7_IN183 YNA 48h x500 1.tif','job_4_IN183 Agar 48h x500 3.tif','job_2_IN125 Agar 48h x500 2.tif','job_3_IN125 SNA 48h x500 3.tif','job_6_IN183 SNA 48h x500 4.tif']
 
 model:
-  name: unetplusplus_resnet34
+  name: segformer_mit_b3
   in_channels: 3
   num_classes: 1
-  encoder_name: resnet34
+  encoder_name: mit_b3
   encoder_weights: imagenet
-  decoder_normalization: instancenorm
-  decoder_channels: [256, 128, 64, 32, 16]
-  decoder_attention_type: scse # set to scse to enable SMP scSE attention in the decoder
+  encoder_depth: 5
+  decoder_segmentation_channels: 256
+  upsampling: 4
 
 loss:
   name: bce_dice_cldice
-  bce_weight: 0
+  bce_weight: 0.3
   dice_weight: 0.5
-  soft_cldice_weight: 0.5
-  iterations: 30
+  soft_cldice_weight: 0.2
+  iterations: 10
   smooth: 1.0e-6
   cldice_smooth: 1.0
 
@@ -109,10 +108,8 @@ scheduler:
   min_lr: 1.0e-6
   monitor: val_dice_macro_resolution
 
-
-
 train:
-  epochs: 80
+  epochs: 120
   mixed_precision: true
   grad_clip: 1.0
   monitor: val_dice_macro_resolution
@@ -135,7 +132,7 @@ qualitative_evaluation:
   enabled: true
   data_root: data/qualitative_evaluation
   crop_patch_grid: [3, 3]
+  selection_seed: 42
   min_foreground_ratio: 0.005
   max_foreground_ratio: 0.15
-  selection_seed: 42
   max_checkpoints: null

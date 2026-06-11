@@ -26,6 +26,12 @@ Put source images in `data/images` and binary masks in `data/masks`.
 python -m src.train --config config.yaml
 ```
 
+To train the SegFormer MiT-B3 variant with 512 pixel patches:
+
+```bash
+python -m src.train --config config_segformer_mit_b3.yaml
+```
+
 Training does the following:
 
 1. Loads `config.yaml`.
@@ -55,6 +61,17 @@ python -m src.inference \
 
 Inference uses the same patch size and stride as training, predicts on overlapping patches, averages overlapping probabilities, and saves binary masks, overlay previews, and optional probability maps.
 
+### Recursive In-Folder Inference
+
+```bash
+python -m src.in_folder_inference \
+  --config config_segformer_mit_b3.yaml \
+  --checkpoint runs/fungi_segmentation_segformer_mit_b3_20260528_171100/fold_0/best.pt \
+  --input data/images
+```
+
+This variant processes every supported image in the input folder and its subfolders, writes only binary masks next to the original images, and preserves each image stem with a `_mask.png` suffix. For example, `data/images/sample.tif` becomes `data/images/sample_mask.png`. Existing or generated `*_mask.png` files are skipped as inputs so reruns do not create nested mask names.
+
 ## Qualitative Evaluation
 
 ```bash
@@ -81,8 +98,13 @@ Supported model names currently include:
 - `unetplusplus_resnet18`
 - `unetplusplus_resnet34`
 - `unetplusplus_resnet50`
+- `segformer_mit_b3`
 - `deeplabv3_resnet50`
 - `fcn_resnet50`
+
+`segformer_mit_b3` uses SMP `Segformer` with an ImageNet-pretrained MiT-B3 encoder. The dedicated
+`config_segformer_mit_b3.yaml` keeps the existing pipeline features but changes training patches to
+512 pixels with 50% overlap.
 
 For SMP `Unet++` models, the decoder can be configured with:
 
@@ -251,6 +273,7 @@ All important settings live in `config.yaml`.
 - `crop_patch_grid`: number of patch origins in the selected crop, such as `[3, 3]`.
 - `min_foreground_ratio`: minimum foreground fraction for automatic crop selection.
 - `max_foreground_ratio`: maximum foreground fraction for automatic crop selection.
+- `selection_seed`: random seed for repeatable qualitative crop selection. Set to `null` to use the deterministic best-match crop.
 - `max_checkpoints`: optional cap on manifest checkpoints to evaluate.
 
 ## Repository Guide

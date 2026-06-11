@@ -88,6 +88,7 @@ Model construction and output normalization live here.
 - `norms.py`: custom 2D LayerNorm helper used when `decoder_normalization` is set to `layernorm`.
 
 This folder is important because it keeps model-specific details out of the training loop.
+The factory supports SMP Unet++, SMP SegFormer with MiT-B3, and torchvision FCN/DeepLabV3 baselines.
 
 ### `src/losses/`
 
@@ -197,7 +198,7 @@ That separation is what makes it practical to swap models, losses, schedulers, a
 
 - `torch`: model definition, tensor operations, optimization, AMP, and checkpoint loading.
 - `torchvision`: optional segmentation baselines such as FCN and DeepLabV3.
-- `segmentation-models-pytorch`: main implementation source for Unet++ and encoder backbones.
+- `segmentation-models-pytorch`: main implementation source for Unet++, SegFormer, and encoder backbones.
 - `albumentations`: image and mask augmentations for training and validation.
 - `numpy`: array manipulation for masks, patches, stitching, and metric preparation.
 - `Pillow`: image file loading and saving.
