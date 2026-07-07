@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import gc
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +22,25 @@ from src.metrics.segmentation import (
     iou_score_from_masks,
     iou_scores,
 )
+from src.metrics.loss_components import loss_component_metrics
 from src.models.wrappers import extract_logits
 from src.patching import OriginalImageRecord, _compute_positions, crop_and_pad_array
 from src.utils.checkpoint import save_checkpoint
 from src.utils.io import save_csv, save_json
+
+
+def shutdown_dataloader(loader: DataLoader | None) -> None:
+    if loader is None:
+        return
+
+    iterator = getattr(loader, "_iterator", None)
+    shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+    if shutdown_workers is not None:
+        with suppress(Exception):
+            shutdown_workers()
+    with suppress(Exception):
+        loader._iterator = None
+    gc.collect()
 
 
 class Trainer:
@@ -35,6 +52,7 @@ class Trainer:
         scheduler,
         device: torch.device,
         train_config: dict[str, Any],
+        loss_config: dict[str, Any] | None,
         logger,
         fold_dir: Path,
         data_config: dict[str, Any],
@@ -49,6 +67,7 @@ class Trainer:
         self.scheduler = scheduler
         self.device = device
         self.train_config = train_config
+        self.loss_config = loss_config or {}
         self.logger = logger
         self.fold_dir = fold_dir
         self.data_config = data_config
@@ -73,7 +92,13 @@ class Trainer:
             augmentations_config=self.augmentations_config,
         )
 
-    def fit(self, train_loader: DataLoader, val_loader: DataLoader, epochs: int) -> dict[str, Any]:
+    def fit(
+        self,
+        train_loader: DataLoader | None,
+        val_loader: DataLoader,
+        epochs: int,
+        train_loader_factory=None,
+    ) -> dict[str, Any]:
         best_metric = -math.inf if self.monitor_mode == "max" else math.inf
         interval_best_metric = -math.inf if self.monitor_mode == "max" else math.inf
         interval_index = 0
@@ -81,57 +106,41 @@ class Trainer:
         epoch_rows: list[dict[str, float]] = []
         checkpoint_manifest: dict[str, dict[str, Any]] = {}
 
-        for epoch in range(1, epochs + 1):
-            current_interval_index = self._interval_index(epoch)
-            if current_interval_index != interval_index:
-                interval_index = current_interval_index
-                interval_best_metric = -math.inf if self.monitor_mode == "max" else math.inf
+        try:
+            for epoch in range(1, epochs + 1):
+                current_interval_index = self._interval_index(epoch)
+                if current_interval_index != interval_index:
+                    interval_index = current_interval_index
+                    interval_best_metric = -math.inf if self.monitor_mode == "max" else math.inf
 
-            train_metrics = self._run_epoch(train_loader, training=True, epoch=epoch, epochs=epochs)
-            val_metrics = self._run_epoch(val_loader, training=False, epoch=epoch, epochs=epochs)
-            if self._should_run_per_image_validation(epoch):
-                val_metrics.update(self._evaluate_full_images(epoch=epoch, epochs=epochs))
-            epoch_metrics = {
-                "epoch": epoch,
-                "lr": self._current_lr(),
-                **train_metrics,
-                **val_metrics,
-            }
-            history.append(epoch_metrics)
-            epoch_rows.append({"fold": self.fold_index, **epoch_metrics})
+                if train_loader_factory is not None:
+                    shutdown_dataloader(train_loader)
+                    train_loader = train_loader_factory(epoch)
+                if train_loader is None:
+                    raise RuntimeError("A train DataLoader or train_loader_factory is required.")
 
-            current_metric = float(epoch_metrics[self.monitor])
-            is_best = current_metric > best_metric if self.monitor_mode == "max" else current_metric < best_metric
-            if is_best:
-                best_metric = current_metric
-                best_path = self.fold_dir / "best.pt"
-                save_checkpoint(
-                    best_path,
-                    self.model,
-                    self.optimizer,
-                    self.scheduler,
-                    epoch,
-                    epoch_metrics,
-                    self.train_config,
-                )
-                checkpoint_manifest[str(best_path.name)] = self._checkpoint_manifest_row(
-                    best_path,
-                    epoch,
-                    "global_best",
-                    epoch_metrics,
-                )
+                train_metrics = self._run_epoch(train_loader, training=True, epoch=epoch, epochs=epochs)
+                if train_loader_factory is not None:
+                    shutdown_dataloader(train_loader)
+                val_metrics = self._run_epoch(val_loader, training=False, epoch=epoch, epochs=epochs)
+                if self._should_run_per_image_validation(epoch):
+                    val_metrics.update(self._evaluate_full_images(epoch=epoch, epochs=epochs))
+                epoch_metrics = {
+                    "epoch": epoch,
+                    "lr": self._current_lr(),
+                    **train_metrics,
+                    **val_metrics,
+                }
+                history.append(epoch_metrics)
+                epoch_rows.append({"fold": self.fold_index, **epoch_metrics})
 
-            if self.best_interval_checkpoint_enabled:
-                interval_is_best = (
-                    current_metric > interval_best_metric
-                    if self.monitor_mode == "max"
-                    else current_metric < interval_best_metric
-                )
-                if interval_is_best:
-                    interval_best_metric = current_metric
-                    interval_path = self.fold_dir / self._interval_checkpoint_name(epoch, epochs)
+                current_metric = float(epoch_metrics[self.monitor])
+                is_best = current_metric > best_metric if self.monitor_mode == "max" else current_metric < best_metric
+                if is_best:
+                    best_metric = current_metric
+                    best_path = self.fold_dir / "best.pt"
                     save_checkpoint(
-                        interval_path,
+                        best_path,
                         self.model,
                         self.optimizer,
                         self.scheduler,
@@ -139,46 +148,74 @@ class Trainer:
                         epoch_metrics,
                         self.train_config,
                     )
-                    checkpoint_manifest[str(interval_path.name)] = self._checkpoint_manifest_row(
-                        interval_path,
+                    checkpoint_manifest[str(best_path.name)] = self._checkpoint_manifest_row(
+                        best_path,
                         epoch,
-                        "interval_best",
+                        "global_best",
                         epoch_metrics,
-                        total_epochs=epochs,
                     )
 
-            last_path = self.fold_dir / "last.pt"
-            save_checkpoint(
-                last_path,
-                self.model,
-                self.optimizer,
-                self.scheduler,
-                epoch,
-                epoch_metrics,
-                self.train_config,
-            )
-            checkpoint_manifest[str(last_path.name)] = self._checkpoint_manifest_row(
-                last_path,
-                epoch,
-                "last",
-                epoch_metrics,
-            )
+                if self.best_interval_checkpoint_enabled:
+                    interval_is_best = (
+                        current_metric > interval_best_metric
+                        if self.monitor_mode == "max"
+                        else current_metric < interval_best_metric
+                    )
+                    if interval_is_best:
+                        interval_best_metric = current_metric
+                        interval_path = self.fold_dir / self._interval_checkpoint_name(epoch, epochs)
+                        save_checkpoint(
+                            interval_path,
+                            self.model,
+                            self.optimizer,
+                            self.scheduler,
+                            epoch,
+                            epoch_metrics,
+                            self.train_config,
+                        )
+                        checkpoint_manifest[str(interval_path.name)] = self._checkpoint_manifest_row(
+                            interval_path,
+                            epoch,
+                            "interval_best",
+                            epoch_metrics,
+                            total_epochs=epochs,
+                        )
 
-            self._step_scheduler(epoch_metrics)
-            self._log_tensorboard(epoch_metrics, epoch)
-            self.logger.info(
-                "Epoch %s/%s - lr=%.8f train_loss=%.4f val_loss=%.4f val_dice_per_patch=%.4f val_iou_per_patch=%.4f val_dice_macro_resolution=%.4f val_dice_per_image=%s val_iou_per_image=%s",
-                epoch,
-                epochs,
-                epoch_metrics["lr"],
-                epoch_metrics["train_loss"],
-                epoch_metrics["val_loss"],
-                epoch_metrics["val_dice_per_patch"],
-                epoch_metrics["val_iou_per_patch"],
-                epoch_metrics["val_dice_macro_resolution"],
-                self._format_optional_metric(epoch_metrics.get("val_dice_per_image")),
-                self._format_optional_metric(epoch_metrics.get("val_iou_per_image")),
-            )
+                last_path = self.fold_dir / "last.pt"
+                save_checkpoint(
+                    last_path,
+                    self.model,
+                    self.optimizer,
+                    self.scheduler,
+                    epoch,
+                    epoch_metrics,
+                    self.train_config,
+                )
+                checkpoint_manifest[str(last_path.name)] = self._checkpoint_manifest_row(
+                    last_path,
+                    epoch,
+                    "last",
+                    epoch_metrics,
+                )
+
+                self._step_scheduler(epoch_metrics)
+                self._log_tensorboard(epoch_metrics, epoch)
+                self.logger.info(
+                    "Epoch %s/%s - lr=%.8f train_loss=%.4f val_loss=%.4f val_dice_per_patch=%.4f val_iou_per_patch=%.4f val_dice_macro_resolution=%.4f val_dice_per_image=%s val_iou_per_image=%s",
+                    epoch,
+                    epochs,
+                    epoch_metrics["lr"],
+                    epoch_metrics["train_loss"],
+                    epoch_metrics["val_loss"],
+                    epoch_metrics["val_dice_per_patch"],
+                    epoch_metrics["val_iou_per_patch"],
+                    epoch_metrics["val_dice_macro_resolution"],
+                    self._format_optional_metric(epoch_metrics.get("val_dice_per_image")),
+                    self._format_optional_metric(epoch_metrics.get("val_iou_per_image")),
+                )
+        finally:
+            shutdown_dataloader(train_loader)
+            shutdown_dataloader(val_loader)
 
         metrics_payload = {
             "best_metric": best_metric,
@@ -218,66 +255,80 @@ class Trainer:
         bucket_dice_totals: dict[str, float] = {}
         bucket_iou_totals: dict[str, float] = {}
         bucket_counts: dict[str, int] = {}
+        component_totals: dict[str, float] = {}
 
         autocast_device = self.device.type if self.device.type in {"cuda", "cpu"} else "cpu"
         stage = "train" if training else "val"
+        progress = None
         iterator = loader
         if self.use_tqdm:
-            iterator = tqdm(
+            progress = tqdm(
                 loader,
                 desc=f"Fold {self.fold_index} | Epoch {epoch}/{epochs} | {stage}",
                 leave=False,
             )
+            iterator = progress
 
-        for batch in iterator:
-            images = batch["image"].to(self.device, non_blocking=True)
-            masks = batch["mask"].to(self.device, non_blocking=True)
-
-            if training:
-                self.optimizer.zero_grad(set_to_none=True)
-
-            context = torch.enable_grad() if training else torch.no_grad()
-            with context:
-                with torch.amp.autocast(device_type=autocast_device, enabled=self.use_amp):
-                    logits = extract_logits(self.model(images))
-                    loss = self.loss_fn(logits, masks)
+        try:
+            for batch in iterator:
+                images = batch["image"].to(self.device, non_blocking=True)
+                masks = batch["mask"].to(self.device, non_blocking=True)
 
                 if training:
-                    self.scaler.scale(loss).backward()
-                    grad_clip = self.train_config.get("grad_clip")
-                    if grad_clip is not None:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(grad_clip))
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
 
-            total_loss += float(loss.item())
-            total_dice += dice_score(logits.detach(), masks.detach(), threshold=self.threshold)
-            total_iou += iou_score(logits.detach(), masks.detach(), threshold=self.threshold)
-            if not training and "resolution_bucket" in batch:
-                batch_buckets = self._as_string_list(batch["resolution_bucket"])
-                batch_dice_scores = dice_scores(
-                    logits.detach(),
-                    masks.detach(),
-                    threshold=self.threshold,
-                ).detach().cpu().tolist()
-                batch_iou_scores = iou_scores(
-                    logits.detach(),
-                    masks.detach(),
-                    threshold=self.threshold,
-                ).detach().cpu().tolist()
-                for bucket, dice_value, iou_value in zip(batch_buckets, batch_dice_scores, batch_iou_scores):
-                    bucket_dice_totals[bucket] = bucket_dice_totals.get(bucket, 0.0) + float(dice_value)
-                    bucket_iou_totals[bucket] = bucket_iou_totals.get(bucket, 0.0) + float(iou_value)
-                    bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-            num_batches += 1
-            if self.use_tqdm:
-                iterator.set_postfix(
-                    lr=f"{self._current_lr():.2e}",
-                    loss=f"{total_loss / num_batches:.4f}",
-                    dice=f"{total_dice / num_batches:.4f}",
-                    iou=f"{total_iou / num_batches:.4f}",
-                )
+                context = torch.enable_grad() if training else torch.no_grad()
+                with context:
+                    with torch.amp.autocast(device_type=autocast_device, enabled=self.use_amp):
+                        logits = extract_logits(self.model(images))
+                        loss = self.loss_fn(logits, masks)
+
+                    if training:
+                        self.scaler.scale(loss).backward()
+                        grad_clip = self.train_config.get("grad_clip")
+                        if grad_clip is not None:
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(grad_clip))
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+
+                total_loss += float(loss.item())
+                total_dice += dice_score(logits.detach(), masks.detach(), threshold=self.threshold)
+                total_iou += iou_score(logits.detach(), masks.detach(), threshold=self.threshold)
+                with torch.no_grad():
+                    batch_components = loss_component_metrics(logits.detach(), masks.detach(), self.loss_config)
+                for metric_name, metric_value in batch_components.items():
+                    component_totals[metric_name] = component_totals.get(metric_name, 0.0) + float(metric_value)
+                if not training and "resolution_bucket" in batch:
+                    batch_buckets = self._as_string_list(batch["resolution_bucket"])
+                    batch_dice_scores = dice_scores(
+                        logits.detach(),
+                        masks.detach(),
+                        threshold=self.threshold,
+                    ).detach().cpu().tolist()
+                    batch_iou_scores = iou_scores(
+                        logits.detach(),
+                        masks.detach(),
+                        threshold=self.threshold,
+                    ).detach().cpu().tolist()
+                    for bucket, dice_value, iou_value in zip(batch_buckets, batch_dice_scores, batch_iou_scores):
+                        bucket_dice_totals[bucket] = bucket_dice_totals.get(bucket, 0.0) + float(dice_value)
+                        bucket_iou_totals[bucket] = bucket_iou_totals.get(bucket, 0.0) + float(iou_value)
+                        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+                num_batches += 1
+                if progress is not None:
+                    progress.set_postfix(
+                        lr=f"{self._current_lr():.2e}",
+                        loss=f"{total_loss / num_batches:.4f}",
+                        dice=f"{total_dice / num_batches:.4f}",
+                        iou=f"{total_iou / num_batches:.4f}",
+                    )
+                del batch, images, masks, logits, loss
+        finally:
+            if progress is not None:
+                progress.close()
+            del iterator
+            gc.collect()
 
         prefix = stage
         divisor = max(num_batches, 1)
@@ -286,6 +337,12 @@ class Trainer:
             f"{prefix}_dice_per_patch": total_dice / divisor,
             f"{prefix}_iou_per_patch": total_iou / divisor,
         }
+        metrics.update(
+            {
+                f"{prefix}_{metric_name}": metric_total / divisor
+                for metric_name, metric_total in sorted(component_totals.items())
+            }
+        )
         if not training and bucket_counts:
             bucket_dice_values = []
             bucket_iou_values = []

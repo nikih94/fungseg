@@ -1,98 +1,163 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
-import torch
+import yaml
+from PIL import Image
 
-from src.data.sampling import build_balanced_resolution_source_sampler
 from src.patching import (
     OriginalImageRecord,
-    PatchRecord,
     _compute_positions,
+    build_patch_records,
+    compute_shifted_positions,
+    crop_and_pad_array,
     crop_scaled_mask_patch,
-    resolve_scale_specs,
 )
 
 
-MULTISCALE_CONFIG = {
-    "enabled": True,
-    "include_native": True,
-    "target_long_edges": [1200, 1600, 2400, 3200],
-    "max_scale": 1.0,
-    "deduplicate_scale_tolerance": 0.03,
+PATCHING_CONFIG = {
+    "patch_size": 256,
+    "overlap": 128,
+    "stride": 128,
+    "filter_empty_patches": False,
+    "mask_threshold": 127,
+    "min_foreground_pixels": 1,
+    "image_resampling": "lanczos",
+    "mask_resampling": "foreground_preserving",
+    "train": {
+        "random_offset": {"enabled": True, "max_fraction_of_patch": 0.5},
+        "scaled_context": {
+            "enabled": True,
+            "probability": 0.25,
+            "max_scale": 2.0,
+            "beta_alpha": 1.0,
+            "beta_beta": 4.0,
+        },
+    },
+    "validation": {
+        "random_offset": {"enabled": False},
+        "scaled_context": {"enabled": False},
+    },
 }
 
 
-class MultiScaleTests(unittest.TestCase):
-    def test_scale_generation_for_large_and_small_images(self) -> None:
-        large = OriginalImageRecord("large", Path("image.tif"), Path("mask.png"), 9607, 6820)
-        small = OriginalImageRecord("small", Path("image.tif"), Path("mask.png"), 1600, 1200)
+def _write_pair(root: Path, width: int = 1024, height: int = 1024) -> OriginalImageRecord:
+    image_path = root / "image.tif"
+    mask_path = root / "mask.png"
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    image[..., 1] = 128
+    mask = np.ones((height, width), dtype=np.uint8) * 255
+    Image.fromarray(image).save(image_path)
+    Image.fromarray(mask).save(mask_path)
+    return OriginalImageRecord(image_path.name, image_path, mask_path, width, height)
 
-        large_specs = resolve_scale_specs(large, MULTISCALE_CONFIG)
-        small_specs = resolve_scale_specs(small, MULTISCALE_CONFIG)
 
-        self.assertEqual(
-            [spec["scale_label"] for spec in large_specs],
-            ["long_edge_1200", "long_edge_1600", "long_edge_2400", "long_edge_3200", "native"],
-        )
-        self.assertEqual(
-            [(spec["scaled_width"], spec["scaled_height"]) for spec in large_specs],
-            [(1200, 852), (1600, 1136), (2400, 1704), (3200, 2272), (9607, 6820)],
-        )
-        self.assertEqual(
-            [spec["scale_label"] for spec in small_specs],
-            ["long_edge_1200", "native"],
-        )
-
-    def test_virtual_patch_geometry_and_foreground_preservation(self) -> None:
-        mask = np.zeros((1024, 1024), dtype=np.uint8)
-        mask[10:1014, 512] = 255
-
-        patch = crop_scaled_mask_patch(
-            mask,
-            x=0,
-            y=0,
-            patch_size=256,
-            scale=0.25,
-            mask_threshold=127,
-            resampling="foreground_preserving",
-        )
-
-        self.assertEqual(patch.shape, (256, 256))
-        self.assertGreater(int((patch > 127).sum()), 0)
+class DynamicPatchingTests(unittest.TestCase):
+    def test_shifted_positions_keep_edges(self) -> None:
         self.assertEqual(_compute_positions(1200, 256, 128)[-1], 944)
+        self.assertEqual(compute_shifted_positions(512, 256, 128, 37), [0, 37, 165, 256])
 
-    def test_balanced_sampler_uses_native_patch_count_epoch_length(self) -> None:
-        records = [
-            PatchRecord("a", Path("i"), Path("m"), 0, 0, 256, 1.0, 1600, 1200, "bucket_1600", "native"),
-            PatchRecord("a", Path("i"), Path("m"), 1, 0, 256, 1.0, 1600, 1200, "bucket_1600", "native"),
-            PatchRecord("b", Path("i"), Path("m"), 0, 0, 256, 0.5, 1200, 900, "bucket_1200", "long_edge_1200"),
-            PatchRecord("b", Path("i"), Path("m"), 1, 0, 256, 0.5, 1200, 900, "bucket_1200", "long_edge_1200"),
-            PatchRecord("b", Path("i"), Path("m"), 2, 0, 256, 0.5, 1200, 900, "bucket_1200", "long_edge_1200"),
-            PatchRecord("c", Path("i"), Path("m"), 0, 0, 256, 0.5, 1200, 900, "bucket_1200", "long_edge_1200"),
-        ]
+    def test_epoch_plans_are_reproducible_and_change_by_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _write_pair(Path(tmp))
+            first = build_patch_records([record], PATCHING_CONFIG, phase="train", epoch=3, base_seed=42)
+            second = build_patch_records([record], PATCHING_CONFIG, phase="train", epoch=3, base_seed=42)
+            different = build_patch_records([record], PATCHING_CONFIG, phase="train", epoch=4, base_seed=42)
 
-        _, diagnostics = build_balanced_resolution_source_sampler(
-            records,
-            {
-                "strategy": "balanced_resolution_source",
-                "samples_per_epoch": "native_patch_count",
-                "replacement": True,
+        self.assertEqual([(item.x, item.y, item.scale) for item in first], [(item.x, item.y, item.scale) for item in second])
+        self.assertNotEqual([(item.x, item.y, item.scale) for item in first], [(item.x, item.y, item.scale) for item in different])
+
+    def test_scaled_context_distribution_and_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _write_pair(Path(tmp), width=4096, height=4096)
+            records = build_patch_records([record], PATCHING_CONFIG, phase="train", epoch=1, base_seed=42)
+
+        scales = [item.scale for item in records]
+        scaled = [scale for scale in scales if scale > 1.0]
+        self.assertTrue(all(1.0 <= scale <= 2.0 for scale in scales))
+        self.assertGreater(len(scaled) / len(records), 0.15)
+        self.assertLess(len(scaled) / len(records), 0.30)
+        self.assertLess(sum(scale > 1.5 for scale in scales) / len(records), 0.05)
+
+    def test_border_patches_fall_back_when_context_does_not_fit(self) -> None:
+        config = {
+            **PATCHING_CONFIG,
+            "train": {
+                "random_offset": {"enabled": False},
+                "scaled_context": {
+                    "enabled": True,
+                    "probability": 1.0,
+                    "max_scale": 2.0,
+                    "beta_alpha": 1.0,
+                    "beta_beta": 4.0,
+                },
             },
-            generator=torch.Generator().manual_seed(42),
-        )
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _write_pair(Path(tmp), width=512, height=512)
+            records = build_patch_records([record], config, phase="train", epoch=1, base_seed=42)
 
-        self.assertEqual(diagnostics["samples_per_epoch"], 2)
-        self.assertAlmostEqual(
-            diagnostics["effective_samples_per_bucket"]["bucket_1200"],
-            diagnostics["effective_samples_per_bucket"]["bucket_1600"],
-        )
-        self.assertAlmostEqual(
-            diagnostics["weight_by_resolution_bucket_source"]["bucket_1200::b"],
-            diagnostics["weight_by_resolution_bucket_source"]["bucket_1200::c"],
-        )
+        by_xy = {(item.x, item.y): item for item in records}
+        self.assertEqual(by_xy[(0, 0)].scale, 1.0)
+        self.assertGreater(by_xy[(128, 128)].scale, 1.0)
+        self.assertEqual(by_xy[(256, 256)].scale, 1.0)
+
+    def test_scaled_crop_resizes_context_and_preserves_foreground(self) -> None:
+        mask = np.zeros((512, 512), dtype=np.uint8)
+        mask[100:412, 256] = 255
+        normal = crop_scaled_mask_patch(mask, 128, 128, 256, 1.0, 127)
+        expected = crop_and_pad_array(mask, 128, 128, 256)
+        scaled = crop_scaled_mask_patch(mask, 128, 128, 256, 2.0, 127)
+
+        self.assertTrue(np.array_equal(normal, expected))
+        self.assertEqual(scaled.shape, (256, 256))
+        self.assertGreater(int((scaled > 127).sum()), 0)
+
+    def test_explain_cli_runs_on_tiny_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images_dir = root / "images"
+            masks_dir = root / "masks"
+            images_dir.mkdir()
+            masks_dir.mkdir()
+            image = np.zeros((512, 512, 3), dtype=np.uint8)
+            mask = np.ones((512, 512), dtype=np.uint8) * 255
+            Image.fromarray(image).save(images_dir / "sample.tif")
+            Image.fromarray(mask).save(masks_dir / "sample.png")
+            config_path = root / "config.yaml"
+            config = {
+                "project": {"name": "test"},
+                "paths": {
+                    "images_dir": str(images_dir),
+                    "masks_dir": str(masks_dir),
+                    "outputs_dir": str(root / "outputs"),
+                },
+                "data": {"image_extensions": [".tif"], "num_workers": 0, "batch_size": 1},
+                "patching": PATCHING_CONFIG,
+                "train": {"seed": 7},
+            }
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, "-m", "src.patching.explain", "--config", str(config_path), "--epoch", "1"],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+        self.assertIn("Images matched: 1", result.stdout)
+        self.assertIn("Scaled-context patches:", result.stdout)
+        self.assertIn("Patches by source and source-crop resolution:", result.stdout)
+        self.assertIn("<=256", result.stdout)
+        self.assertIn("<=512", result.stdout)
+        self.assertIn("percent", result.stdout)
+        self.assertIn("100.0%", result.stdout)
 
 
 if __name__ == "__main__":

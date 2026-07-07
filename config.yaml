@@ -9,30 +9,37 @@ paths:
 
 data:
   image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+  num_workers: 8
+  persistent_workers: false
+  prefetch_factor: 4
+  pin_memory: true
+  batch_size: 8
+  image_size: null
+
+patching:
   patch_size: 512
   overlap: 256
   stride: 256
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 128
-  num_workers: 22
-  persistent_workers: true
-  prefetch_factor: 8
-  pin_memory: true
-  batch_size: 8
-  image_size: null
-  multiscale:
-    enabled: true
-    include_native: true
-    target_long_edges: [1200, 1600, 2400, 3200]
-    max_scale: 1.0
-    deduplicate_scale_tolerance: 0.03
-    image_resampling: lanczos
-    mask_resampling: foreground_preserving
-  sampling:
-    strategy: balanced_resolution_source
-    samples_per_epoch: native_patch_count
-    replacement: true
+  image_resampling: lanczos
+  mask_resampling: foreground_preserving
+  train:
+    random_offset:
+      enabled: true
+      max_fraction_of_patch: 0.5
+    scaled_context:
+      enabled: true
+      probability: 0.3
+      max_scale: 2.0
+      beta_alpha: 1.0
+      beta_beta: 2.0
+  validation:
+    random_offset:
+      enabled: false
+    scaled_context:
+      enabled: false
 
 
 augmentations:
@@ -74,7 +81,7 @@ cv:
   random_state: 42
 
 split:
-  mode: train_val # train_val or kfold
+  mode: kfold #train_val # train_val or kfold
   val_source_ids: ['job_7_IN183 YNA 48h x500 1.tif','job_4_IN183 Agar 48h x500 3.tif','job_2_IN125 Agar 48h x500 2.tif','job_3_IN125 SNA 48h x500 3.tif','job_6_IN183 SNA 48h x500 4.tif']
 
 model:
@@ -83,7 +90,7 @@ model:
   num_classes: 1
   encoder_name: resnet34
   encoder_weights: imagenet
-  decoder_normalization: instancenorm
+  decoder_normalization: batchnorm
   decoder_channels: [256, 128, 64, 32, 16]
   decoder_attention_type: scse # set to scse to enable SMP scSE attention in the decoder
 

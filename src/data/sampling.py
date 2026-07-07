@@ -27,7 +27,7 @@ def patch_distribution(records: list[PatchRecord]) -> dict[str, Any]:
 
 def _resolve_samples_per_epoch(value: Any, records: list[PatchRecord]) -> int:
     if value is None or str(value).strip().lower() == "native_patch_count":
-        native_count = sum(1 for record in records if record.scale_label == "native")
+        native_count = sum(1 for record in records if record.scale_label in {"native", "normal"})
         return native_count or len(records)
     return int(value)
 

@@ -79,8 +79,9 @@ def predict_probabilities_on_image(
         image_array = np.array(rgb_image)
 
     height, width = image_array.shape[:2]
-    patch_size = int(data_cfg["patch_size"])
-    stride = int(data_cfg["stride"])
+    patching_cfg = config["patching"]
+    patch_size = int(patching_cfg["patch_size"])
+    stride = int(patching_cfg["stride"])
     xs = _compute_positions(width, patch_size, stride)
     ys = _compute_positions(height, patch_size, stride)
 

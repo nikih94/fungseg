@@ -117,6 +117,9 @@ class SegmentationPatchDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
+    def set_records(self, records: list[PatchRecord]) -> None:
+        self.records = records
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
 
@@ -172,4 +175,5 @@ class SegmentationPatchDataset(Dataset):
             "scaled_height": record.scaled_height,
             "resolution_bucket": record.resolution_bucket,
             "scale_label": record.scale_label,
+            "source_crop_size": record.source_crop_size or record.patch_size,
         }

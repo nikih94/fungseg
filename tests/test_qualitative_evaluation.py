@@ -9,6 +9,8 @@ import numpy as np
 from src.qualitative_evaluation import (
     CheckpointEntry,
     SelectedCrop,
+    _cross_fold_checkpoint_entries,
+    _is_kfold_run,
     discover_manifest_checkpoints,
     intersecting_patch_coordinates,
     metric_row,
@@ -147,6 +149,34 @@ class QualitativeEvaluationTests(unittest.TestCase):
         self.assertEqual(row["crop_width"], 4)
         self.assertAlmostEqual(row["dice"], 1.0)
         self.assertAlmostEqual(row["iou"], 1.0)
+
+    def test_cross_fold_entries_prefer_global_best_per_fold(self) -> None:
+        entries = [
+            CheckpointEntry(0, "last.pt", Path("fold_0/last.pt"), "last", 10, 10, 10, "val_dice", 0.6),
+            CheckpointEntry(0, "best.pt", Path("fold_0/best.pt"), "global_best", 8, 8, 8, "val_dice", 0.8),
+            CheckpointEntry(1, "last.pt", Path("fold_1/last.pt"), "last", 10, 10, 10, "val_dice", 0.7),
+            CheckpointEntry(1, "best.pt", Path("fold_1/best.pt"), "global_best", 7, 7, 7, "val_dice", 0.9),
+        ]
+
+        selected = _cross_fold_checkpoint_entries(entries)
+
+        self.assertEqual([(entry.fold, entry.checkpoint) for entry in selected], [(0, "best.pt"), (1, "best.pt")])
+
+    def test_cross_fold_entries_fall_back_to_best_named_checkpoint(self) -> None:
+        entries = [
+            CheckpointEntry(0, "last.pt", Path("fold_0/last.pt"), "last", 10, 10, 10, "val_dice", 0.6),
+            CheckpointEntry(0, "best.pt", Path("fold_0/best.pt"), "manual", 8, 8, 8, "val_dice", 0.8),
+            CheckpointEntry(1, "last.pt", Path("fold_1/last.pt"), "last", 10, 10, 10, "val_dice", 0.7),
+        ]
+
+        selected = _cross_fold_checkpoint_entries(entries)
+
+        self.assertEqual([(entry.fold, entry.checkpoint) for entry in selected], [(0, "best.pt"), (1, "last.pt")])
+
+    def test_kfold_detection_uses_saved_split_mode(self) -> None:
+        self.assertTrue(_is_kfold_run({"split": {"mode": "kfold"}}))
+        self.assertFalse(_is_kfold_run({"split": {"mode": "train_val"}}))
+        self.assertFalse(_is_kfold_run({}))
 
 
 if __name__ == "__main__":

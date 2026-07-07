@@ -88,19 +88,20 @@ def main() -> None:
 
     original_records = build_original_image_records(pairs)
     data_cfg = config["data"]
+    patching_cfg = config["patching"]
     project_name = config["project"]["name"]
 
     foreground_counts = collect_foreground_counts(
         original_records=original_records,
-        patch_size=int(data_cfg["patch_size"]),
-        stride=int(data_cfg["stride"]),
-        mask_threshold=int(data_cfg["mask_threshold"]),
+        patch_size=int(patching_cfg["patch_size"]),
+        stride=int(patching_cfg["stride"]),
+        mask_threshold=int(patching_cfg["mask_threshold"]),
     )
     if not foreground_counts:
         raise RuntimeError("No patches were generated from the discovered image/mask pairs.")
 
     total_patches = len(foreground_counts)
-    min_foreground_pixels = int(data_cfg["min_foreground_pixels"])
+    min_foreground_pixels = int(patching_cfg["min_foreground_pixels"])
     kept_patches = sum(count >= min_foreground_pixels for count in foreground_counts)
     discarded_patches = total_patches - kept_patches
     empty_patches = sum(count == 0 for count in foreground_counts)

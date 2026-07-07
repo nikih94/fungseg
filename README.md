@@ -38,16 +38,31 @@ Training does the following:
 2. Scans `data/images` and `data/masks`.
 3. Builds original-image records.
 4. Splits by original image, not by patch.
-5. Generates patch records in memory.
+5. Generates validation patch records and epoch-specific training patch records in memory.
 6. Builds datasets, dataloaders, model, loss, optimizer, and scheduler.
 7. Trains and validates each fold or manual split.
 8. Saves checkpoints, logs, and metrics under `runs/<project>_<timestamp>/`.
 9. Runs qualitative checkpoint comparison when `qualitative_evaluation.enabled` is true.
 
-Each run folder contains the merged config, per-fold checkpoints, TensorBoard logs, and CSV/JSON metric files.
+Each run folder contains the merged config, `split_manifest.csv` / `split_manifest.json`, per-fold checkpoints,
+TensorBoard logs, and CSV/JSON metric files. The split manifest records every train/validation source image per
+fold, so k-fold and manual train/validation runs can be audited later.
 
-Each fold saves `best.pt`, `last.pt`, configurable best-in-interval snapshots such as
-`best_epochs_001_010.pt`, and `checkpoint_manifest.csv` with the metrics for each saved checkpoint.
+Each fold always saves `best.pt`, `last.pt`, and `checkpoint_manifest.csv` with the metrics for each saved
+checkpoint. When `train.best_interval_checkpoint.enabled` is true, it also saves configurable best-in-interval
+snapshots such as `best_epochs_001_010.pt`.
+
+Metric files include the optimized loss, hard-thresholded Dice/IoU, and loss-component diagnostics such as
+soft Dice score, soft-clDice score, BCE, Tversky index, and weighted component contributions when those terms
+are part of the configured loss.
+
+Run-level metric outputs include:
+
+- `cv_summary.json`: aggregate fold summary and final/best metrics.
+- `fold_metrics.csv`: one row per fold with the selected best-epoch metrics.
+- `epoch_metrics.csv`: one row per fold and epoch.
+- `fold_*/metrics.csv` and `fold_*/metrics.json`: full per-fold epoch history.
+- `fold_*/checkpoint_manifest.csv` and `.json`: saved checkpoints and their associated metrics.
 
 ## Inference
 
@@ -87,6 +102,14 @@ For each qualitative image, it selects one configurable mostly-background crop w
 - `runs/<project>_<timestamp>/qualitative_evaluation/eval_metrics.csv`
 - `runs/<project>_<timestamp>/qualitative_evaluation/selected_crops.csv`
 
+For k-fold cross-validation runs, qualitative evaluation also writes a compact best-per-fold comparison using one
+`global_best` checkpoint per fold:
+
+- `runs/<project>_<timestamp>/qualitative_evaluation/fold_comparison_grids/`
+- `runs/<project>_<timestamp>/qualitative_evaluation/fold_comparison_metrics.csv`
+
+Manual `train_val` runs skip these cross-fold files, so the additional CV comparison does not change non-CV runs.
+
 Training runs this automatically at the end when `qualitative_evaluation.enabled` is true.
 
 ## Models
@@ -110,6 +133,10 @@ For SMP `Unet++` models, the decoder can be configured with:
 
 - attention via `model.decoder_attention_type`
 - normalization via `model.decoder_normalization`
+
+The default `config.yaml` currently uses `decoder_normalization: batchnorm`. The small-run config keeps
+`instancenorm`. SegFormer does not use this Unet++ decoder-normalization option; its normalization comes from the
+SMP SegFormer/MiT implementation.
 
 Supported decoder normalization values:
 
@@ -136,12 +163,6 @@ All important settings live in `config.yaml`.
 ### `data`
 
 - `image_extensions`: file extensions accepted during dataset discovery.
-- `patch_size`: square crop size used for patch-based training and inference.
-- `overlap`: overlap between neighboring patches.
-- `stride`: patch step size. If omitted, it is derived from `patch_size - overlap`.
-- `filter_empty_patches`: whether to discard patches without enough foreground.
-- `mask_threshold`: grayscale threshold used to binarize masks.
-- `min_foreground_pixels`: minimum positive pixels required to keep a patch when filtering is enabled.
 - `num_workers`: dataloader worker count.
 - `persistent_workers`: whether to keep dataloader workers alive across epochs.
 - `prefetch_factor`: batches prefetched per worker when multiprocessing is enabled.
@@ -149,21 +170,37 @@ All important settings live in `config.yaml`.
 - `batch_size`: patch batch size.
 - `image_size`: optional resize applied after patch extraction and before normalization.
 
-### `data.multiscale`
+### `patching`
 
-- `enabled`: whether to create virtual lower-resolution patch records during training and validation.
-- `include_native`: whether to keep native-resolution patch records.
-- `target_long_edges`: synthetic long-edge sizes used to downscale large images before virtual tiling.
-- `max_scale`: maximum allowed virtual scale. Keep this at `1.0` to avoid upscaling smaller images.
-- `deduplicate_scale_tolerance`: scale-difference tolerance used to remove duplicate native/synthetic scales.
-- `image_resampling`: image resize filter used for virtual patches.
+- `patch_size`: square model crop size used for patch-based training, validation, and inference.
+- `overlap`: overlap between neighboring deterministic patches.
+- `stride`: patch step size. If omitted, it is derived from `patch_size - overlap`.
+- `filter_empty_patches`: whether to discard training/validation patches without enough foreground.
+- `mask_threshold`: grayscale threshold used to binarize masks.
+- `min_foreground_pixels`: minimum positive pixels required to keep a patch when filtering is enabled.
+- `image_resampling`: image resize filter used when scaled-context patches are resized back to `patch_size`.
 - `mask_resampling`: mask resize mode. `foreground_preserving` is intended to preserve thin filament labels.
+- `train.random_offset.enabled`: whether each epoch shifts the training grid by a deterministic random offset.
+- `train.random_offset.max_fraction_of_patch`: maximum offset as a fraction of patch size, capped by stride.
+- `train.scaled_context.enabled`: whether some training patches crop larger context and resize back to `patch_size`.
+- `train.scaled_context.probability`: probability that a grid patch becomes scaled-context, usually `0.25`.
+- `train.scaled_context.max_scale`: largest context crop multiplier, usually `2.0`.
+- `train.scaled_context.beta_alpha` and `beta_beta`: Beta distribution parameters; defaults bias scales close to `1.0`.
+- `validation.random_offset.enabled` and `validation.scaled_context.enabled`: normally false so validation/inference remain deterministic.
 
-### `data.sampling`
+Training uses `train.seed + epoch` for patch randomness, so patch cuts and scaled-context choices change each epoch but remain reproducible.
+Validation, inference, and stitched full-image validation use the deterministic unscaled grid.
 
-- `strategy`: training sampler strategy. `balanced_resolution_source` balances resolution buckets and source images.
-- `samples_per_epoch`: number of training samples drawn per epoch. `native_patch_count` keeps epoch length close to the native-resolution baseline.
-- `replacement`: whether weighted sampling may draw records more than once per epoch.
+To inspect patching for a config:
+
+```bash
+python -m src.patching.explain --config config.yaml
+python -m src.patching.explain --config config.yaml --image "data/images/example.tif" --epoch 3
+```
+
+The explanation command prints patch counts, normal/scaled-context counts, scale statistics, and a per-source
+source-crop-resolution table with a final percentage row across resolution bins. With `--image`, it saves an image
+overlay under `outputs/<project>/patching_explain/`.
 
 ### `augmentations.normalize`
 
@@ -205,6 +242,10 @@ All important settings live in `config.yaml`.
 
 - `mode`: split strategy. Supported values are `train_val` and `kfold`.
 - `val_source_ids`: validation image identifiers used only in `train_val` mode.
+
+Set `split.mode: kfold` to run grouped cross-validation. In this mode, `val_source_ids` is ignored and each
+source image is used as validation in exactly one fold. The exact fold membership is written to the split
+manifest files in the run directory.
 
 ### `model`
 

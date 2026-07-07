@@ -25,6 +25,7 @@ Responsibilities:
 - set seed and device
 - discover image and mask pairs
 - build grouped splits
+- write split manifests for run auditability
 - generate patch records
 - create datasets and dataloaders
 - build model, loss, optimizer, and scheduler
@@ -55,18 +56,21 @@ Responsibilities:
 - select one mostly-background crop with foreground per qualitative image
 - predict the selected crop with each manifest checkpoint
 - save comparison grid PNGs plus crop-level metrics
+- for k-fold runs, save an additional best-per-fold qualitative comparison
 
-### `src/patching.py`
+### `src/patching/`
 
 Core patch-generation logic.
 
 Why it matters:
 
 - turns original image and mask pairs into `OriginalImageRecord` objects
-- creates patch coordinates with full edge coverage
-- creates virtual multi-scale patch records for lower-resolution training views
+- creates deterministic patch coordinates with full edge coverage for validation and inference
+- creates epoch-specific training patch records with random grid offsets
+- creates scaled-context training crops that are resized back to the model patch size
 - filters empty patches based on mask foreground content
 - preserves the distinction between original-image grouping and patch-level training samples
+- provides `python -m src.patching.explain` for patch count summaries and optional grid overlays
 
 ### `src/data/`
 
@@ -75,7 +79,7 @@ Dataset and split logic live here.
 - `dataset.py`: patch dataset plus Albumentations train and validation transforms.
 - `discovery.py`: scans image and mask directories and matches files by stem.
 - `folds.py`: creates grouped k-fold splits or a manual train/validation split.
-- `sampling.py`: builds balanced weighted samplers and patch-distribution diagnostics.
+- `sampling.py`: patch-distribution diagnostics and legacy balanced-sampler helpers.
 
 This folder is important because it keeps dataset discovery, patch sampling, and split strategy separate from model code.
 
@@ -101,9 +105,10 @@ This folder makes it easy to swap training objectives without rewriting the trai
 
 ### `src/metrics/`
 
-Validation metrics live here.
+Validation and diagnostic metrics live here.
 
 - `segmentation.py`: Dice and IoU metrics for patch-level and stitched-image evaluation.
+- `loss_components.py`: BCE, soft Dice, soft-clDice, Tversky, and weighted component diagnostics written with training metrics.
 
 This folder stays separate from losses so monitoring and optimization remain independent.
 
@@ -127,6 +132,7 @@ Why it matters:
 
 - runs epoch loops
 - computes patch-level metrics
+- computes loss-component diagnostics without changing the optimized objective
 - optionally runs full-image stitched validation
 - tracks the monitored metric
 - saves `best.pt`, `last.pt`, and optional best-in-interval snapshots
@@ -156,21 +162,21 @@ These are useful but not central to the main training loop:
 
 1. `src/train.py` loads `config.yaml` through `src/utils/config.py`.
 2. `src/data/discovery.py` matches images and masks by filename stem.
-3. `src/patching.py` creates original-image records containing source identity and image size.
+3. `src/patching/` creates original-image records containing source identity and image size.
 4. `src/data/folds.py` splits by original image, not by patch.
-5. `src/patching.py` creates native and virtual multi-scale patch records for the selected train and validation source images.
-6. `src/data/dataset.py` loads full images lazily, crops native or virtual scaled patches on the fly, applies Albumentations, and returns tensors.
+5. `src/patching/` creates deterministic validation patch records and epoch-specific training patch records.
+6. `src/data/dataset.py` loads full images lazily, crops native or scaled-context patches on the fly, applies Albumentations, and returns tensors.
 7. `src/models/factory.py` builds the requested segmentation model.
 8. `src/losses/factory.py`, `src/optim/factory.py`, and `src/schedulers/factory.py` build the training components from config.
-9. `src/engine/trainer.py` runs training, validation, per-resolution metrics, checkpointing, and metric export.
-10. `src/train.py` aggregates fold metrics and writes run summaries.
+9. `src/engine/trainer.py` runs training, validation, per-resolution metrics, loss-component diagnostics, checkpointing, and metric export.
+10. `src/train.py` aggregates fold metrics, writes split manifests, and writes run summaries.
 11. If enabled, `src/qualitative_evaluation.py` compares manifest checkpoints on qualitative crops and writes visual grids plus `eval_metrics.csv`.
 
 ### Inference Flow
 
 1. `src/inference.py` loads config and a checkpoint.
 2. `src/models/factory.py` rebuilds the model architecture.
-3. The full image is tiled using the same patch geometry defined in config.
+3. The full image is tiled using the deterministic patch geometry defined in config.
 4. Each patch is normalized with validation transforms and passed through the model.
 5. Overlapping patch probabilities are averaged back into a full-size probability map.
 6. The final binary mask is thresholded and written to disk.
@@ -183,6 +189,7 @@ These are useful but not central to the main training loop:
 4. For each image, it selects a crop using the configured patch grid and foreground-ratio bounds.
 5. It predicts all overlapping patches that contribute to that crop, averages probabilities, and crops away border-only context.
 6. It writes one grid PNG per image plus `selected_crops.csv` and `eval_metrics.csv`.
+7. For k-fold runs, it also writes best-per-fold grids and `fold_comparison_metrics.csv`.
 
 ## Why the Folder Boundaries Matter
 

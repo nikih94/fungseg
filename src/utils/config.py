@@ -17,31 +17,38 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "data": {
         "image_extensions": [".png", ".jpg", ".jpeg", ".tif", ".tiff"],
+        "num_workers": 4,
+        "persistent_workers": False,
+        "prefetch_factor": 2,
+        "pin_memory": True,
+        "batch_size": 8,
+        "image_size": None,
+    },
+    "patching": {
         "patch_size": 512,
         "overlap": 128,
         "stride": 384,
         "filter_empty_patches": True,
         "mask_threshold": 127,
         "min_foreground_pixels": 1,
-        "num_workers": 8,
-        "persistent_workers": True,
-        "prefetch_factor": 4,
-        "pin_memory": True,
-        "batch_size": 8,
-        "image_size": None,
-        "multiscale": {
-            "enabled": True,
-            "include_native": True,
-            "target_long_edges": [1200, 1600, 2400, 3200],
-            "max_scale": 1.0,
-            "deduplicate_scale_tolerance": 0.03,
-            "image_resampling": "lanczos",
-            "mask_resampling": "foreground_preserving",
+        "image_resampling": "lanczos",
+        "mask_resampling": "foreground_preserving",
+        "train": {
+            "random_offset": {
+                "enabled": True,
+                "max_fraction_of_patch": 0.5,
+            },
+            "scaled_context": {
+                "enabled": True,
+                "probability": 0.25,
+                "max_scale": 2.0,
+                "beta_alpha": 1.0,
+                "beta_beta": 4.0,
+            },
         },
-        "sampling": {
-            "strategy": "balanced_resolution_source",
-            "samples_per_epoch": "native_patch_count",
-            "replacement": True,
+        "validation": {
+            "random_offset": {"enabled": False},
+            "scaled_context": {"enabled": False},
         },
     },
     "augmentations": {
@@ -162,6 +169,27 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         loaded = yaml.safe_load(handle) or {}
 
     config = _deep_update(deepcopy(DEFAULT_CONFIG), loaded)
-    data_cfg = config["data"]
-    data_cfg["stride"] = int(data_cfg.get("stride") or (int(data_cfg["patch_size"]) - int(data_cfg["overlap"])))
+    if "patching" not in loaded and isinstance(loaded.get("data"), dict):
+        legacy_data = loaded["data"]
+        for key in (
+            "patch_size",
+            "overlap",
+            "stride",
+            "filter_empty_patches",
+            "mask_threshold",
+            "min_foreground_pixels",
+        ):
+            if key in legacy_data:
+                config["patching"][key] = legacy_data[key]
+        multiscale = legacy_data.get("multiscale", {})
+        if isinstance(multiscale, dict):
+            for key in ("image_resampling", "mask_resampling"):
+                if key in multiscale:
+                    config["patching"][key] = multiscale[key]
+
+    patching_cfg = config["patching"]
+    patching_cfg["stride"] = int(
+        patching_cfg.get("stride")
+        or (int(patching_cfg["patch_size"]) - int(patching_cfg["overlap"]))
+    )
     return config

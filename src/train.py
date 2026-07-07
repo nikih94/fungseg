@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from src.data.dataset import SegmentationPatchDataset, get_train_transforms, get_val_transforms
 from src.data.discovery import discover_image_mask_pairs
 from src.data.folds import make_grouped_kfold_splits, make_manual_train_val_split
-from src.data.sampling import build_balanced_resolution_source_sampler, patch_distribution
+from src.data.sampling import patch_distribution
 from src.engine.trainer import Trainer
 from src.losses.factory import build_loss
 from src.models.factory import build_model
@@ -23,6 +23,18 @@ from src.utils.config import load_config
 from src.utils.io import ensure_dir, save_csv, save_json, save_yaml
 from src.utils.logging import setup_logger
 from src.utils.seed import set_seed
+
+
+TORCH_SHARING_STRATEGY = "file_system"
+
+
+def configure_torch_multiprocessing() -> str:
+    torch.multiprocessing.set_sharing_strategy(TORCH_SHARING_STRATEGY)
+    return torch.multiprocessing.get_sharing_strategy()
+
+
+def _worker_init_fn(_: int) -> None:
+    torch.multiprocessing.set_sharing_strategy(TORCH_SHARING_STRATEGY)
 
 
 def _collect_optional_metric(values: list[float | None]) -> tuple[float | None, float | None]:
@@ -64,6 +76,16 @@ def build_splits(config: dict, original_records: list) -> tuple[list[tuple[list[
     raise ValueError(f"Unsupported split mode: {split_mode}. Expected 'train_val' or 'kfold'.")
 
 
+def split_manifest_rows(splits: list[tuple[list[str], list[str]]]) -> list[dict[str, int | str]]:
+    rows: list[dict[str, int | str]] = []
+    for fold_index, (train_sources, val_sources) in enumerate(splits):
+        for source_id in train_sources:
+            rows.append({"fold": fold_index, "split": "train", "source_id": source_id})
+        for source_id in val_sources:
+            rows.append({"fold": fold_index, "split": "val", "source_id": source_id})
+    return rows
+
+
 def resolve_device(device_name: str) -> torch.device:
     if device_name != "auto":
         return torch.device(device_name)
@@ -80,19 +102,17 @@ def make_loader(
     shuffle: bool,
     persistent_workers: bool,
     prefetch_factor: int | None,
-    sampler=None,
 ) -> DataLoader:
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": batch_size,
-        "shuffle": shuffle if sampler is None else False,
+        "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
-    if sampler is not None:
-        loader_kwargs["sampler"] = sampler
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["worker_init_fn"] = _worker_init_fn
         if prefetch_factor is not None:
             loader_kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(**loader_kwargs)
@@ -113,6 +133,7 @@ def log_run_summary(logger, config: dict, device: torch.device, num_images: int,
     model_cfg = config["model"]
     train_cfg = config["train"]
     data_cfg = config["data"]
+    patching_cfg = config["patching"]
     optimizer_cfg = config["optimizer"]
 
     logger.info("Training summary")
@@ -130,9 +151,9 @@ def log_run_summary(logger, config: dict, device: torch.device, num_images: int,
         "Dataset: %s images | split_mode=%s | patch_size=%s | stride=%s | empty_patch_filter=%s",
         num_images,
         split_mode,
-        data_cfg["patch_size"],
-        data_cfg["stride"],
-        data_cfg["filter_empty_patches"],
+        patching_cfg["patch_size"],
+        patching_cfg["stride"],
+        patching_cfg["filter_empty_patches"],
     )
     logger.info(
         "Loader: num_workers=%s | persistent_workers=%s | prefetch_factor=%s | pin_memory=%s",
@@ -185,8 +206,10 @@ def main() -> None:
     outputs_root = ensure_dir(Path(config["paths"]["outputs_dir"]) / project_name)
     logger = setup_logger("train", run_dir / "logs")
     save_yaml(run_dir / "config.yaml", config)
+    sharing_strategy = configure_torch_multiprocessing()
     logger.info("Using device: %s", device)
     logger.info("Run directory: %s", run_dir)
+    logger.info("Torch multiprocessing sharing strategy: %s", sharing_strategy)
 
     pairs, diagnostics = discover_image_mask_pairs(
         config["paths"]["images_dir"],
@@ -202,14 +225,16 @@ def main() -> None:
 
     original_records = build_original_image_records(pairs)
     splits, split_mode = build_splits(config, original_records)
+    manifest_rows = split_manifest_rows(splits)
+    save_csv(run_dir / "split_manifest.csv", manifest_rows)
+    save_json(run_dir / "split_manifest.json", {"splits": manifest_rows})
     log_run_summary(logger, config, device, num_images=len(original_records), split_mode=split_mode)
 
     fold_results = []
     all_epoch_rows: list[dict[str, float]] = []
     data_cfg = config["data"]
+    patching_cfg = config["patching"]
     augmentations_cfg = config.get("augmentations", {})
-    multiscale_cfg = data_cfg.get("multiscale", {})
-    sampling_cfg = data_cfg.get("sampling", {})
     total_folds = len(splits)
 
     for fold_index, (train_sources, val_sources) in enumerate(splits):
@@ -222,21 +247,15 @@ def main() -> None:
 
         train_patch_records = build_patch_records(
             train_originals,
-            patch_size=int(data_cfg["patch_size"]),
-            stride=int(data_cfg["stride"]),
-            filter_empty_patches=bool(data_cfg["filter_empty_patches"]),
-            mask_threshold=int(data_cfg["mask_threshold"]),
-            min_foreground_pixels=int(data_cfg["min_foreground_pixels"]),
-            multiscale_config=multiscale_cfg,
+            patching_cfg,
+            phase="train",
+            epoch=1,
+            base_seed=int(config["train"]["seed"]),
         )
         val_patch_records = build_patch_records(
             val_originals,
-            patch_size=int(data_cfg["patch_size"]),
-            stride=int(data_cfg["stride"]),
-            filter_empty_patches=bool(data_cfg["filter_empty_patches"]),
-            mask_threshold=int(data_cfg["mask_threshold"]),
-            min_foreground_pixels=int(data_cfg["min_foreground_pixels"]),
-            multiscale_config=multiscale_cfg,
+            patching_cfg,
+            phase="validation",
         )
         log_fold_summary(
             logger=logger,
@@ -251,53 +270,54 @@ def main() -> None:
 
         train_dataset = SegmentationPatchDataset(
             records=train_patch_records,
-            mask_threshold=int(data_cfg["mask_threshold"]),
+            mask_threshold=int(patching_cfg["mask_threshold"]),
             transforms=get_train_transforms(
                 data_cfg.get("image_size"),
                 augmentations_config=augmentations_cfg,
             ),
-            image_resampling=str(multiscale_cfg.get("image_resampling", "lanczos")),
-            mask_resampling=str(multiscale_cfg.get("mask_resampling", "foreground_preserving")),
+            image_resampling=str(patching_cfg.get("image_resampling", "lanczos")),
+            mask_resampling=str(patching_cfg.get("mask_resampling", "foreground_preserving")),
         )
         val_dataset = SegmentationPatchDataset(
             records=val_patch_records,
-            mask_threshold=int(data_cfg["mask_threshold"]),
+            mask_threshold=int(patching_cfg["mask_threshold"]),
             transforms=get_val_transforms(
                 data_cfg.get("image_size"),
                 augmentations_config=augmentations_cfg,
             ),
-            image_resampling=str(multiscale_cfg.get("image_resampling", "lanczos")),
-            mask_resampling=str(multiscale_cfg.get("mask_resampling", "foreground_preserving")),
+            image_resampling=str(patching_cfg.get("image_resampling", "lanczos")),
+            mask_resampling=str(patching_cfg.get("mask_resampling", "foreground_preserving")),
         )
 
-        sampler_generator = torch.Generator()
-        sampler_generator.manual_seed(int(config["train"]["seed"]) + fold_index)
-        train_sampler, sampler_diagnostics = build_balanced_resolution_source_sampler(
-            train_patch_records,
-            sampling_cfg,
-            generator=sampler_generator,
-        )
         patch_diagnostics = {
             "train": patch_distribution(train_patch_records),
             "val": patch_distribution(val_patch_records),
-            "sampler": sampler_diagnostics,
         }
         save_json(fold_dir / "patch_distribution.json", patch_diagnostics)
 
-        train_loader = make_loader(
-            train_dataset,
-            batch_size=int(data_cfg["batch_size"]),
-            num_workers=int(data_cfg["num_workers"]),
-            pin_memory=bool(data_cfg["pin_memory"]),
-            shuffle=True,
-            persistent_workers=bool(data_cfg.get("persistent_workers", False)),
-            prefetch_factor=(
-                int(data_cfg["prefetch_factor"])
-                if data_cfg.get("prefetch_factor") is not None
-                else None
-            ),
-            sampler=train_sampler,
-        )
+        def make_train_loader_for_epoch(epoch: int) -> DataLoader:
+            epoch_records = build_patch_records(
+                train_originals,
+                patching_cfg,
+                phase="train",
+                epoch=epoch,
+                base_seed=int(config["train"]["seed"]),
+            )
+            train_dataset.set_records(epoch_records)
+            return make_loader(
+                train_dataset,
+                batch_size=int(data_cfg["batch_size"]),
+                num_workers=int(data_cfg["num_workers"]),
+                pin_memory=bool(data_cfg["pin_memory"]),
+                shuffle=True,
+                persistent_workers=bool(data_cfg.get("persistent_workers", False)),
+                prefetch_factor=(
+                    int(data_cfg["prefetch_factor"])
+                    if data_cfg.get("prefetch_factor") is not None
+                    else None
+                ),
+            )
+
         val_loader = make_loader(
             val_dataset,
             batch_size=int(data_cfg["batch_size"]),
@@ -328,24 +348,33 @@ def main() -> None:
                 **config["train"],
                 "scheduler_monitor": config["scheduler"].get("monitor", config["train"]["monitor"]),
             },
+            loss_config=config["loss"],
             logger=logger,
             fold_dir=Path(fold_dir),
-            data_config=data_cfg,
+            data_config={**data_cfg, **patching_cfg},
             augmentations_config=augmentations_cfg,
             val_original_records=val_originals,
             tensorboard_writer=writer,
             fold_index=fold_index,
         )
-        fold_result = trainer.fit(train_loader, val_loader, epochs=int(config["train"]["epochs"]))
+        fold_result = trainer.fit(
+            None,
+            val_loader,
+            epochs=int(config["train"]["epochs"]),
+            train_loader_factory=make_train_loader_for_epoch,
+        )
         writer.close()
         fold_result["fold"] = fold_index
         fold_result["num_train_patches"] = len(train_patch_records)
         fold_result["num_val_patches"] = len(val_patch_records)
-        fold_result["num_train_native_patches"] = sum(
-            1 for record in train_patch_records if record.scale_label == "native"
+        fold_result["num_train_normal_patches"] = sum(
+            1 for record in train_patch_records if record.scale_label == "normal"
         )
-        fold_result["num_val_native_patches"] = sum(
-            1 for record in val_patch_records if record.scale_label == "native"
+        fold_result["num_train_scaled_context_patches"] = sum(
+            1 for record in train_patch_records if record.scale_label == "scaled_context"
+        )
+        fold_result["num_val_normal_patches"] = sum(
+            1 for record in val_patch_records if record.scale_label == "normal"
         )
         fold_results.append(fold_result)
         all_epoch_rows.extend(

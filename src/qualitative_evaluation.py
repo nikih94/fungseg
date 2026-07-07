@@ -238,8 +238,9 @@ def predict_crop_probabilities(
     use_amp: bool = False,
 ) -> np.ndarray:
     data_cfg = config["data"]
-    patch_size = int(data_cfg["patch_size"])
-    stride = int(data_cfg["stride"])
+    patching_cfg = config["patching"]
+    patch_size = int(patching_cfg["patch_size"])
+    stride = int(patching_cfg["stride"])
     transforms = get_val_transforms(
         data_cfg.get("image_size"),
         augmentations_config=config.get("augmentations", {}),
@@ -383,6 +384,42 @@ def _checkpoint_label(entry: CheckpointEntry) -> str:
     return f"fold {entry.fold} | {entry.checkpoint}\nepoch {epoch} | {entry.monitor}={monitor}"
 
 
+def _cross_fold_checkpoint_entries(checkpoints: list[CheckpointEntry]) -> list[CheckpointEntry]:
+    by_fold: dict[int, list[CheckpointEntry]] = {}
+    for entry in checkpoints:
+        by_fold.setdefault(entry.fold, []).append(entry)
+
+    selected: list[CheckpointEntry] = []
+    for fold in sorted(by_fold):
+        entries = by_fold[fold]
+        global_best = [entry for entry in entries if entry.reason == "global_best"]
+        if global_best:
+            selected.append(sorted(global_best, key=lambda entry: entry.checkpoint)[0])
+            continue
+
+        best_named = [entry for entry in entries if entry.checkpoint == "best.pt"]
+        if best_named:
+            selected.append(best_named[0])
+            continue
+
+        selected.append(
+            sorted(
+                entries,
+                key=lambda entry: (
+                    float("-inf") if entry.monitor_value is None else float(entry.monitor_value),
+                    -1 if entry.epoch is None else int(entry.epoch),
+                    entry.checkpoint,
+                ),
+                reverse=True,
+            )[0]
+        )
+    return selected
+
+
+def _is_kfold_run(config: dict[str, Any]) -> bool:
+    return str(config.get("split", {}).get("mode", "")).strip().lower() == "kfold"
+
+
 def run_qualitative_evaluation(
     run_dir: str | Path,
     config_path: str | Path | None = None,
@@ -403,6 +440,7 @@ def run_qualitative_evaluation(
     data_root = Path(data_root or qualitative_cfg.get("data_root", "data/qualitative_evaluation"))
     output_dir = ensure_dir(output_dir or run_dir / "qualitative_evaluation")
     grids_dir = ensure_dir(output_dir / "grids")
+    fold_grids_dir = output_dir / "fold_comparison_grids"
     crop_patch_grid = tuple(crop_patch_grid or qualitative_cfg.get("crop_patch_grid", [3, 3]))
     min_foreground_ratio = float(
         qualitative_cfg.get("min_foreground_ratio", 0.005)
@@ -450,6 +488,14 @@ def run_qualitative_evaluation(
     checkpoints = discover_manifest_checkpoints(run_dir, max_checkpoints=max_checkpoints)
     if not checkpoints:
         raise RuntimeError(f"No manifest checkpoints found under {run_dir}.")
+    cross_fold_entries = _cross_fold_checkpoint_entries(checkpoints) if _is_kfold_run(config) else []
+    cross_fold_keys = {
+        (entry.fold, entry.checkpoint, str(entry.path))
+        for entry in cross_fold_entries
+    }
+    if len(cross_fold_entries) <= 1:
+        cross_fold_entries = []
+        cross_fold_keys = set()
 
     if logger:
         logger.info(
@@ -458,11 +504,13 @@ def run_qualitative_evaluation(
             len(checkpoints),
         )
 
-    patch_size = int(config["data"]["patch_size"])
-    stride = int(config["data"]["stride"])
-    mask_threshold = int(config["data"]["mask_threshold"])
+    patching_cfg = config["patching"]
+    patch_size = int(patching_cfg["patch_size"])
+    stride = int(patching_cfg["stride"])
+    mask_threshold = int(patching_cfg["mask_threshold"])
     use_amp = bool(config["train"].get("mixed_precision", True)) and device.type == "cuda"
     metric_rows: list[dict[str, Any]] = []
+    fold_metric_rows: list[dict[str, Any]] = []
     crop_rows: list[dict[str, Any]] = []
     selected_crops: dict[str, SelectedCrop] = {}
     image_payloads: list[dict[str, Any]] = []
@@ -533,6 +581,29 @@ def run_qualitative_evaluation(
                     payload["target_crop"],
                 )
             )
+            if (entry.fold, entry.checkpoint, str(entry.path)) in cross_fold_keys:
+                fold_metric_rows.append(
+                    metric_row(
+                        payload["image_path"],
+                        entry,
+                        payload["crop"],
+                        prediction_mask,
+                        payload["target_crop"],
+                    )
+                )
+                payload.setdefault(
+                    "fold_comparison_panels",
+                    [
+                        make_panel(f"{payload['image_path'].stem}\nsource", payload["image_crop"]),
+                        make_panel("ground truth", create_overlay(payload["image_crop"], payload["target_crop"] * 255), payload["target_crop"]),
+                    ],
+                ).append(
+                    make_panel(
+                        _checkpoint_label(entry),
+                        create_overlay(payload["image_crop"], prediction_mask * 255),
+                        prediction_mask,
+                    )
+                )
             payload["panels"].append(
                 make_panel(
                     _checkpoint_label(entry),
@@ -546,14 +617,22 @@ def run_qualitative_evaluation(
 
     for payload in image_payloads:
         save_grid(grids_dir / f"{payload['image_path'].stem}.png", payload["panels"])
+        if cross_fold_entries:
+            save_grid(
+                ensure_dir(fold_grids_dir) / f"{payload['image_path'].stem}.png",
+                payload.get("fold_comparison_panels", []),
+            )
 
     save_csv(output_dir / "eval_metrics.csv", metric_rows)
+    if cross_fold_entries:
+        save_csv(output_dir / "fold_comparison_metrics.csv", fold_metric_rows)
     save_csv(output_dir / "selected_crops.csv", crop_rows)
     return {
         "skipped": False,
         "output_dir": str(output_dir),
         "num_images": len(pairs),
         "num_checkpoints": len(checkpoints),
+        "num_fold_comparison_checkpoints": len(cross_fold_entries),
         "num_metric_rows": len(metric_rows),
         "selected_crops": selected_crops,
     }
