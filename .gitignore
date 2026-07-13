@@ -34,6 +34,7 @@ funi-temporal-masks.zip
 /data/loci_masks
 /data/small-test
 /data/test
+data/other-test-data
 
 # Logs and notebooks
 *.log
