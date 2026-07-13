@@ -11,7 +11,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.data.dataset import SegmentationPatchDataset, get_train_transforms, get_val_transforms
 from src.data.discovery import discover_image_mask_pairs
-from src.data.folds import make_grouped_kfold_splits, make_manual_train_val_split
+from src.data.folds import (
+    SplitDefinition,
+    make_csv_train_val_test_split,
+    make_grouped_kfold_splits,
+    make_manual_train_val_split,
+)
 from src.data.sampling import patch_distribution
 from src.engine.trainer import Trainer
 from src.losses.factory import build_loss
@@ -19,7 +24,7 @@ from src.models.factory import build_model
 from src.optim.factory import build_optimizer
 from src.patching import build_original_image_records, build_patch_records
 from src.schedulers.factory import build_scheduler
-from src.utils.config import load_config
+from src.utils.config import load_config, resolve_mask_dir
 from src.utils.io import ensure_dir, save_csv, save_json, save_yaml
 from src.utils.logging import setup_logger
 from src.utils.seed import set_seed
@@ -52,10 +57,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_splits(config: dict, original_records: list) -> tuple[list[tuple[list[str], list[str]]], str]:
+def _as_split_definition(split: SplitDefinition | tuple[list[str], list[str]]) -> SplitDefinition:
+    if isinstance(split, SplitDefinition):
+        return split
+    train_sources, val_sources = split
+    return SplitDefinition(
+        train_sources=list(train_sources),
+        val_sources=list(val_sources),
+        test_sources=[],
+    )
+
+
+def build_splits(config: dict, original_records: list) -> tuple[list[SplitDefinition], str]:
     source_ids = [record.source_id for record in original_records]
     split_cfg = config.get("split", {})
     split_mode = str(split_cfg.get("mode", "train_val")).lower()
+
+    if split_mode == "csv":
+        split = make_csv_train_val_test_split(
+            source_ids,
+            csv_path=split_cfg.get("csv_path", "data/image_splits.csv"),
+        )
+        return [split], split_mode
 
     if split_mode == "kfold":
         splits = make_grouped_kfold_splits(
@@ -64,25 +87,42 @@ def build_splits(config: dict, original_records: list) -> tuple[list[tuple[list[
             shuffle_groups=bool(config["cv"]["shuffle_groups"]),
             random_state=int(config["cv"]["random_state"]),
         )
-        return splits, split_mode
+        return [_as_split_definition(split) for split in splits], split_mode
 
     if split_mode == "train_val":
         splits = make_manual_train_val_split(
             source_ids,
             val_source_ids=split_cfg.get("val_source_ids", []),
         )
-        return splits, split_mode
+        split_definitions = [_as_split_definition(split) for split in splits]
+        requested_test_sources = split_cfg.get("test_source_ids", [])
+        if requested_test_sources:
+            test_split = make_manual_train_val_split(source_ids, requested_test_sources)[0][1]
+            split_definitions = [
+                SplitDefinition(
+                    train_sources=split.train_sources,
+                    val_sources=split.val_sources,
+                    test_sources=test_split,
+                )
+                for split in split_definitions
+            ]
+        return split_definitions, split_mode
 
-    raise ValueError(f"Unsupported split mode: {split_mode}. Expected 'train_val' or 'kfold'.")
+    raise ValueError(f"Unsupported split mode: {split_mode}. Expected 'csv', 'train_val', or 'kfold'.")
 
 
-def split_manifest_rows(splits: list[tuple[list[str], list[str]]]) -> list[dict[str, int | str]]:
+def split_manifest_rows(
+    splits: list[SplitDefinition | tuple[list[str], list[str]]],
+) -> list[dict[str, int | str]]:
     rows: list[dict[str, int | str]] = []
-    for fold_index, (train_sources, val_sources) in enumerate(splits):
-        for source_id in train_sources:
+    for fold_index, split in enumerate(splits):
+        split_definition = _as_split_definition(split)
+        for source_id in split_definition.train_sources:
             rows.append({"fold": fold_index, "split": "train", "source_id": source_id})
-        for source_id in val_sources:
+        for source_id in split_definition.val_sources:
             rows.append({"fold": fold_index, "split": "val", "source_id": source_id})
+        for source_id in split_definition.test_sources:
+            rows.append({"fold": fold_index, "split": "test", "source_id": source_id})
     return rows
 
 
@@ -129,7 +169,14 @@ def create_run_dir(runs_root: Path, project_name: str) -> Path:
     return run_dir
 
 
-def log_run_summary(logger, config: dict, device: torch.device, num_images: int, split_mode: str) -> None:
+def log_run_summary(
+    logger,
+    config: dict,
+    device: torch.device,
+    num_images: int,
+    split_mode: str,
+    mask_dir: Path,
+) -> None:
     model_cfg = config["model"]
     train_cfg = config["train"]
     data_cfg = config["data"]
@@ -148,8 +195,10 @@ def log_run_summary(logger, config: dict, device: torch.device, num_images: int,
         device,
     )
     logger.info(
-        "Dataset: %s images | split_mode=%s | patch_size=%s | stride=%s | empty_patch_filter=%s",
+        "Dataset: %s images | target=%s | masks=%s | split_mode=%s | patch_size=%s | stride=%s | empty_patch_filter=%s",
         num_images,
+        config.get("segmentation", {}).get("target", "legacy"),
+        mask_dir,
         split_mode,
         patching_cfg["patch_size"],
         patching_cfg["stride"],
@@ -171,19 +220,23 @@ def log_fold_summary(
     split_mode: str,
     train_originals: list,
     val_originals: list,
+    test_originals: list,
     train_patch_records: list,
     val_patch_records: list,
+    test_patch_records: list,
 ) -> None:
-    split_label = "Split" if split_mode == "train_val" else "Fold"
+    split_label = "Fold" if split_mode == "kfold" else "Split"
     logger.info(
-        "%s %s/%s | train_images=%s | val_images=%s | train_patches=%s | val_patches=%s",
+        "%s %s/%s | train_images=%s | val_images=%s | test_images=%s | train_patches=%s | val_patches=%s | test_patches=%s",
         split_label,
         fold_index + 1,
         total_folds,
         len(train_originals),
         len(val_originals),
+        len(test_originals),
         len(train_patch_records),
         len(val_patch_records),
+        len(test_patch_records),
     )
     # logger.info(
     #     "Fold %s split | train_sources=%s | val_sources=%s",
@@ -211,9 +264,10 @@ def main() -> None:
     logger.info("Run directory: %s", run_dir)
     logger.info("Torch multiprocessing sharing strategy: %s", sharing_strategy)
 
+    mask_dir = resolve_mask_dir(config)
     pairs, diagnostics = discover_image_mask_pairs(
         config["paths"]["images_dir"],
-        config["paths"]["masks_dir"],
+        mask_dir,
         config["data"]["image_extensions"],
     )
     if not pairs:
@@ -228,7 +282,14 @@ def main() -> None:
     manifest_rows = split_manifest_rows(splits)
     save_csv(run_dir / "split_manifest.csv", manifest_rows)
     save_json(run_dir / "split_manifest.json", {"splits": manifest_rows})
-    log_run_summary(logger, config, device, num_images=len(original_records), split_mode=split_mode)
+    log_run_summary(
+        logger,
+        config,
+        device,
+        num_images=len(original_records),
+        split_mode=split_mode,
+        mask_dir=mask_dir,
+    )
 
     fold_results = []
     all_epoch_rows: list[dict[str, float]] = []
@@ -237,13 +298,17 @@ def main() -> None:
     augmentations_cfg = config.get("augmentations", {})
     total_folds = len(splits)
 
-    for fold_index, (train_sources, val_sources) in enumerate(splits):
+    for fold_index, split in enumerate(splits):
         logger.info("Preparing fold %s", fold_index)
         fold_dir = ensure_dir(run_dir / f"fold_{fold_index}")
         tensorboard_dir = ensure_dir(fold_dir / "tensorboard")
+        train_sources = split.train_sources
+        val_sources = split.val_sources
+        test_sources = split.test_sources
 
         train_originals = [record for record in original_records if record.source_id in set(train_sources)]
         val_originals = [record for record in original_records if record.source_id in set(val_sources)]
+        test_originals = [record for record in original_records if record.source_id in set(test_sources)]
 
         train_patch_records = build_patch_records(
             train_originals,
@@ -257,6 +322,11 @@ def main() -> None:
             patching_cfg,
             phase="validation",
         )
+        test_patch_records = build_patch_records(
+            test_originals,
+            patching_cfg,
+            phase="validation",
+        )
         log_fold_summary(
             logger=logger,
             fold_index=fold_index,
@@ -264,8 +334,10 @@ def main() -> None:
             split_mode=split_mode,
             train_originals=train_originals,
             val_originals=val_originals,
+            test_originals=test_originals,
             train_patch_records=train_patch_records,
             val_patch_records=val_patch_records,
+            test_patch_records=test_patch_records,
         )
 
         train_dataset = SegmentationPatchDataset(
@@ -292,6 +364,7 @@ def main() -> None:
         patch_diagnostics = {
             "train": patch_distribution(train_patch_records),
             "val": patch_distribution(val_patch_records),
+            "test": patch_distribution(test_patch_records),
         }
         save_json(fold_dir / "patch_distribution.json", patch_diagnostics)
 
@@ -364,9 +437,34 @@ def main() -> None:
             train_loader_factory=make_train_loader_for_epoch,
         )
         writer.close()
+        if test_originals and bool(config.get("test_evaluation", {}).get("enabled", True)):
+            from src.test_evaluation import run_test_evaluation
+
+            best_checkpoint_path = fold_dir / "best.pt"
+            evaluation_dir = run_dir / "test-evaluation"
+            if total_folds > 1:
+                evaluation_dir = evaluation_dir / f"fold_{fold_index}"
+            test_result = run_test_evaluation(
+                best_checkpoint_path,
+                config,
+                evaluation_dir,
+                device,
+            )
+            fold_result.update({
+                "test_dice_per_image": test_result["mean_dice"],
+                "test_iou_per_image": test_result["mean_iou"],
+            })
+            logger.info(
+                "Fold %s test evaluation - test_dice_per_image=%.4f test_iou_per_image=%.4f output=%s",
+                fold_index,
+                test_result["mean_dice"],
+                test_result["mean_iou"],
+                evaluation_dir,
+            )
         fold_result["fold"] = fold_index
         fold_result["num_train_patches"] = len(train_patch_records)
         fold_result["num_val_patches"] = len(val_patch_records)
+        fold_result["num_test_patches"] = len(test_patch_records)
         fold_result["num_train_normal_patches"] = sum(
             1 for record in train_patch_records if record.scale_label == "normal"
         )
@@ -375,6 +473,9 @@ def main() -> None:
         )
         fold_result["num_val_normal_patches"] = sum(
             1 for record in val_patch_records if record.scale_label == "normal"
+        )
+        fold_result["num_test_normal_patches"] = sum(
+            1 for record in test_patch_records if record.scale_label == "normal"
         )
         fold_results.append(fold_result)
         all_epoch_rows.extend(
@@ -396,10 +497,30 @@ def main() -> None:
     val_iou_per_image_mean, val_iou_per_image_std = _collect_optional_metric(
         [item.get("val_iou_per_image") for item in fold_results]
     )
+    test_dice_per_patch_mean, test_dice_per_patch_std = _collect_optional_metric(
+        [item.get("test_dice_per_patch") for item in fold_results]
+    )
+    test_iou_per_patch_mean, test_iou_per_patch_std = _collect_optional_metric(
+        [item.get("test_iou_per_patch") for item in fold_results]
+    )
+    test_dice_macro_resolution_mean, test_dice_macro_resolution_std = _collect_optional_metric(
+        [item.get("test_dice_macro_resolution") for item in fold_results]
+    )
+    test_iou_macro_resolution_mean, test_iou_macro_resolution_std = _collect_optional_metric(
+        [item.get("test_iou_macro_resolution") for item in fold_results]
+    )
+    test_dice_per_image_mean, test_dice_per_image_std = _collect_optional_metric(
+        [item.get("test_dice_per_image") for item in fold_results]
+    )
+    test_iou_per_image_mean, test_iou_per_image_std = _collect_optional_metric(
+        [item.get("test_iou_per_image") for item in fold_results]
+    )
     summary = {
         "project": project_name,
         "run_dir": str(run_dir),
         "split_mode": split_mode,
+        "segmentation_target": config.get("segmentation", {}).get("target", "legacy"),
+        "mask_dir": str(mask_dir),
         "folds": fold_results,
         "mean_dice_per_patch": statistics.mean(val_dice_per_patch_values),
         "std_dice_per_patch": (
@@ -429,6 +550,18 @@ def main() -> None:
         "std_dice_per_image": val_dice_per_image_std,
         "mean_iou_per_image": val_iou_per_image_mean,
         "std_iou_per_image": val_iou_per_image_std,
+        "mean_test_dice_per_patch": test_dice_per_patch_mean,
+        "std_test_dice_per_patch": test_dice_per_patch_std,
+        "mean_test_iou_per_patch": test_iou_per_patch_mean,
+        "std_test_iou_per_patch": test_iou_per_patch_std,
+        "mean_test_dice_macro_resolution": test_dice_macro_resolution_mean,
+        "std_test_dice_macro_resolution": test_dice_macro_resolution_std,
+        "mean_test_iou_macro_resolution": test_iou_macro_resolution_mean,
+        "std_test_iou_macro_resolution": test_iou_macro_resolution_std,
+        "mean_test_dice_per_image": test_dice_per_image_mean,
+        "std_test_dice_per_image": test_dice_per_image_std,
+        "mean_test_iou_per_image": test_iou_per_image_mean,
+        "std_test_iou_per_image": test_iou_per_image_std,
         "num_original_images": len(original_records),
     }
     save_json(run_dir / "cv_summary.json", summary)

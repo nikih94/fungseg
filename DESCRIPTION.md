@@ -78,7 +78,7 @@ Dataset and split logic live here.
 
 - `dataset.py`: patch dataset plus Albumentations train and validation transforms.
 - `discovery.py`: scans image and mask directories and matches files by stem.
-- `folds.py`: creates grouped k-fold splits or a manual train/validation split.
+- `folds.py`: creates CSV train/validation/test splits, grouped k-fold splits, or a manual train/validation split.
 - `sampling.py`: patch-distribution diagnostics and legacy balanced-sampler helpers.
 
 This folder is important because it keeps dataset discovery, patch sampling, and split strategy separate from model code.
@@ -161,16 +161,17 @@ These are useful but not central to the main training loop:
 ### Training Flow
 
 1. `src/train.py` loads `config.yaml` through `src/utils/config.py`.
-2. `src/data/discovery.py` matches images and masks by filename stem.
-3. `src/patching/` creates original-image records containing source identity and image size.
-4. `src/data/folds.py` splits by original image, not by patch.
-5. `src/patching/` creates deterministic validation patch records and epoch-specific training patch records.
-6. `src/data/dataset.py` loads full images lazily, crops native or scaled-context patches on the fly, applies Albumentations, and returns tensors.
-7. `src/models/factory.py` builds the requested segmentation model.
-8. `src/losses/factory.py`, `src/optim/factory.py`, and `src/schedulers/factory.py` build the training components from config.
-9. `src/engine/trainer.py` runs training, validation, per-resolution metrics, loss-component diagnostics, checkpointing, and metric export.
-10. `src/train.py` aggregates fold metrics, writes split manifests, and writes run summaries.
-11. If enabled, `src/qualitative_evaluation.py` compares manifest checkpoints on qualitative crops and writes visual grids plus `eval_metrics.csv`.
+2. `src/utils/config.py` resolves the active segmentation target, such as `loci` or `inoculum`, to its mask directory.
+3. `src/data/discovery.py` matches images and masks by filename stem.
+4. `src/patching/` creates original-image records containing source identity and image size.
+5. `src/data/folds.py` splits by original image from CSV, k-fold, or manual config, never by patch.
+6. `src/patching/` creates deterministic validation/test patch records and epoch-specific training patch records.
+7. `src/data/dataset.py` loads full images lazily, crops native or scaled-context patches on the fly, applies Albumentations, and returns tensors.
+8. `src/models/factory.py` builds the requested segmentation model.
+9. `src/losses/factory.py`, `src/optim/factory.py`, and `src/schedulers/factory.py` build the training components from config.
+10. `src/engine/trainer.py` runs training, validation, per-resolution metrics, loss-component diagnostics, checkpointing, and metric export.
+11. `src.train.py` invokes `src.test_evaluation.py` on each selected `best.pt`, producing stitched full-image test artifacts and metrics in the run directory.
+12. If enabled, `src/qualitative_evaluation.py` compares manifest checkpoints on seeded crops from the configured qualitative split, which defaults to CSV `test`.
 
 ### Inference Flow
 

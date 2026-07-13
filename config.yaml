@@ -1,9 +1,14 @@
 project:
   name: fungi_segmentation
 
+segmentation:
+  target: loci
+
 paths:
   images_dir: data/images
-  masks_dir: data/masks
+  mask_dirs:
+    loci: data/loci_masks
+    inoculum: data/inoculum_masks
   runs_dir: runs
   outputs_dir: outputs
 
@@ -17,9 +22,9 @@ data:
   image_size: null
 
 patching:
-  patch_size: 512
-  overlap: 256
-  stride: 256
+  patch_size: 512 #512
+  overlap: 256 #256
+  stride: 256 #256
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 128
@@ -81,8 +86,9 @@ cv:
   random_state: 42
 
 split:
-  mode: kfold #train_val # train_val or kfold
-  val_source_ids: ['job_7_IN183 YNA 48h x500 1.tif','job_4_IN183 Agar 48h x500 3.tif','job_2_IN125 Agar 48h x500 2.tif','job_3_IN125 SNA 48h x500 3.tif','job_6_IN183 SNA 48h x500 4.tif']
+  mode: csv # csv, train_val, or kfold
+  csv_path: data/image_splits.csv
+  val_source_ids: []
 
 model:
   name: unetplusplus_resnet34
@@ -92,7 +98,7 @@ model:
   encoder_weights: imagenet
   decoder_normalization: batchnorm
   decoder_channels: [256, 128, 64, 32, 16]
-  decoder_attention_type: scse # set to scse to enable SMP scSE attention in the decoder
+  decoder_attention_type: null # set to scse to enable SMP scSE attention in the decoder, null for no attention
 
 loss:
   name: bce_dice_cldice
@@ -138,9 +144,17 @@ inference:
   threshold: 0.5
   save_probabilities: true
 
+test_evaluation:
+  enabled: true
+  threshold_start: 0.5
+  threshold_stop: 1.0
+  threshold_step: 0.01
+  cldice_iterations: 3
+
 qualitative_evaluation:
   enabled: true
-  data_root: data/qualitative_evaluation
+  data_root: null
+  split: test
   crop_patch_grid: [3, 3]
   min_foreground_ratio: 0.005
   max_foreground_ratio: 0.15

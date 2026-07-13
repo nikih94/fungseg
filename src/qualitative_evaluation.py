@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -15,13 +16,14 @@ from tqdm.auto import tqdm
 
 from src.data.dataset import get_val_transforms
 from src.data.discovery import discover_image_mask_pairs
+from src.data.folds import make_csv_train_val_test_split
 from src.inference import create_overlay
 from src.metrics.segmentation import dice_score_from_masks, iou_score_from_masks
 from src.models.factory import build_model
 from src.models.wrappers import extract_logits
 from src.patching import _compute_positions, crop_and_pad_array
 from src.utils.checkpoint import load_checkpoint
-from src.utils.config import load_config
+from src.utils.config import load_config, resolve_mask_dir
 from src.utils.io import ensure_dir, save_csv
 
 
@@ -420,6 +422,76 @@ def _is_kfold_run(config: dict[str, Any]) -> bool:
     return str(config.get("split", {}).get("mode", "")).strip().lower() == "kfold"
 
 
+def image_selection_rng(selection_seed: int | None, image_stem: str) -> np.random.Generator | None:
+    if selection_seed is None:
+        return None
+    digest = hashlib.blake2b(image_stem.encode("utf-8"), digest_size=8).digest()
+    image_seed = int.from_bytes(digest, byteorder="big", signed=False)
+    combined_seed = (int(selection_seed) + image_seed) % (2**63 - 1)
+    return np.random.default_rng(combined_seed)
+
+
+def _pairs_for_split(
+    pairs: list[tuple[Path, Path]],
+    config: dict[str, Any],
+    split_label: str,
+) -> list[tuple[Path, Path]]:
+    split_cfg = config.get("split", {})
+    csv_path = split_cfg.get("csv_path")
+    if not csv_path:
+        return pairs
+
+    split = make_csv_train_val_test_split(
+        [image_path.name for image_path, _ in pairs],
+        csv_path=csv_path,
+    )
+    normalized_label = split_label.strip().lower()
+    if normalized_label in {"validation", "valid"}:
+        normalized_label = "val"
+    source_map = {
+        "train": set(split.train_sources),
+        "val": set(split.val_sources),
+        "test": set(split.test_sources),
+    }
+    if normalized_label not in source_map:
+        raise ValueError(f"Unsupported qualitative split '{split_label}'. Expected train, validation/val, or test.")
+    selected_sources = source_map[normalized_label]
+    return [(image_path, mask_path) for image_path, mask_path in pairs if image_path.name in selected_sources]
+
+
+def resolve_qualitative_pairs(
+    config: dict[str, Any],
+    data_root: str | Path | None,
+) -> tuple[list[tuple[Path, Path]], dict[str, list[str]], str]:
+    qualitative_cfg = config.get("qualitative_evaluation", {})
+    configured_data_root = qualitative_cfg.get("data_root")
+    effective_data_root = data_root if data_root is not None else configured_data_root
+
+    if effective_data_root:
+        root = Path(effective_data_root)
+        images_dir = root / "images"
+        masks_dir = root / "masks"
+        if not images_dir.exists() or not masks_dir.exists():
+            raise FileNotFoundError(f"Qualitative data root is missing images/ or masks/: {root}")
+        pairs, diagnostics = discover_image_mask_pairs(
+            images_dir,
+            masks_dir,
+            config["data"]["image_extensions"],
+        )
+        return pairs, diagnostics, f"data_root:{root}"
+
+    images_dir = Path(config["paths"]["images_dir"])
+    masks_dir = resolve_mask_dir(config)
+    pairs, diagnostics = discover_image_mask_pairs(
+        images_dir,
+        masks_dir,
+        config["data"]["image_extensions"],
+    )
+    split_label = str(qualitative_cfg.get("split", "test"))
+    pairs = _pairs_for_split(pairs, config, split_label)
+    return pairs, diagnostics, f"split:{split_label}"
+
+
 def run_qualitative_evaluation(
     run_dir: str | Path,
     config_path: str | Path | None = None,
@@ -437,7 +509,6 @@ def run_qualitative_evaluation(
     run_dir = Path(run_dir)
     config = load_config(config_path or run_dir / "config.yaml")
     qualitative_cfg = config.get("qualitative_evaluation", {})
-    data_root = Path(data_root or qualitative_cfg.get("data_root", "data/qualitative_evaluation"))
     output_dir = ensure_dir(output_dir or run_dir / "qualitative_evaluation")
     grids_dir = ensure_dir(output_dir / "grids")
     fold_grids_dir = output_dir / "fold_comparison_grids"
@@ -456,31 +527,24 @@ def run_qualitative_evaluation(
         qualitative_cfg.get("selection_seed", None) if selection_seed is None else selection_seed
     )
     selection_seed = None if selection_seed is None else int(selection_seed)
-    selection_rng = None if selection_seed is None else np.random.default_rng(selection_seed)
     threshold = float(config.get("inference", {}).get("threshold", 0.5) if threshold is None else threshold)
     device = resolve_device(device_name or str(config["train"].get("device", "auto")))
     max_checkpoints = qualitative_cfg.get("max_checkpoints") if max_checkpoints is None else max_checkpoints
     max_checkpoints = None if max_checkpoints is None else int(max_checkpoints)
 
-    images_dir = data_root / "images"
-    masks_dir = data_root / "masks"
-    if not images_dir.exists() or not masks_dir.exists():
-        message = f"Qualitative data root is missing images/ or masks/: {data_root}"
+    try:
+        pairs, diagnostics, pairs_source = resolve_qualitative_pairs(config, data_root)
+    except FileNotFoundError as exc:
+        message = str(exc)
         if logger:
             logger.warning(message)
         return {"skipped": True, "reason": message}
-
-    pairs, diagnostics = discover_image_mask_pairs(
-        images_dir,
-        masks_dir,
-        config["data"]["image_extensions"],
-    )
     if diagnostics["missing_masks"] and logger:
         logger.warning("Qualitative evaluation missing masks for %s images.", len(diagnostics["missing_masks"]))
     if diagnostics["missing_images"] and logger:
         logger.warning("Qualitative evaluation found %s masks without images.", len(diagnostics["missing_images"]))
     if not pairs:
-        message = f"No qualitative image/mask pairs found under {data_root}"
+        message = f"No qualitative image/mask pairs found for {pairs_source}"
         if logger:
             logger.warning(message)
         return {"skipped": True, "reason": message}
@@ -499,8 +563,9 @@ def run_qualitative_evaluation(
 
     if logger:
         logger.info(
-            "Running qualitative evaluation on %s image(s) with %s checkpoint(s).",
+            "Running qualitative evaluation on %s image(s) from %s with %s checkpoint(s).",
             len(pairs),
+            pairs_source,
             len(checkpoints),
         )
 
@@ -534,7 +599,7 @@ def run_qualitative_evaluation(
             mask_threshold=mask_threshold,
             min_foreground_ratio=min_foreground_ratio,
             max_foreground_ratio=max_foreground_ratio,
-            rng=selection_rng,
+            rng=image_selection_rng(selection_seed, image_path.stem),
         )
         selected_crops[image_path.stem] = crop
         crop_rows.append(crop_row(image_path, mask_path, crop, selection_seed))

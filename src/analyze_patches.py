@@ -9,7 +9,7 @@ from PIL import Image
 
 from src.data.discovery import discover_image_mask_pairs
 from src.patching import _compute_positions, build_original_image_records, crop_and_pad_array
-from src.utils.config import load_config
+from src.utils.config import load_config, resolve_mask_dir
 from src.utils.io import ensure_dir
 
 
@@ -80,7 +80,7 @@ def main() -> None:
 
     pairs, diagnostics = discover_image_mask_pairs(
         config["paths"]["images_dir"],
-        config["paths"]["masks_dir"],
+        resolve_mask_dir(config),
         config["data"]["image_extensions"],
     )
     if not pairs:

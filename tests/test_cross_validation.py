@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 
-from src.data.folds import make_grouped_kfold_splits
+from src.data.folds import SplitDefinition, make_csv_train_val_test_split, make_grouped_kfold_splits
 from src.train import split_manifest_rows
 
 
@@ -49,6 +51,64 @@ class CrossValidationTests(unittest.TestCase):
                 {"fold": 1, "split": "val", "source_id": "b.tif"},
             ],
         )
+
+    def test_split_manifest_rows_include_test_sources(self) -> None:
+        rows = split_manifest_rows(
+            [
+                SplitDefinition(
+                    train_sources=["a.tif"],
+                    val_sources=["b.tif"],
+                    test_sources=["c.tif"],
+                )
+            ]
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                {"fold": 0, "split": "train", "source_id": "a.tif"},
+                {"fold": 0, "split": "val", "source_id": "b.tif"},
+                {"fold": 0, "split": "test", "source_id": "c.tif"},
+            ],
+        )
+
+    def test_csv_split_parses_train_validation_and_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "image_splits.csv"
+            csv_path.write_text(
+                "\n".join(
+                    [
+                        "filename,split",
+                        "a.tif,train",
+                        "b.tif,validation",
+                        "c.tif,test",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            split = make_csv_train_val_test_split(["a.tif", "b.tif", "c.tif"], csv_path)
+
+        self.assertEqual(split.train_sources, ["a.tif"])
+        self.assertEqual(split.val_sources, ["b.tif"])
+        self.assertEqual(split.test_sources, ["c.tif"])
+
+    def test_csv_split_rejects_unassigned_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "image_splits.csv"
+            csv_path.write_text(
+                "\n".join(
+                    [
+                        "filename,split",
+                        "a.tif,train",
+                        "b.tif,validation",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                make_csv_train_val_test_split(["a.tif", "b.tif", "c.tif"], csv_path)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from src.data.discovery import discover_image_mask_pairs
+from src.data.folds import SplitDefinition, make_csv_train_val_test_split
 from src.patching.core import (
     OriginalImageRecord,
     PatchRecord,
@@ -17,13 +18,14 @@ from src.patching.core import (
     build_original_image_records,
     build_patch_records,
 )
-from src.utils.config import load_config
+from src.utils.config import load_config, resolve_mask_dir
 from src.utils.io import ensure_dir
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Explain dynamic patching for a config.")
     parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    parser.add_argument("--target", default=None, help="Optional segmentation target override, e.g. loci or inoculum.")
     parser.add_argument("--image", default=None, help="Optional image path to draw a patch overlay for.")
     parser.add_argument("--epoch", type=int, default=1, help="Epoch number used for deterministic training patching.")
     return parser.parse_args()
@@ -65,7 +67,11 @@ def _resolution_bin_index(record: PatchRecord, bin_edges: list[int]) -> int:
     return len(bin_edges) - 1
 
 
-def _print_source_resolution_table(kept: list[PatchRecord], patch_size: int) -> None:
+def _print_source_resolution_table(
+    kept: list[PatchRecord],
+    patch_size: int,
+    title: str = "Patches by source and source-crop resolution:",
+) -> None:
     bin_edges = _resolution_bin_edges(patch_size)
     source_rows: dict[str, list[int]] = {}
     for record in kept:
@@ -103,7 +109,7 @@ def _print_source_resolution_table(kept: list[PatchRecord], patch_size: int) -> 
         for index, header in enumerate(bin_headers)
     ]
 
-    print("Patches by source and source-crop resolution:")
+    print(title)
     header = (
         f"  {source_header:<{source_width}}  "
         f"{total_header:>{total_width}}  "
@@ -125,6 +131,14 @@ def _print_source_resolution_table(kept: list[PatchRecord], patch_size: int) -> 
             )
         )
     print(
+        f"  {'total':<{source_width}}  "
+        f"{total_patches:>{total_width}}  "
+        + "  ".join(
+            f"{value:>{width}}"
+            for value, width in zip(bin_totals, bin_widths)
+        )
+    )
+    print(
         f"  {'percent':<{source_width}}  "
         f"{'100.0%':>{total_width}}  "
         + "  ".join(
@@ -134,6 +148,45 @@ def _print_source_resolution_table(kept: list[PatchRecord], patch_size: int) -> 
     )
 
 
+def _csv_split_definition(config: dict[str, Any], original_records: list[OriginalImageRecord]) -> SplitDefinition | None:
+    split_cfg = config.get("split", {})
+    if str(split_cfg.get("mode", "")).strip().lower() != "csv":
+        return None
+    csv_path = split_cfg.get("csv_path")
+    if not csv_path:
+        return None
+    try:
+        return make_csv_train_val_test_split(
+            [record.source_id for record in original_records],
+            csv_path=csv_path,
+        )
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _print_split_resolution_tables(
+    kept: list[PatchRecord],
+    patch_size: int,
+    split: SplitDefinition | None,
+) -> None:
+    if split is None:
+        return
+
+    split_sources = [
+        ("train", set(split.train_sources)),
+        ("validation", set(split.val_sources)),
+        ("test", set(split.test_sources)),
+    ]
+    for split_name, source_ids in split_sources:
+        split_records = [record for record in kept if record.source_id in source_ids]
+        print()
+        _print_source_resolution_table(
+            split_records,
+            patch_size,
+            title=f"Patches by source and source-crop resolution ({split_name} split):",
+        )
+
+
 def _print_summary(
     original_records: list[OriginalImageRecord],
     candidates: list[PatchRecord],
@@ -141,6 +194,7 @@ def _print_summary(
     patching_config: dict[str, Any],
     epoch: int,
     seed: int,
+    split: SplitDefinition | None = None,
 ) -> None:
     labels = Counter(record.scale_label for record in kept)
     discarded = max(0, len(candidates) - len(kept))
@@ -167,6 +221,7 @@ def _print_summary(
         f"p50={stats['p50']:.4f} p90={stats['p90']:.4f} p95={stats['p95']:.4f}"
     )
     _print_source_resolution_table(kept, patch_size)
+    _print_split_resolution_tables(kept, patch_size, split)
 
 
 def _match_image_record(records: list[OriginalImageRecord], image_path: str) -> OriginalImageRecord:
@@ -241,15 +296,18 @@ def _draw_overlay(
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if args.target is not None:
+        config.setdefault("segmentation", {})["target"] = str(args.target)
     pairs, diagnostics = discover_image_mask_pairs(
         config["paths"]["images_dir"],
-        config["paths"]["masks_dir"],
+        resolve_mask_dir(config),
         config["data"]["image_extensions"],
     )
     if not pairs:
         raise RuntimeError("No matched image/mask pairs were found.")
 
     original_records = build_original_image_records(pairs)
+    split = _csv_split_definition(config, original_records)
     patching_config = config["patching"]
     seed = int(config["train"]["seed"])
     candidates = build_patch_records(
@@ -266,13 +324,14 @@ def main() -> None:
         epoch=int(args.epoch),
         base_seed=seed,
     )
-    _print_summary(original_records, candidates, kept, patching_config, int(args.epoch), seed)
+    _print_summary(original_records, candidates, kept, patching_config, int(args.epoch), seed, split=split)
 
     if args.image:
+        target = str(config.get("segmentation", {}).get("target", "legacy"))
         image_record = _match_image_record(original_records, args.image)
         image_records = [record for record in kept if record.source_id == image_record.source_id]
         output_dir = ensure_dir(Path(config["paths"]["outputs_dir"]) / config["project"]["name"] / "patching_explain")
-        output_path = output_dir / f"{Path(image_record.source_id).stem}_epoch_{int(args.epoch):03d}_patches.png"
+        output_path = output_dir / f"{Path(image_record.source_id).stem}_{target}_epoch_{int(args.epoch):03d}_patches.png"
         _draw_overlay(image_record, image_records, output_path, int(args.epoch), seed)
         print(f"Overlay saved to: {output_path}")
 

@@ -1,6 +1,9 @@
 project:
   name: fungi_segmentation
 
+segmentation:
+  target: legacy
+
 paths:
   images_dir: data/images-small
   masks_dir: data/masks-small

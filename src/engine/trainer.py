@@ -246,7 +246,33 @@ class Trainer:
             "val_iou_per_image": self._latest_metric(history, "val_iou_per_image"),
         }
 
-    def _run_epoch(self, loader: DataLoader, training: bool, epoch: int, epochs: int) -> dict[str, float]:
+    def evaluate(
+        self,
+        loader: DataLoader,
+        original_records: list[OriginalImageRecord] | None = None,
+        stage: str = "test",
+    ) -> dict[str, float]:
+        metrics = self._run_epoch(loader, training=False, epoch=1, epochs=1, stage_name=stage)
+        if original_records:
+            metrics.update(
+                self._evaluate_full_images(
+                    epoch=1,
+                    epochs=1,
+                    original_records=original_records,
+                    stage=stage,
+                )
+            )
+        shutdown_dataloader(loader)
+        return metrics
+
+    def _run_epoch(
+        self,
+        loader: DataLoader,
+        training: bool,
+        epoch: int,
+        epochs: int,
+        stage_name: str | None = None,
+    ) -> dict[str, float]:
         self.model.train(mode=training)
         total_loss = 0.0
         total_dice = 0.0
@@ -258,7 +284,7 @@ class Trainer:
         component_totals: dict[str, float] = {}
 
         autocast_device = self.device.type if self.device.type in {"cuda", "cpu"} else "cpu"
-        stage = "train" if training else "val"
+        stage = stage_name or ("train" if training else "val")
         progress = None
         iterator = loader
         if self.use_tqdm:
@@ -349,30 +375,37 @@ class Trainer:
             for bucket in sorted(bucket_counts):
                 dice_value = bucket_dice_totals[bucket] / bucket_counts[bucket]
                 iou_value = bucket_iou_totals[bucket] / bucket_counts[bucket]
-                metrics[f"val_dice_{bucket}"] = dice_value
-                metrics[f"val_iou_{bucket}"] = iou_value
+                metrics[f"{stage}_dice_{bucket}"] = dice_value
+                metrics[f"{stage}_iou_{bucket}"] = iou_value
                 bucket_dice_values.append(dice_value)
                 bucket_iou_values.append(iou_value)
-            metrics["val_dice_macro_resolution"] = sum(bucket_dice_values) / len(bucket_dice_values)
-            metrics["val_iou_macro_resolution"] = sum(bucket_iou_values) / len(bucket_iou_values)
+            metrics[f"{stage}_dice_macro_resolution"] = sum(bucket_dice_values) / len(bucket_dice_values)
+            metrics[f"{stage}_iou_macro_resolution"] = sum(bucket_iou_values) / len(bucket_iou_values)
         elif not training:
-            metrics["val_dice_macro_resolution"] = metrics["val_dice_per_patch"]
-            metrics["val_iou_macro_resolution"] = metrics["val_iou_per_patch"]
+            metrics[f"{stage}_dice_macro_resolution"] = metrics[f"{stage}_dice_per_patch"]
+            metrics[f"{stage}_iou_macro_resolution"] = metrics[f"{stage}_iou_per_patch"]
         return metrics
 
-    def _evaluate_full_images(self, epoch: int, epochs: int) -> dict[str, float]:
+    def _evaluate_full_images(
+        self,
+        epoch: int,
+        epochs: int,
+        original_records: list[OriginalImageRecord] | None = None,
+        stage: str = "val",
+    ) -> dict[str, float]:
         patch_size = int(self.data_config["patch_size"])
         stride = int(self.data_config["stride"])
         mask_threshold = int(self.data_config["mask_threshold"])
         total_dice = 0.0
         total_iou = 0.0
         num_images = 0
+        records = self.val_original_records if original_records is None else original_records
 
-        iterator = self.val_original_records
+        iterator = records
         if self.use_tqdm:
             iterator = tqdm(
-                self.val_original_records,
-                desc=f"Fold {self.fold_index} | Epoch {epoch}/{epochs} | val_full_image",
+                records,
+                desc=f"Fold {self.fold_index} | Epoch {epoch}/{epochs} | {stage}_full_image",
                 leave=False,
             )
 
@@ -438,8 +471,8 @@ class Trainer:
 
         divisor = max(num_images, 1)
         return {
-            "val_dice_per_image": total_dice / divisor,
-            "val_iou_per_image": total_iou / divisor,
+            f"{stage}_dice_per_image": total_dice / divisor,
+            f"{stage}_iou_per_image": total_iou / divisor,
         }
 
     def _should_run_per_image_validation(self, epoch: int) -> bool:

@@ -12,8 +12,10 @@ from src.qualitative_evaluation import (
     _cross_fold_checkpoint_entries,
     _is_kfold_run,
     discover_manifest_checkpoints,
+    image_selection_rng,
     intersecting_patch_coordinates,
     metric_row,
+    resolve_qualitative_pairs,
     select_qualitative_crop,
 )
 
@@ -76,6 +78,59 @@ class QualitativeEvaluationTests(unittest.TestCase):
 
         self.assertEqual(first, repeat)
         self.assertNotEqual((first.x, first.y), (different_seed.x, different_seed.y))
+
+    def test_per_image_selection_rng_is_repeatable_and_image_specific(self) -> None:
+        first = image_selection_rng(42, "image_a")
+        repeat = image_selection_rng(42, "image_a")
+        other_image = image_selection_rng(42, "image_b")
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(repeat)
+        self.assertIsNotNone(other_image)
+        first_values = first.integers(0, 100000, size=4).tolist()
+        repeat_values = repeat.integers(0, 100000, size=4).tolist()
+        other_values = other_image.integers(0, 100000, size=4).tolist()
+        self.assertEqual(first_values, repeat_values)
+        self.assertNotEqual(first_values, other_values)
+
+    def test_resolves_default_qualitative_pairs_from_test_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            images_dir = root / "images"
+            masks_dir = root / "loci_masks"
+            images_dir.mkdir()
+            masks_dir.mkdir()
+            for stem in ["train_image", "val_image", "test_image"]:
+                (images_dir / f"{stem}.tif").write_bytes(b"image")
+                (masks_dir / f"{stem}.png").write_bytes(b"mask")
+            split_path = root / "image_splits.csv"
+            split_path.write_text(
+                "\n".join(
+                    [
+                        "filename,split",
+                        "train_image.tif,train",
+                        "val_image.tif,validation",
+                        "test_image.tif,test",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "paths": {
+                    "images_dir": str(images_dir),
+                    "mask_dirs": {"loci": str(masks_dir)},
+                },
+                "segmentation": {"target": "loci"},
+                "data": {"image_extensions": [".tif"]},
+                "split": {"csv_path": str(split_path)},
+                "qualitative_evaluation": {"data_root": None, "split": "test"},
+            }
+
+            pairs, diagnostics, source = resolve_qualitative_pairs(config, data_root=None)
+
+        self.assertEqual(diagnostics, {"missing_masks": [], "missing_images": []})
+        self.assertEqual(source, "split:test")
+        self.assertEqual([image_path.name for image_path, _ in pairs], ["test_image.tif"])
 
     def test_border_patches_are_included_for_crop_stitching(self) -> None:
         crop = SelectedCrop(

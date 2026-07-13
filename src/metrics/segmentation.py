@@ -78,3 +78,74 @@ def iou_score(logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.
 def iou_scores(logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5, smooth: float = 1e-6) -> torch.Tensor:
     predictions = _prepare_predictions(logits, threshold)
     return iou_scores_from_masks(predictions, targets, smooth=smooth)
+
+
+def precision_score_from_masks(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    smooth: float = 1e-6,
+) -> float:
+    predictions = _flatten_batch(predictions)
+    targets = _flatten_batch(targets)
+    true_positives = (predictions * targets).sum(dim=1)
+    predicted_positives = predictions.sum(dim=1)
+    return float(((true_positives + smooth) / (predicted_positives + smooth)).mean().item())
+
+
+def recall_score_from_masks(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    smooth: float = 1e-6,
+) -> float:
+    predictions = _flatten_batch(predictions)
+    targets = _flatten_batch(targets)
+    true_positives = (predictions * targets).sum(dim=1)
+    target_positives = targets.sum(dim=1)
+    return float(((true_positives + smooth) / (target_positives + smooth)).mean().item())
+
+
+def cldice_score_from_masks(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    iterations: int = 3,
+    smooth: float = 1.0,
+) -> float:
+    import torch.nn.functional as F
+
+    def as_nchw(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 2:
+            return tensor.unsqueeze(0).unsqueeze(0).float()
+        if tensor.ndim == 3:
+            return tensor.unsqueeze(1).float()
+        return tensor.float()
+
+    def erode(mask: torch.Tensor) -> torch.Tensor:
+        eroded_y = -F.max_pool2d(-mask, kernel_size=(3, 1), stride=1, padding=(1, 0))
+        eroded_x = -F.max_pool2d(-mask, kernel_size=(1, 3), stride=1, padding=(0, 1))
+        return torch.minimum(eroded_x, eroded_y)
+
+    def skeletonize(mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().clamp(0.0, 1.0)
+        skeleton = F.relu(mask - F.max_pool2d(erode(mask), kernel_size=3, stride=1, padding=1))
+        for _ in range(max(0, iterations - 1)):
+            mask = erode(mask)
+            delta = F.relu(mask - F.max_pool2d(erode(mask), kernel_size=3, stride=1, padding=1))
+            skeleton = skeleton + F.relu(delta - skeleton * delta)
+        return skeleton
+
+    predictions = as_nchw(predictions)
+    targets = as_nchw(targets)
+    prediction_skeleton = _flatten_batch(skeletonize(predictions))
+    target_skeleton = _flatten_batch(skeletonize(targets))
+    predictions = _flatten_batch(predictions)
+    targets = _flatten_batch(targets)
+    topology_precision = ((prediction_skeleton * targets).sum(dim=1) + smooth) / (
+        prediction_skeleton.sum(dim=1) + smooth
+    )
+    topology_recall = ((target_skeleton * predictions).sum(dim=1) + smooth) / (
+        target_skeleton.sum(dim=1) + smooth
+    )
+    cldice = (2.0 * topology_precision * topology_recall + smooth) / (
+        topology_precision + topology_recall + smooth
+    )
+    return float(cldice.mean().item())

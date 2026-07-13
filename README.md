@@ -2,7 +2,7 @@
 
 Modular PyTorch project for binary semantic segmentation of fungal networks in RGB microscopy or macroscopy images.
 
-The training pipeline discovers image and mask pairs automatically, creates patch records in memory, trains on patches, and keeps all patches from the same original image in the same validation split.
+The training pipeline discovers image and target-mask pairs automatically, creates patch records in memory, trains on patches, validates on the configured validation images, and reports a held-out test evaluation from `data/image_splits.csv`.
 
 ## Install
 
@@ -14,11 +14,20 @@ pip install -r requirements.txt
 
 ## Data Layout
 
-Put source images in `data/images` and binary masks in `data/masks`.
+Put source images and binary target masks in this layout:
+
+```text
+data/images/
+data/loci_masks/
+data/inoculum_masks/
+data/image_splits.csv
+```
 
 - Images and masks are matched by filename stem.
+- `segmentation.target: loci` uses `data/loci_masks`.
+- `segmentation.target: inoculum` uses `data/inoculum_masks`.
 - Supported image extensions come from `config.yaml`.
-- No CSV manifest is required.
+- `data/image_splits.csv` must contain `filename,split`, with split labels `train`, `validation` or `val`, and `test`.
 
 ## Training
 
@@ -35,18 +44,19 @@ python -m src.train --config config_segformer_mit_b3.yaml
 Training does the following:
 
 1. Loads `config.yaml`.
-2. Scans `data/images` and `data/masks`.
+2. Scans `data/images` and the mask directory for the configured `segmentation.target`.
 3. Builds original-image records.
-4. Splits by original image, not by patch.
+4. Splits by original image from `data/image_splits.csv` by default, not by patch.
 5. Generates validation patch records and epoch-specific training patch records in memory.
 6. Builds datasets, dataloaders, model, loss, optimizer, and scheduler.
-7. Trains and validates each fold or manual split.
-8. Saves checkpoints, logs, and metrics under `runs/<project>_<timestamp>/`.
-9. Runs qualitative checkpoint comparison when `qualitative_evaluation.enabled` is true.
+7. Trains and validates each split or fold.
+8. Evaluates the held-out CSV test images with the selected `best.pt`, using the same stitched patch inference as `src.inference`.
+9. Saves checkpoints, logs, and metrics under `runs/<project>_<timestamp>/`.
+10. Runs qualitative checkpoint comparison on the test split when `qualitative_evaluation.enabled` is true.
 
 Each run folder contains the merged config, `split_manifest.csv` / `split_manifest.json`, per-fold checkpoints,
-TensorBoard logs, and CSV/JSON metric files. The split manifest records every train/validation source image per
-fold, so k-fold and manual train/validation runs can be audited later.
+TensorBoard logs, and CSV/JSON metric files. The split manifest records every train, validation, and test source
+image per fold/split so runs can be audited later.
 
 Each fold always saves `best.pt`, `last.pt`, and `checkpoint_manifest.csv` with the metrics for each saved
 checkpoint. When `train.best_interval_checkpoint.enabled` is true, it also saves configurable best-in-interval
@@ -62,7 +72,21 @@ Run-level metric outputs include:
 - `fold_metrics.csv`: one row per fold with the selected best-epoch metrics.
 - `epoch_metrics.csv`: one row per fold and epoch.
 - `fold_*/metrics.csv` and `fold_*/metrics.json`: full per-fold epoch history.
+- `test-evaluation/`: full-image test artifacts from the selected `best.pt`, including masks, overlays, per-image and mean Dice, IoU, precision, recall, clDice, and predicted-foreground-fraction CSV metrics, plus threshold plots for every metric.
 - `fold_*/checkpoint_manifest.csv` and `.json`: saved checkpoints and their associated metrics.
+
+## Test Evaluation
+
+Training runs test evaluation automatically after `best.pt` is selected. To evaluate a chosen checkpoint later:
+
+```bash
+python -m src.test_evaluation \
+  --checkpoint runs/fungi_segmentation_20260415_225352/fold_0/best.pt
+```
+
+The command uses the saved run `config.yaml` by default. Pass `--config` for a checkpoint outside a run folder or
+`--output` to write artifacts elsewhere. The default threshold sweep evaluates every test image from 0.50 to 1.00 in
+0.01 increments and writes one line per image in each Dice and IoU plot.
 
 ## Inference
 
@@ -87,6 +111,30 @@ python -m src.in_folder_inference \
 
 This variant processes every supported image in the input folder and its subfolders, writes only binary masks next to the original images, and preserves each image stem with a `_mask.png` suffix. For example, `data/images/sample.tif` becomes `data/images/sample_mask.png`. Existing or generated `*_mask.png` files are skipped as inputs so reruns do not create nested mask names.
 
+### Evaluation on Images from Other Papers
+
+To run a trained model on the image collections under `data/other-test-data/`, use:
+
+```bash
+python -m src.other_test_data_evaluation \
+  --config config.yaml \
+  --model runs/fungi_segmentation_20260415_225352/fold_0/best.pt
+```
+
+The script recursively processes the paper-specific folders and writes only binary segmentation masks and overlay previews under `data/other-test-data/results/`, preserving the input folder structure. For example:
+
+```text
+data/other-test-data/
+├── Cardini_et_al_images/a.jpg
+├── ghent-Real_Images/Crop001.png
+└── results/
+    ├── Cardini_et_al_images/a_mask.png
+    ├── Cardini_et_al_images/a_overlay.png
+    └── ghent-Real_Images/Crop001_mask.png
+```
+
+The `--model` option accepts the checkpoint path; `--checkpoint` and `--model-path` are accepted aliases. The input root can be changed with `--input`, and a different results directory can be selected with `--output`. Probability maps are not written by this command, even if `inference.save_probabilities` is enabled in the config.
+
 ## Qualitative Evaluation
 
 ```bash
@@ -94,9 +142,9 @@ python -m src.qualitative_evaluation \
   --run-dir runs/fungi_segmentation_20260526_181338
 ```
 
-Qualitative evaluation compares all checkpoints listed in each fold's `checkpoint_manifest.csv` on paired images and masks from `data/qualitative_evaluation/images` and `data/qualitative_evaluation/masks`.
+Qualitative evaluation compares all checkpoints listed in each fold's `checkpoint_manifest.csv`. By default it uses only the CSV `test` images from `data/images` and the active target mask directory. Passing `--data-root` keeps the older ad hoc mode with paired `images/` and `masks/` subfolders.
 
-For each qualitative image, it selects one configurable mostly-background crop with some foreground, predicts with all manifest checkpoints, and writes comparison grids and crop-level metrics under:
+For each qualitative image, it selects one configurable mostly-background crop with some foreground using a seed that is stable per image, predicts with all manifest checkpoints, and writes comparison grids and crop-level metrics under:
 
 - `runs/<project>_<timestamp>/qualitative_evaluation/grids/`
 - `runs/<project>_<timestamp>/qualitative_evaluation/eval_metrics.csv`
@@ -156,9 +204,14 @@ All important settings live in `config.yaml`.
 ### `paths`
 
 - `images_dir`: directory containing input images.
-- `masks_dir`: directory containing binary segmentation masks.
+- `mask_dirs`: mapping from segmentation target names to binary mask directories.
+- `masks_dir`: legacy fallback for old single-target configs.
 - `runs_dir`: root directory for training runs, checkpoints, logs, and metrics.
 - `outputs_dir`: root directory for inference outputs and exported artifacts.
+
+### `segmentation`
+
+- `target`: active binary segmentation target, usually `loci` or `inoculum`.
 
 ### `data`
 
@@ -171,6 +224,10 @@ All important settings live in `config.yaml`.
 - `image_size`: optional resize applied after patch extraction and before normalization.
 
 ### `patching`
+
+Detailed patching behavior is documented in [PATHCING_DESCRIPTION.md](/home/niki/fungseg/PATHCING_DESCRIPTION.md).
+If patching, patch filtering, split-specific patch behavior, or patch visualization changes, keep that document
+updated together with this README.
 
 - `patch_size`: square model crop size used for patch-based training, validation, and inference.
 - `overlap`: overlap between neighboring deterministic patches.
@@ -195,7 +252,8 @@ To inspect patching for a config:
 
 ```bash
 python -m src.patching.explain --config config.yaml
-python -m src.patching.explain --config config.yaml --image "data/images/example.tif" --epoch 3
+python -m src.patching.explain --config config.yaml --target loci --image "data/images/example.tif" --epoch 3
+python -m src.patching.explain --config config.yaml --target inoculum --image "data/images/example.tif" --epoch 3
 ```
 
 The explanation command prints patch counts, normal/scaled-context counts, scale statistics, and a per-source
@@ -240,8 +298,13 @@ overlay under `outputs/<project>/patching_explain/`.
 
 ### `split`
 
-- `mode`: split strategy. Supported values are `train_val` and `kfold`.
+- `mode`: split strategy. Supported values are `csv`, `train_val`, and `kfold`.
+- `csv_path`: CSV file used in `csv` mode. It must contain `filename,split`.
 - `val_source_ids`: validation image identifiers used only in `train_val` mode.
+
+Default training uses `split.mode: csv`, trains on `train`, selects checkpoints on `validation`/`val`, and reports
+the held-out `test` split after reloading each fold's `best.pt`. Test metrics are not used for checkpoint selection,
+learning-rate scheduling, or training decisions.
 
 Set `split.mode: kfold` to run grouped cross-validation. In this mode, `val_source_ids` is ignored and each
 source image is used as validation in exactly one fold. The exact fold membership is written to the split
@@ -310,7 +373,8 @@ manifest files in the run directory.
 ### `qualitative_evaluation`
 
 - `enabled`: whether training should run qualitative comparison after finishing.
-- `data_root`: folder containing qualitative `images/` and `masks/` subfolders.
+- `data_root`: optional folder containing qualitative `images/` and `masks/` subfolders. Leave `null` to use the configured split.
+- `split`: split label used when `data_root` is `null`; defaults to `test`.
 - `crop_patch_grid`: number of patch origins in the selected crop, such as `[3, 3]`.
 - `min_foreground_ratio`: minimum foreground fraction for automatic crop selection.
 - `max_foreground_ratio`: maximum foreground fraction for automatic crop selection.

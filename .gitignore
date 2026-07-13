@@ -29,7 +29,11 @@ Fungi_temporal.zip
 funi-temporal-masks.zip
 
 # Data
-/data/
+/data/images
+/data/inoculum_masks
+/data/loci_masks
+/data/small-test
+/data/test
 
 # Logs and notebooks
 *.log

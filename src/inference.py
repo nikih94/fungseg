@@ -65,6 +65,28 @@ def save_rgb_image(path: Path, image_array: np.ndarray) -> None:
     Image.fromarray(image_array.astype(np.uint8)).save(path)
 
 
+def _repair_raw_16bit_tiff_tiles(image: Image.Image) -> None:
+    if image.format != "TIFF" or image.mode != "I;16":
+        return
+
+    repaired_tiles = []
+    for tile in image.tile:
+        if tile[0] == "raw":
+            tile = tile._replace(args=("I;16", 0, 1))
+        repaired_tiles.append(tile)
+    image.tile = repaired_tiles
+
+
+def load_rgb_image(image_path: Path) -> np.ndarray:
+    with Image.open(image_path) as image:
+        _repair_raw_16bit_tiff_tiles(image)
+        if image.format == "TIFF" and image.mode == "I;16":
+            grayscale = np.asarray(image).astype(np.uint16, copy=False)
+            grayscale_8bit = (grayscale >> 8).astype(np.uint8)
+            return np.repeat(grayscale_8bit[..., np.newaxis], 3, axis=2)
+        return np.array(image.convert("RGB"))
+
+
 def predict_probabilities_on_image(
     model, image_path: Path, config: dict, device: torch.device
 ) -> np.ndarray:
@@ -74,9 +96,7 @@ def predict_probabilities_on_image(
         augmentations_config=config.get("augmentations", {}),
     )
 
-    with Image.open(image_path) as image:
-        rgb_image = image.convert("RGB")
-        image_array = np.array(rgb_image)
+    image_array = load_rgb_image(image_path)
 
     height, width = image_array.shape[:2]
     patching_cfg = config["patching"]
@@ -121,8 +141,7 @@ def run_inference_on_image(
     threshold = float(config["inference"]["threshold"])
     averaged_probabilities = predict_probabilities_on_image(model, image_path, config, device)
     binary_mask = probabilities_to_binary_mask(averaged_probabilities, threshold)
-    with Image.open(image_path) as image:
-        image_array = np.array(image.convert("RGB"))
+    image_array = load_rgb_image(image_path)
     overlay = create_overlay(image_array, binary_mask)
     return averaged_probabilities, binary_mask, overlay
 
