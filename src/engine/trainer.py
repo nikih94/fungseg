@@ -13,7 +13,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from src.data.dataset import get_val_transforms
+from src.data.dataset import compose_multiclass_mask, get_val_transforms
 from src.metrics.segmentation import (
     dice_score,
     dice_score_from_masks,
@@ -21,6 +21,8 @@ from src.metrics.segmentation import (
     iou_score,
     iou_score_from_masks,
     iou_scores,
+    multiclass_metrics_from_masks,
+    multiclass_predictions,
 )
 from src.metrics.loss_components import loss_component_metrics
 from src.models.wrappers import extract_logits
@@ -60,6 +62,7 @@ class Trainer:
         val_original_records: list[OriginalImageRecord] | None = None,
         tensorboard_writer=None,
         fold_index: int = 0,
+        segmentation_config: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.loss_fn = loss_fn
@@ -75,6 +78,13 @@ class Trainer:
         self.val_original_records = val_original_records or []
         self.tensorboard_writer = tensorboard_writer
         self.fold_index = fold_index
+        self.segmentation_config = segmentation_config or {}
+        self.segmentation_mode = str(self.segmentation_config.get("mode", "binary")).lower()
+        self.class_names = {
+            name: int(class_id) for name, class_id in self.segmentation_config.get(
+                "classes", {"background": 0, "loci": 1, "inoculum": 2}
+            ).items() if name != "background"
+        }
         self.monitor = self._normalize_metric_name(train_config.get("monitor", "val_dice_per_patch"))
         self.monitor_mode = train_config.get("monitor_mode", "max")
         interval_checkpoint_config = train_config.get("best_interval_checkpoint", {})
@@ -319,13 +329,22 @@ class Trainer:
                         self.scaler.update()
 
                 total_loss += float(loss.item())
-                total_dice += dice_score(logits.detach(), masks.detach(), threshold=self.threshold)
-                total_iou += iou_score(logits.detach(), masks.detach(), threshold=self.threshold)
+                if self.segmentation_mode == "multiclass":
+                    batch_task_metrics = multiclass_metrics_from_masks(
+                        multiclass_predictions(logits.detach()), masks.detach(), self.class_names
+                    )
+                    total_dice += batch_task_metrics["dice_macro_foreground"]
+                    total_iou += batch_task_metrics["iou_macro_foreground"]
+                    for metric_name, metric_value in batch_task_metrics.items():
+                        component_totals[metric_name] = component_totals.get(metric_name, 0.0) + float(metric_value)
+                else:
+                    total_dice += dice_score(logits.detach(), masks.detach(), threshold=self.threshold)
+                    total_iou += iou_score(logits.detach(), masks.detach(), threshold=self.threshold)
                 with torch.no_grad():
                     batch_components = loss_component_metrics(logits.detach(), masks.detach(), self.loss_config)
                 for metric_name, metric_value in batch_components.items():
                     component_totals[metric_name] = component_totals.get(metric_name, 0.0) + float(metric_value)
-                if not training and "resolution_bucket" in batch:
+                if not training and "resolution_bucket" in batch and self.segmentation_mode != "multiclass":
                     batch_buckets = self._as_string_list(batch["resolution_bucket"])
                     batch_dice_scores = dice_scores(
                         logits.detach(),
@@ -384,6 +403,13 @@ class Trainer:
         elif not training:
             metrics[f"{stage}_dice_macro_resolution"] = metrics[f"{stage}_dice_per_patch"]
             metrics[f"{stage}_iou_macro_resolution"] = metrics[f"{stage}_iou_per_patch"]
+        if self.segmentation_mode == "multiclass":
+            metrics[f"{stage}_dice_macro_foreground"] = metrics.get(
+                f"{stage}_dice_macro_foreground", metrics[f"{stage}_dice_per_patch"]
+            )
+            metrics[f"{stage}_iou_macro_foreground"] = metrics.get(
+                f"{stage}_iou_macro_foreground", metrics[f"{stage}_iou_per_patch"]
+            )
         return metrics
 
     def _evaluate_full_images(
@@ -414,11 +440,23 @@ class Trainer:
             for record in iterator:
                 with Image.open(record.image_path) as image:
                     image_array = np.array(image.convert("RGB"))
-                with Image.open(record.mask_path) as mask:
-                    mask_array = np.array(mask.convert("L"), dtype=np.uint8)
-
-                height, width = mask_array.shape
-                probability_sum = np.zeros((height, width), dtype=np.float32)
+                if self.segmentation_mode == "multiclass":
+                    if not record.mask_paths:
+                        raise ValueError("Multiclass full-image evaluation requires named masks.")
+                    with Image.open(record.mask_paths["loci"]) as mask:
+                        loci_array = np.array(mask.convert("L"), dtype=np.uint8)
+                    with Image.open(record.mask_paths["inoculum"]) as mask:
+                        inoculum_array = np.array(mask.convert("L"), dtype=np.uint8)
+                    mask_array, _ = compose_multiclass_mask(
+                        loci_array, inoculum_array, mask_threshold
+                    )
+                    height, width = mask_array.shape
+                    probability_sum = np.zeros((3, height, width), dtype=np.float32)
+                else:
+                    with Image.open(record.mask_path) as mask:
+                        mask_array = np.array(mask.convert("L"), dtype=np.uint8)
+                    height, width = mask_array.shape
+                    probability_sum = np.zeros((height, width), dtype=np.float32)
                 probability_count = np.zeros((height, width), dtype=np.float32)
                 xs = _compute_positions(width, patch_size, stride)
                 ys = _compute_positions(height, patch_size, stride)
@@ -437,7 +475,11 @@ class Trainer:
                             enabled=self.use_amp,
                         ):
                             logits = extract_logits(self.model(image_tensor))
-                            probabilities = torch.sigmoid(logits)
+                            probabilities = (
+                                torch.softmax(logits, dim=1)
+                                if self.segmentation_mode == "multiclass"
+                                else torch.sigmoid(logits)
+                            )
 
                         if probabilities.shape[-2:] != (patch_size, patch_size):
                             probabilities = F.interpolate(
@@ -447,20 +489,38 @@ class Trainer:
                                 align_corners=False,
                             )
 
-                        probability_patch = probabilities.squeeze().cpu().numpy().astype(np.float32)
+                        probability_patch = probabilities.squeeze(0).cpu().numpy().astype(np.float32)
+                        if self.segmentation_mode != "multiclass":
+                            probability_patch = probability_patch.squeeze(0)
                         valid_height = min(patch_size, height - y)
                         valid_width = min(patch_size, width - x)
-                        probability_sum[y : y + valid_height, x : x + valid_width] += probability_patch[
-                            :valid_height, :valid_width
-                        ]
+                        if self.segmentation_mode == "multiclass":
+                            probability_sum[:, y : y + valid_height, x : x + valid_width] += probability_patch[
+                                :, :valid_height, :valid_width
+                            ]
+                        else:
+                            probability_sum[y : y + valid_height, x : x + valid_width] += probability_patch[
+                                :valid_height, :valid_width
+                            ]
                         probability_count[y : y + valid_height, x : x + valid_width] += 1.0
 
-                averaged_probabilities = probability_sum / np.clip(probability_count, a_min=1.0, a_max=None)
-                prediction_mask = torch.from_numpy((averaged_probabilities >= self.threshold).astype(np.float32))
-                target_mask = torch.from_numpy((mask_array > mask_threshold).astype(np.float32))
-
-                total_dice += dice_score_from_masks(prediction_mask, target_mask)
-                total_iou += iou_score_from_masks(prediction_mask, target_mask)
+                if self.segmentation_mode == "multiclass":
+                    averaged_probabilities = probability_sum / np.clip(
+                        probability_count[None, ...], a_min=1.0, a_max=None
+                    )
+                    prediction_mask = torch.from_numpy(averaged_probabilities.argmax(axis=0))
+                    target_mask = torch.from_numpy(mask_array.astype(np.int64))
+                    image_metrics = multiclass_metrics_from_masks(
+                        prediction_mask, target_mask, self.class_names
+                    )
+                    total_dice += image_metrics["dice_macro_foreground"]
+                    total_iou += image_metrics["iou_macro_foreground"]
+                else:
+                    averaged_probabilities = probability_sum / np.clip(probability_count, a_min=1.0, a_max=None)
+                    prediction_mask = torch.from_numpy((averaged_probabilities >= self.threshold).astype(np.float32))
+                    target_mask = torch.from_numpy((mask_array > mask_threshold).astype(np.float32))
+                    total_dice += dice_score_from_masks(prediction_mask, target_mask)
+                    total_iou += iou_score_from_masks(prediction_mask, target_mask)
                 num_images += 1
 
                 if self.use_tqdm:
@@ -470,10 +530,14 @@ class Trainer:
                     )
 
         divisor = max(num_images, 1)
-        return {
+        result = {
             f"{stage}_dice_per_image": total_dice / divisor,
             f"{stage}_iou_per_image": total_iou / divisor,
         }
+        if self.segmentation_mode == "multiclass":
+            result[f"{stage}_dice_macro_foreground_per_image"] = total_dice / divisor
+            result[f"{stage}_iou_macro_foreground_per_image"] = total_iou / divisor
+        return result
 
     def _should_run_per_image_validation(self, epoch: int) -> bool:
         return (

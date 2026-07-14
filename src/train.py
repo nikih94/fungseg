@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from src.data.dataset import SegmentationPatchDataset, get_train_transforms, get_val_transforms
-from src.data.discovery import discover_image_mask_pairs
+from src.data.discovery import discover_image_mask_pairs, discover_image_mask_sets
 from src.data.folds import (
     SplitDefinition,
     make_csv_train_val_test_split,
@@ -264,18 +264,43 @@ def main() -> None:
     logger.info("Run directory: %s", run_dir)
     logger.info("Torch multiprocessing sharing strategy: %s", sharing_strategy)
 
-    mask_dir = resolve_mask_dir(config)
-    pairs, diagnostics = discover_image_mask_pairs(
-        config["paths"]["images_dir"],
-        mask_dir,
-        config["data"]["image_extensions"],
-    )
+    segmentation_mode = str(config.get("segmentation", {}).get("mode", "binary")).lower()
+    if segmentation_mode == "multiclass":
+        mask_dir = Path(config["paths"]["mask_dirs"]["loci"])
+        pairs, diagnostics = discover_image_mask_sets(
+            config["paths"]["images_dir"],
+            {
+                "loci": config["paths"]["mask_dirs"]["loci"],
+                "inoculum": config["paths"]["mask_dirs"]["inoculum"],
+            },
+            config["data"]["image_extensions"],
+        )
+    else:
+        mask_dir = resolve_mask_dir(config)
+        pairs, diagnostics = discover_image_mask_pairs(
+            config["paths"]["images_dir"],
+            mask_dir,
+            config["data"]["image_extensions"],
+        )
     if not pairs:
         raise RuntimeError("No matched image/mask pairs were found.")
-    if diagnostics["missing_masks"]:
-        logger.warning("Missing masks for %s images.", len(diagnostics["missing_masks"]))
-    if diagnostics["missing_images"]:
-        logger.warning("Found %s masks without matching images.", len(diagnostics["missing_images"]))
+    if segmentation_mode == "multiclass":
+        for class_name, stems in diagnostics["missing_masks"].items():
+            if stems:
+                logger.warning("Missing %s masks for %s images: %s", class_name, len(stems), ", ".join(stems))
+        for class_name, stems in diagnostics["missing_images"].items():
+            if stems:
+                logger.warning("Found %s %s masks without matching images.", len(stems), class_name)
+        if diagnostics.get("dimension_mismatches"):
+            logger.warning(
+                "Excluded %s image/mask sets with dimension mismatches.",
+                len(diagnostics["dimension_mismatches"]),
+            )
+    else:
+        if diagnostics["missing_masks"]:
+            logger.warning("Missing masks for %s images.", len(diagnostics["missing_masks"]))
+        if diagnostics["missing_images"]:
+            logger.warning("Found %s masks without matching images.", len(diagnostics["missing_images"]))
 
     original_records = build_original_image_records(pairs)
     splits, split_mode = build_splits(config, original_records)
@@ -349,6 +374,7 @@ def main() -> None:
             ),
             image_resampling=str(patching_cfg.get("image_resampling", "lanczos")),
             mask_resampling=str(patching_cfg.get("mask_resampling", "foreground_preserving")),
+            segmentation_mode=segmentation_mode,
         )
         val_dataset = SegmentationPatchDataset(
             records=val_patch_records,
@@ -359,6 +385,7 @@ def main() -> None:
             ),
             image_resampling=str(patching_cfg.get("image_resampling", "lanczos")),
             mask_resampling=str(patching_cfg.get("mask_resampling", "foreground_preserving")),
+            segmentation_mode=segmentation_mode,
         )
 
         patch_diagnostics = {
@@ -429,6 +456,7 @@ def main() -> None:
             val_original_records=val_originals,
             tensorboard_writer=writer,
             fold_index=fold_index,
+            segmentation_config=config.get("segmentation", {}),
         )
         fold_result = trainer.fit(
             None,

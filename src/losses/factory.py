@@ -8,6 +8,7 @@ from src.losses.combined import (
     BCEDiceLoss,
     BCEDiceSoftCLDiceLoss,
     CLDiceLoss,
+    MulticlassCEDiceLociCLDiceLoss,
     SoftCLDiceLoss,
     TverskyLoss,
     TverskySoftCLDiceLoss,
@@ -16,6 +17,15 @@ from src.losses.combined import (
 
 def build_loss(config: dict[str, Any]):
     loss_name = config["name"].lower()
+    if loss_name == "multiclass_ce_dice_loci_cldice":
+        return MulticlassCEDiceLociCLDiceLoss(
+            cross_entropy_weight=float(config.get("cross_entropy_weight", 0.2)),
+            dice_weight=float(config.get("dice_weight", 0.5)),
+            loci_cldice_weight=float(config.get("loci_cldice_weight", 0.3)),
+            iterations=int(config.get("iterations", 30)),
+            smooth=float(config.get("smooth", 1e-6)),
+            cldice_smooth=float(config.get("cldice_smooth", 1.0)),
+        )
     if loss_name in {"bce_with_logits", "bce", "binary_cross_entropy_with_logits"}:
         return nn.BCEWithLogitsLoss()
     if loss_name == "bce_dice":

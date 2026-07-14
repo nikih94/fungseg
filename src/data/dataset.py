@@ -12,6 +12,23 @@ from torch.utils.data import Dataset
 from src.patching import PatchRecord, crop_scaled_image_patch, crop_scaled_mask_patch
 
 
+def compose_multiclass_mask(
+    loci_mask: np.ndarray,
+    inoculum_mask: np.ndarray,
+    threshold: int = 127,
+) -> tuple[np.ndarray, dict[str, float | int]]:
+    loci = loci_mask > threshold
+    inoculum = inoculum_mask > threshold
+    overlap_pixels = int((loci & inoculum).sum())
+    mask = np.zeros(loci.shape, dtype=np.uint8)
+    mask[loci] = 1
+    mask[inoculum] = 2
+    return mask, {
+        "overlap_pixels": overlap_pixels,
+        "overlap_fraction": overlap_pixels / max(int(mask.size), 1),
+    }
+
+
 def _build_normalize(augmentations_config: Optional[dict[str, Any]]) -> A.Normalize:
     normalize_config = (augmentations_config or {}).get("normalize", {})
     mean = normalize_config.get("mean", [0.485, 0.456, 0.406])
@@ -107,12 +124,14 @@ class SegmentationPatchDataset(Dataset):
         transforms: Optional[A.Compose] = None,
         image_resampling: str = "lanczos",
         mask_resampling: str = "foreground_preserving",
+        segmentation_mode: str = "binary",
     ) -> None:
         self.records = records
         self.mask_threshold = mask_threshold
         self.transforms = transforms
         self.image_resampling = image_resampling
         self.mask_resampling = mask_resampling
+        self.segmentation_mode = str(segmentation_mode).lower()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -126,8 +145,16 @@ class SegmentationPatchDataset(Dataset):
         with Image.open(record.image_path) as image:
             image_array = np.array(image.convert("RGB"))
 
-        with Image.open(record.mask_path) as mask:
-            mask_array = np.array(mask.convert("L"), dtype=np.uint8)
+        mask_arrays: dict[str, np.ndarray] = {}
+        if self.segmentation_mode == "multiclass":
+            if not record.mask_paths or "loci" not in record.mask_paths or "inoculum" not in record.mask_paths:
+                raise ValueError("Multiclass records require named loci and inoculum mask paths.")
+            for name in ("loci", "inoculum"):
+                with Image.open(record.mask_paths[name]) as mask:
+                    mask_arrays[name] = np.array(mask.convert("L"), dtype=np.uint8)
+        else:
+            with Image.open(record.mask_path) as mask:
+                mask_arrays["binary"] = np.array(mask.convert("L"), dtype=np.uint8)
 
         image_patch = crop_scaled_image_patch(
             image_array,
@@ -137,31 +164,39 @@ class SegmentationPatchDataset(Dataset):
             scale=record.scale,
             resampling=self.image_resampling,
         )
-        mask_patch = crop_scaled_mask_patch(
-            mask_array,
-            x=record.x,
-            y=record.y,
-            patch_size=record.patch_size,
-            scale=record.scale,
-            mask_threshold=self.mask_threshold,
-            resampling=self.mask_resampling,
-        )
-
-        binary_mask = (mask_patch > self.mask_threshold).astype(np.float32)
+        mask_patches = {
+            name: crop_scaled_mask_patch(
+                array, x=record.x, y=record.y, patch_size=record.patch_size,
+                scale=record.scale, mask_threshold=self.mask_threshold,
+                resampling=self.mask_resampling,
+            ) for name, array in mask_arrays.items()
+        }
+        if self.segmentation_mode == "multiclass":
+            target_mask, overlap = compose_multiclass_mask(
+                mask_patches["loci"], mask_patches["inoculum"], self.mask_threshold
+            )
+        else:
+            target_mask = (mask_patches["binary"] > self.mask_threshold).astype(np.float32)
+            overlap = {"overlap_pixels": 0, "overlap_fraction": 0.0}
 
         if self.transforms is not None:
-            transformed = self.transforms(image=image_patch, mask=binary_mask)
+            transformed = self.transforms(image=image_patch, mask=target_mask)
             image_tensor = transformed["image"]
             mask_tensor = transformed["mask"]
         else:
             image_tensor = torch.from_numpy(image_patch).permute(2, 0, 1).float() / 255.0
-            mask_tensor = torch.from_numpy(binary_mask)
+            mask_tensor = torch.from_numpy(target_mask)
 
-        if mask_tensor.ndim == 2:
-            mask_tensor = mask_tensor.unsqueeze(0)
+        if self.segmentation_mode == "multiclass":
+            if mask_tensor.ndim == 3:
+                mask_tensor = mask_tensor.squeeze(0)
+            mask_tensor = mask_tensor.long()
         else:
-            mask_tensor = mask_tensor[:1]
-        mask_tensor = mask_tensor.float()
+            if mask_tensor.ndim == 2:
+                mask_tensor = mask_tensor.unsqueeze(0)
+            else:
+                mask_tensor = mask_tensor[:1]
+            mask_tensor = mask_tensor.float()
 
         return {
             "image": image_tensor,
@@ -176,4 +211,5 @@ class SegmentationPatchDataset(Dataset):
             "resolution_bucket": record.resolution_bucket,
             "scale_label": record.scale_label,
             "source_crop_size": record.source_crop_size or record.patch_size,
+            **overlap,
         }

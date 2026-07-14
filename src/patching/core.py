@@ -16,6 +16,7 @@ class OriginalImageRecord:
     mask_path: Path
     width: int
     height: int
+    mask_paths: dict[str, Path] | None = None
 
 
 @dataclass(frozen=True)
@@ -32,11 +33,14 @@ class PatchRecord:
     resolution_bucket: str = "normal"
     scale_label: str = "normal"
     source_crop_size: int | None = None
+    mask_paths: dict[str, Path] | None = None
 
 
-def build_original_image_records(pairs: Iterable[tuple[Path, Path]]) -> list[OriginalImageRecord]:
+def build_original_image_records(pairs: Iterable[tuple[Path, Path | dict[str, Path]]]) -> list[OriginalImageRecord]:
     records: list[OriginalImageRecord] = []
-    for image_path, mask_path in pairs:
+    for image_path, mask_value in pairs:
+        mask_paths = dict(mask_value) if isinstance(mask_value, dict) else None
+        mask_path = (mask_paths.get("loci") or next(iter(mask_paths.values()))) if mask_paths else mask_value
         with Image.open(image_path) as image:
             width, height = image.size
         records.append(
@@ -46,6 +50,7 @@ def build_original_image_records(pairs: Iterable[tuple[Path, Path]]) -> list[Ori
                 mask_path=mask_path,
                 width=width,
                 height=height,
+                mask_paths=mask_paths,
             )
         )
     return records
@@ -300,8 +305,11 @@ def build_patch_records(
 
     patch_records: list[PatchRecord] = []
     for record in original_records:
-        with Image.open(record.mask_path) as mask_image:
-            mask_array = np.array(mask_image.convert("L"), dtype=np.uint8)
+        mask_arrays: list[np.ndarray] = []
+        paths = record.mask_paths.values() if record.mask_paths else [record.mask_path]
+        for mask_path in paths:
+            with Image.open(mask_path) as mask_image:
+                mask_arrays.append(np.array(mask_image.convert("L"), dtype=np.uint8))
 
         xs = compute_shifted_positions(record.width, patch_size, stride, offset_x)
         ys = compute_shifted_positions(record.height, patch_size, stride, offset_y)
@@ -316,16 +324,15 @@ def build_patch_records(
                     phase_cfg,
                     rng,
                 )
-                mask_patch = crop_scaled_mask_patch(
-                    mask_array,
-                    x=x,
-                    y=y,
-                    patch_size=patch_size,
-                    scale=scale,
-                    mask_threshold=mask_threshold,
-                    resampling=mask_resampling,
-                )
-                foreground_pixels = _count_foreground(mask_patch, mask_threshold)
+                mask_patches = [
+                    crop_scaled_mask_patch(
+                        mask_array, x=x, y=y, patch_size=patch_size, scale=scale,
+                        mask_threshold=mask_threshold, resampling=mask_resampling,
+                    ) for mask_array in mask_arrays
+                ]
+                foreground_pixels = int(np.logical_or.reduce(
+                    [patch > mask_threshold for patch in mask_patches]
+                ).sum())
                 if filter_empty_patches and foreground_pixels < min_foreground_pixels:
                     continue
 
@@ -344,6 +351,7 @@ def build_patch_records(
                         resolution_bucket=scale_label,
                         scale_label=scale_label,
                         source_crop_size=int(round(patch_size * scale)),
+                        mask_paths=record.mask_paths,
                     )
                 )
 

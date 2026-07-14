@@ -10,7 +10,10 @@ import yaml
 DEFAULT_CONFIG: dict[str, Any] = {
     "project": {"name": "fungi_segmentation"},
     "segmentation": {
+        "mode": "binary",
         "target": "loci",
+        "classes": {"background": 0, "loci": 1, "inoculum": 2},
+        "overlap_precedence": "inoculum",
     },
     "paths": {
         "images_dir": "data/images",

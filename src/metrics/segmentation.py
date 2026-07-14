@@ -149,3 +149,40 @@ def cldice_score_from_masks(
         topology_precision + topology_recall + smooth
     )
     return float(cldice.mean().item())
+
+
+def multiclass_predictions(logits: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(logits, dim=1).argmax(dim=1)
+
+
+def multiclass_metrics_from_masks(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    class_names: dict[str, int] | None = None,
+    smooth: float = 1e-6,
+    cldice_iterations: int = 3,
+) -> dict[str, float]:
+    """Per-class and foreground-macro metrics for class-index masks."""
+    classes = class_names or {"loci": 1, "inoculum": 2}
+    metrics: dict[str, float] = {}
+    dice_values: list[float] = []
+    iou_values: list[float] = []
+    for name, class_id in classes.items():
+        pred = (predictions == class_id).float()
+        target = (targets == class_id).float()
+        dice = dice_score_from_masks(pred, target, smooth=smooth)
+        iou = iou_score_from_masks(pred, target, smooth=smooth)
+        metrics[f"dice_{name}"] = dice
+        metrics[f"iou_{name}"] = iou
+        metrics[f"precision_{name}"] = precision_score_from_masks(pred, target, smooth=smooth)
+        metrics[f"recall_{name}"] = recall_score_from_masks(pred, target, smooth=smooth)
+        dice_values.append(dice)
+        iou_values.append(iou)
+    metrics["dice_macro_foreground"] = sum(dice_values) / max(len(dice_values), 1)
+    metrics["iou_macro_foreground"] = sum(iou_values) / max(len(iou_values), 1)
+    loci_id = classes.get("loci", 1)
+    metrics["cldice_loci"] = cldice_score_from_masks(
+        (predictions == loci_id).float(), (targets == loci_id).float(),
+        iterations=cldice_iterations,
+    )
+    return metrics

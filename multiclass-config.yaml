@@ -1,0 +1,165 @@
+project:
+  name: fungi_multiclass_segmentation
+
+segmentation:
+  mode: multiclass
+  classes:
+    background: 0
+    loci: 1
+    inoculum: 2
+  overlap_precedence: inoculum
+
+paths:
+  images_dir: data/images
+  mask_dirs:
+    loci: data/loci_masks
+    inoculum: data/inoculum_masks
+  runs_dir: runs
+  outputs_dir: outputs
+
+data:
+  image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+  num_workers: 8
+  persistent_workers: false
+  prefetch_factor: 4
+  pin_memory: true
+  batch_size: 8
+  image_size: null
+
+patching:
+  patch_size: 512 #512
+  overlap: 256 #256
+  stride: 256 #256
+  filter_empty_patches: true
+  mask_threshold: 127
+  min_foreground_pixels: 128
+  image_resampling: lanczos
+  mask_resampling: foreground_preserving
+  train:
+    random_offset:
+      enabled: true
+      max_fraction_of_patch: 0.5
+    scaled_context:
+      enabled: true
+      probability: 0.3
+      max_scale: 2.0
+      beta_alpha: 1.0
+      beta_beta: 2.0
+  validation:
+    random_offset:
+      enabled: false
+    scaled_context:
+      enabled: false
+
+
+augmentations:
+  normalize: # do not touch this
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  train: # this can be edited
+    horizontal_flip_p: 0.8
+    vertical_flip_p: 0.5
+    random_rotate_90_p: 0.8
+    affine:
+      translate_x: [-0.02, 0.02]
+      translate_y: [-0.02, 0.02]
+      scale: [0.90, 1.1]
+      rotate: [-10, 10]
+      p: 0.4
+    random_brightness_contrast:
+      brightness_limit: [-0.15, 0.15]
+      contrast_limit: [-0.15, 0.15]
+      p: 0.2
+    random_gamma:
+      gamma_limit: [90, 110]
+      p: 0.2
+    clahe:
+      clip_limit: [1.0, 2.0]
+      tile_grid_size: [8, 8]
+      p: 0.1
+    blur:
+      gaussian_blur_limit: [3, 5]
+      gaussian_sigma_limit: [0.2, 0.8]
+      defocus_radius: [2, 3]
+      defocus_alias_blur: [0.1, 0.3]
+      p: 0.1
+    gauss_noise_p: 0.05
+
+cv:
+  n_splits: 5
+  shuffle_groups: true
+  random_state: 42
+
+split:
+  mode: csv # csv, train_val, or kfold
+  csv_path: data/image_splits.csv
+  val_source_ids: []
+
+model:
+  name: unetplusplus_resnet34
+  in_channels: 3
+  num_classes: 3
+  encoder_name: resnet34
+  encoder_weights: imagenet
+  decoder_normalization: batchnorm
+  decoder_channels: [256, 128, 64, 32, 16]
+  decoder_attention_type: null # set to scse to enable SMP scSE attention in the decoder, null for no attention
+
+loss:
+  name: multiclass_ce_dice_loci_cldice
+  cross_entropy_weight: 0.2
+  dice_weight: 0.5
+  loci_cldice_weight: 0.3
+  iterations: 30
+  smooth: 1.0e-6
+  cldice_smooth: 1.0
+
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.0001
+
+scheduler:
+  name: reduce_on_plateau
+  mode: max
+  factor: 0.5
+  patience: 4
+  min_lr: 1.0e-6
+  monitor: val_dice_macro_foreground
+
+
+
+train:
+  epochs: 80
+  mixed_precision: true
+  grad_clip: 1.0
+  monitor: val_dice_macro_foreground
+  monitor_mode: max
+  best_interval_checkpoint:
+    enabled: true
+    interval_epochs: 10
+  threshold: 0.5
+  enable_per_image_validation: true
+  per_image_validation_interval: 10
+  seed: 42
+  device: auto
+  use_tqdm: true
+
+inference:
+  decision: argmax
+  save_probabilities: true
+
+test_evaluation:
+  enabled: true
+  threshold_sweep: false
+  cldice_iterations: 3
+
+qualitative_evaluation:
+  enabled: true
+  data_root: null
+  split: test
+  crop_patch_grid: [3, 3]
+  min_foreground_ratio: 0.005
+  max_foreground_ratio: 0.15
+  selection_seed: 42
+  max_checkpoints: null

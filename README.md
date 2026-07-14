@@ -29,6 +29,38 @@ data/image_splits.csv
 - Supported image extensions come from `config.yaml`.
 - `data/image_splits.csv` must contain `filename,split`, with split labels `train`, `validation` or `val`, and `test`.
 
+## Multiclass loci and inoculum segmentation
+
+`multiclass-config.yaml` preserves the binary config's splits, patching, augmentations, optimizer, scheduler, and U-Net++/ResNet34 architecture. Every image must have matching stems in both mask directories:
+
+```text
+data/
+├── images/sample.tif
+├── loci_masks/sample.png
+├── inoculum_masks/sample.png
+└── image_splits.csv
+```
+
+Targets are composed in memory: `0` is background, `1` is loci, and `2` is inoculum. Inoculum takes precedence on overlaps. Discovery rejects incomplete or dimension-mismatched triplets, patch filtering uses the union of both foreground masks, and overlap counts/fractions are recorded.
+
+```bash
+python -m src.train --config multiclass-config.yaml
+```
+
+The loss is `0.2 × cross-entropy + 0.5 × foreground Dice loss + 0.3 × loci soft-clDice loss`. Dice averages loci and inoculum; soft-clDice receives only the loci softmax probability and target.
+
+```bash
+python -m src.inference \
+  --config multiclass-config.yaml \
+  --checkpoint runs/fungi_multiclass_segmentation_<timestamp>/fold_0/best.pt \
+  --input data/images \
+  --output outputs/multiclass
+```
+
+Inference stitches three softmax maps and uses `argmax`. Prediction masks retain class IDs `0`, `1`, and `2`; optional probability images are separate for loci and inoculum. Evaluations use distinct class colors and report per-class Dice, IoU, precision, recall, foreground-macro Dice/IoU, and loci-only clDice. There is no multiclass threshold sweep.
+
+The existing `config.yaml`, binary losses, sigmoid inference, binary encoding, and threshold sweep remain supported.
+
 ## Training
 
 ```bash

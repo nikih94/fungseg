@@ -14,17 +14,17 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
-from src.data.dataset import get_val_transforms
-from src.data.discovery import discover_image_mask_pairs
+from src.data.dataset import compose_multiclass_mask, get_val_transforms
+from src.data.discovery import discover_image_mask_pairs, discover_image_mask_sets
 from src.data.folds import make_csv_train_val_test_split
 from src.inference import create_overlay
-from src.metrics.segmentation import dice_score_from_masks, iou_score_from_masks
+from src.metrics.segmentation import dice_score_from_masks, iou_score_from_masks, multiclass_metrics_from_masks
 from src.models.factory import build_model
 from src.models.wrappers import extract_logits
 from src.patching import _compute_positions, crop_and_pad_array
 from src.utils.checkpoint import load_checkpoint
 from src.utils.config import load_config, resolve_mask_dir
-from src.utils.io import ensure_dir, save_csv
+from src.utils.io import ensure_dir, save_csv, save_json, save_mask_image
 
 
 @dataclass(frozen=True)
@@ -248,7 +248,11 @@ def predict_crop_probabilities(
         augmentations_config=config.get("augmentations", {}),
     )
     height, width = image_array.shape[:2]
-    probability_sum = np.zeros((height, width), dtype=np.float32)
+    multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
+    num_classes = int(config.get("model", {}).get("num_classes", 3 if multiclass else 1))
+    probability_sum = np.zeros(
+        (num_classes, height, width) if multiclass else (height, width), dtype=np.float32
+    )
     probability_count = np.zeros((height, width), dtype=np.float32)
 
     model.eval()
@@ -263,7 +267,9 @@ def predict_crop_probabilities(
             autocast_device = device.type if device.type in {"cuda", "cpu"} else "cpu"
             with torch.amp.autocast(device_type=autocast_device, enabled=use_amp):
                 logits = extract_logits(model(image_tensor))
-                probabilities = torch.sigmoid(logits)
+                probabilities = (
+                    torch.softmax(logits, dim=1) if multiclass else torch.sigmoid(logits)
+                )
             if probabilities.shape[-2:] != (patch_size, patch_size):
                 probabilities = F.interpolate(
                     probabilities,
@@ -271,15 +277,27 @@ def predict_crop_probabilities(
                     mode="bilinear",
                     align_corners=False,
                 )
-            probability_patch = probabilities.squeeze().cpu().numpy().astype(np.float32)
+            probability_patch = probabilities.squeeze(0).cpu().numpy().astype(np.float32)
+            if not multiclass:
+                probability_patch = probability_patch.squeeze(0)
             valid_height = min(patch_size, height - y)
             valid_width = min(patch_size, width - x)
-            probability_sum[y : y + valid_height, x : x + valid_width] += probability_patch[
-                :valid_height, :valid_width
-            ]
+            if multiclass:
+                probability_sum[:, y : y + valid_height, x : x + valid_width] += probability_patch[
+                    :, :valid_height, :valid_width
+                ]
+            else:
+                probability_sum[y : y + valid_height, x : x + valid_width] += probability_patch[
+                    :valid_height, :valid_width
+                ]
             probability_count[y : y + valid_height, x : x + valid_width] += 1.0
 
-    averaged = probability_sum / np.clip(probability_count, a_min=1.0, a_max=None)
+    averaged = probability_sum / np.clip(
+        probability_count[None, ...] if multiclass else probability_count,
+        a_min=1.0, a_max=None,
+    )
+    if multiclass:
+        return averaged[:, crop.y : crop.y + crop.height, crop.x : crop.x + crop.width]
     return averaged[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width]
 
 
@@ -289,10 +307,15 @@ def metric_row(
     crop: SelectedCrop,
     prediction_mask: np.ndarray,
     target_mask: np.ndarray,
+    multiclass: bool = False,
 ) -> dict[str, Any]:
-    prediction_tensor = torch.from_numpy((prediction_mask > 0).astype(np.float32))
-    target_tensor = torch.from_numpy((target_mask > 0).astype(np.float32))
-    return {
+    prediction_tensor = torch.from_numpy(
+        prediction_mask.astype(np.int64) if multiclass else (prediction_mask > 0).astype(np.float32)
+    )
+    target_tensor = torch.from_numpy(
+        target_mask.astype(np.int64) if multiclass else (target_mask > 0).astype(np.float32)
+    )
+    row = {
         "image": image_path.name,
         "image_stem": image_path.stem,
         "fold": entry.fold,
@@ -310,8 +333,16 @@ def metric_row(
         "crop_height": crop.height,
         "crop_foreground_ratio": crop.foreground_ratio,
         "dice": dice_score_from_masks(prediction_tensor, target_tensor),
-        "iou": iou_score_from_masks(prediction_tensor, target_tensor),
+        "iou": (
+            multiclass_metrics_from_masks(prediction_tensor, target_tensor)["iou_macro_foreground"]
+            if multiclass else iou_score_from_masks(prediction_tensor, target_tensor)
+        ),
     }
+    if multiclass:
+        task_metrics = multiclass_metrics_from_masks(prediction_tensor, target_tensor)
+        row.update(task_metrics)
+        row["dice"] = task_metrics["dice_macro_foreground"]
+    return row
 
 
 def crop_row(image_path: Path, mask_path: Path, crop: SelectedCrop, selection_seed: int | None) -> dict[str, Any]:
@@ -470,23 +501,42 @@ def resolve_qualitative_pairs(
     if effective_data_root:
         root = Path(effective_data_root)
         images_dir = root / "images"
-        masks_dir = root / "masks"
-        if not images_dir.exists() or not masks_dir.exists():
-            raise FileNotFoundError(f"Qualitative data root is missing images/ or masks/: {root}")
-        pairs, diagnostics = discover_image_mask_pairs(
-            images_dir,
-            masks_dir,
-            config["data"]["image_extensions"],
-        )
+        multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
+        if multiclass:
+            loci_dir, inoculum_dir = root / "loci_masks", root / "inoculum_masks"
+            if not images_dir.exists() or not loci_dir.exists() or not inoculum_dir.exists():
+                raise FileNotFoundError(
+                    f"Multiclass qualitative data root requires images/, loci_masks/, and inoculum_masks/: {root}"
+                )
+            pairs, diagnostics = discover_image_mask_sets(
+                images_dir, {"loci": loci_dir, "inoculum": inoculum_dir},
+                config["data"]["image_extensions"],
+            )
+        else:
+            masks_dir = root / "masks"
+            if not images_dir.exists() or not masks_dir.exists():
+                raise FileNotFoundError(f"Qualitative data root is missing images/ or masks/: {root}")
+            pairs, diagnostics = discover_image_mask_pairs(
+                images_dir, masks_dir, config["data"]["image_extensions"],
+            )
         return pairs, diagnostics, f"data_root:{root}"
 
     images_dir = Path(config["paths"]["images_dir"])
-    masks_dir = resolve_mask_dir(config)
-    pairs, diagnostics = discover_image_mask_pairs(
-        images_dir,
-        masks_dir,
-        config["data"]["image_extensions"],
-    )
+    multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
+    if multiclass:
+        pairs, diagnostics = discover_image_mask_sets(
+            images_dir,
+            {
+                "loci": config["paths"]["mask_dirs"]["loci"],
+                "inoculum": config["paths"]["mask_dirs"]["inoculum"],
+            },
+            config["data"]["image_extensions"],
+        )
+    else:
+        masks_dir = resolve_mask_dir(config)
+        pairs, diagnostics = discover_image_mask_pairs(
+            images_dir, masks_dir, config["data"]["image_extensions"],
+        )
     split_label = str(qualitative_cfg.get("split", "test"))
     pairs = _pairs_for_split(pairs, config, split_label)
     return pairs, diagnostics, f"split:{split_label}"
@@ -511,6 +561,7 @@ def run_qualitative_evaluation(
     qualitative_cfg = config.get("qualitative_evaluation", {})
     output_dir = ensure_dir(output_dir or run_dir / "qualitative_evaluation")
     grids_dir = ensure_dir(output_dir / "grids")
+    masks_dir = output_dir / "masks"
     fold_grids_dir = output_dir / "fold_comparison_grids"
     crop_patch_grid = tuple(crop_patch_grid or qualitative_cfg.get("crop_patch_grid", [3, 3]))
     min_foreground_ratio = float(
@@ -573,6 +624,8 @@ def run_qualitative_evaluation(
     patch_size = int(patching_cfg["patch_size"])
     stride = int(patching_cfg["stride"])
     mask_threshold = int(patching_cfg["mask_threshold"])
+    multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
+    probabilities_dir = output_dir / "probabilities"
     use_amp = bool(config["train"].get("mixed_precision", True)) and device.type == "cuda"
     metric_rows: list[dict[str, Any]] = []
     fold_metric_rows: list[dict[str, Any]] = []
@@ -583,8 +636,16 @@ def run_qualitative_evaluation(
     for image_path, mask_path in tqdm(pairs, desc="Qualitative images"):
         with Image.open(image_path) as image:
             image_array = np.array(image.convert("RGB"))
-        with Image.open(mask_path) as mask:
-            mask_array = np.array(mask.convert("L"), dtype=np.uint8)
+        overlap = {"overlap_pixels": 0, "overlap_fraction": 0.0}
+        if multiclass:
+            with Image.open(mask_path["loci"]) as mask:
+                loci_array = np.array(mask.convert("L"), dtype=np.uint8)
+            with Image.open(mask_path["inoculum"]) as mask:
+                inoculum_array = np.array(mask.convert("L"), dtype=np.uint8)
+            mask_array, overlap = compose_multiclass_mask(loci_array, inoculum_array, mask_threshold)
+        else:
+            with Image.open(mask_path) as mask:
+                mask_array = np.array(mask.convert("L"), dtype=np.uint8)
         if mask_array.shape[:2] != image_array.shape[:2]:
             raise ValueError(
                 f"Image and mask shapes differ for {image_path.name}: "
@@ -602,14 +663,24 @@ def run_qualitative_evaluation(
             rng=image_selection_rng(selection_seed, image_path.stem),
         )
         selected_crops[image_path.stem] = crop
-        crop_rows.append(crop_row(image_path, mask_path, crop, selection_seed))
+        representative_mask_path = mask_path["loci"] if multiclass else mask_path
+        crop_metadata = crop_row(image_path, representative_mask_path, crop, selection_seed)
+        crop_metadata.update(overlap)
+        crop_metadata["overlap_precedence"] = "inoculum" if multiclass else ""
+        crop_rows.append(crop_metadata)
         image_crop = image_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width]
-        target_crop = (mask_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width] > mask_threshold).astype(
-            np.uint8
+        raw_target_crop = mask_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width]
+        target_crop = (
+            raw_target_crop.astype(np.uint8)
+            if multiclass else (raw_target_crop > mask_threshold).astype(np.uint8)
         )
         panels = [
             make_panel(f"{image_path.stem}\nsource", image_crop),
-            make_panel("ground truth", create_overlay(image_crop, target_crop * 255), target_crop),
+            make_panel(
+                "ground truth",
+                create_overlay(image_crop, target_crop if multiclass else target_crop * 255),
+                target_crop,
+            ),
         ]
         image_payloads.append(
             {
@@ -636,7 +707,14 @@ def run_qualitative_evaluation(
                 device=device,
                 use_amp=use_amp,
             )
-            prediction_mask = (probabilities >= threshold).astype(np.uint8)
+            prediction_mask = (
+                probabilities.argmax(axis=0).astype(np.uint8)
+                if multiclass else (probabilities >= threshold).astype(np.uint8)
+            )
+            if multiclass and config.get("inference", {}).get("save_probabilities", False):
+                stem = payload["image_path"].stem
+                save_mask_image(probabilities_dir / f"{stem}_{entry.fold}_{entry.checkpoint}_prob_loci.png", probabilities[1] * 255.0)
+                save_mask_image(probabilities_dir / f"{stem}_{entry.fold}_{entry.checkpoint}_prob_inoculum.png", probabilities[2] * 255.0)
             metric_rows.append(
                 metric_row(
                     payload["image_path"],
@@ -644,8 +722,14 @@ def run_qualitative_evaluation(
                     payload["crop"],
                     prediction_mask,
                     payload["target_crop"],
+                    multiclass=multiclass,
                 )
             )
+            if multiclass:
+                save_mask_image(
+                    masks_dir / f"{payload['image_path'].stem}_{entry.fold}_{entry.checkpoint}_mask.png",
+                    prediction_mask,
+                )
             if (entry.fold, entry.checkpoint, str(entry.path)) in cross_fold_keys:
                 fold_metric_rows.append(
                     metric_row(
@@ -654,25 +738,26 @@ def run_qualitative_evaluation(
                         payload["crop"],
                         prediction_mask,
                         payload["target_crop"],
+                        multiclass=multiclass,
                     )
                 )
                 payload.setdefault(
                     "fold_comparison_panels",
                     [
                         make_panel(f"{payload['image_path'].stem}\nsource", payload["image_crop"]),
-                        make_panel("ground truth", create_overlay(payload["image_crop"], payload["target_crop"] * 255), payload["target_crop"]),
+                        make_panel("ground truth", create_overlay(payload["image_crop"], payload["target_crop"] if multiclass else payload["target_crop"] * 255), payload["target_crop"]),
                     ],
                 ).append(
                     make_panel(
                         _checkpoint_label(entry),
-                        create_overlay(payload["image_crop"], prediction_mask * 255),
+                        create_overlay(payload["image_crop"], prediction_mask if multiclass else prediction_mask * 255),
                         prediction_mask,
                     )
                 )
             payload["panels"].append(
                 make_panel(
                     _checkpoint_label(entry),
-                    create_overlay(payload["image_crop"], prediction_mask * 255),
+                    create_overlay(payload["image_crop"], prediction_mask if multiclass else prediction_mask * 255),
                     prediction_mask,
                 )
             )
@@ -692,15 +777,23 @@ def run_qualitative_evaluation(
     if cross_fold_entries:
         save_csv(output_dir / "fold_comparison_metrics.csv", fold_metric_rows)
     save_csv(output_dir / "selected_crops.csv", crop_rows)
-    return {
+    result = {
         "skipped": False,
         "output_dir": str(output_dir),
         "num_images": len(pairs),
         "num_checkpoints": len(checkpoints),
         "num_fold_comparison_checkpoints": len(cross_fold_entries),
         "num_metric_rows": len(metric_rows),
+        "segmentation_mode": "multiclass" if multiclass else "binary",
+        "overlap_precedence": "inoculum" if multiclass else None,
         "selected_crops": selected_crops,
     }
+    serializable_result = {**result, "selected_crops": {
+        key: value.__dict__ for key, value in selected_crops.items()
+    }}
+    if multiclass:
+        save_json(output_dir / "summary.json", serializable_result)
+    return result
 
 
 def main() -> None:

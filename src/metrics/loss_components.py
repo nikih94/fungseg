@@ -95,6 +95,24 @@ def loss_component_metrics(logits: torch.Tensor, targets: torch.Tensor, config: 
     metrics: dict[str, float] = {}
     smooth = float(config.get("smooth", 1e-6))
 
+    if loss_name == "multiclass_ce_dice_loci_cldice":
+        from src.losses.combined import MulticlassCEDiceLociCLDiceLoss
+
+        loss = MulticlassCEDiceLociCLDiceLoss(
+            cross_entropy_weight=float(config.get("cross_entropy_weight", 0.2)),
+            dice_weight=float(config.get("dice_weight", 0.5)),
+            loci_cldice_weight=float(config.get("loci_cldice_weight", 0.3)),
+            iterations=int(config.get("iterations", 30)),
+            smooth=smooth,
+            cldice_smooth=float(config.get("cldice_smooth", 1.0)),
+        )
+        parts = loss.components(logits, targets)
+        return {
+            "cross_entropy": float(parts["cross_entropy"].item()),
+            "multiclass_dice_loss": float(parts["dice"].item()),
+            "loci_soft_cldice_loss": float(parts["loci_cldice"].item()),
+        }
+
     if loss_name in {
         "bce_with_logits",
         "bce",

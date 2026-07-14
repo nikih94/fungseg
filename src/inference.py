@@ -53,10 +53,16 @@ def list_input_images(input_path: Path, image_extensions: list[str]) -> list[Pat
 
 def create_overlay(original: np.ndarray, mask_np: np.ndarray) -> np.ndarray:
     overlay = np.array(original, copy=True)
-    fg_pixels = mask_np > 127
-    overlay[fg_pixels, 0] = np.clip(overlay[fg_pixels, 0].astype(int) * 0.5, 0, 255)
-    overlay[fg_pixels, 1] = np.clip(overlay[fg_pixels, 1].astype(int) * 0.5 + 128, 0, 255)
-    overlay[fg_pixels, 2] = np.clip(overlay[fg_pixels, 2].astype(int) * 0.5, 0, 255)
+    if mask_np.size and int(mask_np.max()) <= 2:
+        colors = {1: np.array([40, 220, 70]), 2: np.array([235, 70, 200])}
+        for class_id, color in colors.items():
+            pixels = mask_np == class_id
+            overlay[pixels] = (0.5 * overlay[pixels] + 0.5 * color).astype(np.uint8)
+    else:
+        fg_pixels = mask_np > 127
+        overlay[fg_pixels, 0] = np.clip(overlay[fg_pixels, 0].astype(int) * 0.5, 0, 255)
+        overlay[fg_pixels, 1] = np.clip(overlay[fg_pixels, 1].astype(int) * 0.5 + 128, 0, 255)
+        overlay[fg_pixels, 2] = np.clip(overlay[fg_pixels, 2].astype(int) * 0.5, 0, 255)
     return overlay.astype(np.uint8)
 
 
@@ -105,7 +111,11 @@ def predict_probabilities_on_image(
     xs = _compute_positions(width, patch_size, stride)
     ys = _compute_positions(height, patch_size, stride)
 
-    probability_sum = np.zeros((height, width), dtype=np.float32)
+    multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
+    num_classes = int(config.get("model", {}).get("num_classes", 3 if multiclass else 1))
+    probability_sum = np.zeros(
+        (num_classes, height, width) if multiclass else (height, width), dtype=np.float32
+    )
     probability_count = np.zeros((height, width), dtype=np.float32)
     patch_coordinates = [(x, y) for y in ys for x in xs]
 
@@ -121,13 +131,26 @@ def predict_probabilities_on_image(
             transformed = transforms(image=patch, mask=np.zeros((patch.shape[0], patch.shape[1]), dtype=np.float32))
             image_tensor = transformed["image"].unsqueeze(0).to(device)
             logits = extract_logits(model(image_tensor))
-            probabilities = torch.sigmoid(logits).squeeze().cpu().numpy().astype(np.float32)
+            if multiclass:
+                probabilities = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.float32)
+            else:
+                probabilities = torch.sigmoid(logits).squeeze().cpu().numpy().astype(np.float32)
             valid_height = min(patch_size, height - y)
             valid_width = min(patch_size, width - x)
-            probability_sum[y : y + valid_height, x : x + valid_width] += probabilities[:valid_height, :valid_width]
+            if multiclass:
+                probability_sum[:, y : y + valid_height, x : x + valid_width] += probabilities[
+                    :, :valid_height, :valid_width
+                ]
+            else:
+                probability_sum[y : y + valid_height, x : x + valid_width] += probabilities[
+                    :valid_height, :valid_width
+                ]
             probability_count[y : y + valid_height, x : x + valid_width] += 1.0
 
-    averaged_probabilities = probability_sum / np.clip(probability_count, a_min=1.0, a_max=None)
+    averaged_probabilities = probability_sum / np.clip(
+        probability_count[None, ...] if multiclass else probability_count,
+        a_min=1.0, a_max=None,
+    )
     return averaged_probabilities
 
 
@@ -138,12 +161,16 @@ def probabilities_to_binary_mask(probabilities: np.ndarray, threshold: float) ->
 def run_inference_on_image(
     model, image_path: Path, config: dict, device: torch.device
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    threshold = float(config["inference"]["threshold"])
+    multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
     averaged_probabilities = predict_probabilities_on_image(model, image_path, config, device)
-    binary_mask = probabilities_to_binary_mask(averaged_probabilities, threshold)
+    if multiclass:
+        output_mask = averaged_probabilities.argmax(axis=0).astype(np.uint8)
+    else:
+        threshold = float(config["inference"]["threshold"])
+        output_mask = probabilities_to_binary_mask(averaged_probabilities, threshold)
     image_array = load_rgb_image(image_path)
-    overlay = create_overlay(image_array, binary_mask)
-    return averaged_probabilities, binary_mask, overlay
+    overlay = create_overlay(image_array, output_mask)
+    return averaged_probabilities, output_mask, overlay
 
 
 def main() -> None:
@@ -167,7 +194,11 @@ def main() -> None:
         save_mask_image(Path(output_dir) / f"{image_path.stem}_mask.png", binary_mask)
         save_rgb_image(Path(output_dir) / f"{image_path.stem}_overlay.png", overlay)
         if config["inference"].get("save_probabilities", False):
-            save_mask_image(Path(output_dir) / f"{image_path.stem}_prob.png", probabilities * 255.0)
+            if probabilities.ndim == 3:
+                save_mask_image(Path(output_dir) / f"{image_path.stem}_prob_loci.png", probabilities[1] * 255.0)
+                save_mask_image(Path(output_dir) / f"{image_path.stem}_prob_inoculum.png", probabilities[2] * 255.0)
+            else:
+                save_mask_image(Path(output_dir) / f"{image_path.stem}_prob.png", probabilities * 255.0)
 
 
 if __name__ == "__main__":
