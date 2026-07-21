@@ -1,225 +1,132 @@
 # Repository Description
 
-This file explains the core structure of the repository, why each main folder exists, how the training and inference pipeline is wired together, and which dependencies are central to the project.
+This repository contains a config-driven PyTorch segmentation pipeline. The main workflow discovers source images and masks, creates image-grouped patch records, trains a selected model, evaluates stitched full images, and stores auditable run artifacts.
 
-## Top-Level Layout
+## Repository map
 
-- `config.yaml`: main experiment configuration used by training and inference.
-- `README.md`: user-facing quickstart and concise config reference.
-- `DESCRIPTION.md`: repository structure and architecture guide.
-- `requirements.txt`: Python dependencies needed to run the project.
-- `data/`: local dataset storage for raw images, masks, and any auxiliary data folders.
-- `runs/`: training outputs created at runtime, including fold checkpoints, logs, and metric files.
-- `outputs/`: exported inference outputs and generated artifacts.
-- `src/`: all application code for data loading, model building, training, evaluation, and utilities.
+- `config.yaml`: current binary U-Net++/ResNet34 experiment.
+- `multiclass-config.yaml`: loci/inoculum multiclass U-Net++/ResNet34 experiment.
+- `multiclass-segformer-config.yaml`: equivalent loci/inoculum multiclass SegFormer MiT-B3 experiment.
+- `config_segformer_mit_b3.yaml`: legacy binary SegFormer experiment.
+- `config-small-run.yaml`: legacy single-mask compatibility configuration.
+- `requirements.txt`: runtime dependencies.
+- `data/`: local images, masks, split CSV, and external evaluation data.
+- `runs/`: training outputs.
+- `outputs/`: inference and diagnostic outputs.
+- `src/`: application code.
+- `tests/`: unit and integration tests.
 
-## `src/` Structure
+Generated data, archives, checkpoints, and exported images are not part of the application architecture.
 
-### `src/train.py`
+## Application modules
 
-Main training entrypoint.
+### Entrypoints
 
-Responsibilities:
-
-- load configuration
-- set seed and device
-- discover image and mask pairs
-- build grouped splits
-- write split manifests for run auditability
-- generate patch records
-- create datasets and dataloaders
-- build model, loss, optimizer, and scheduler
-- launch one trainer per fold or split
-- aggregate metrics across folds
-
-### `src/inference.py`
-
-Main inference entrypoint.
-
-Responsibilities:
-
-- load one trained checkpoint
-- build the model from config
-- tile full-size images into patches
-- run prediction patch by patch
-- average overlapping probabilities
-- write binary masks, overlays, and optional probability maps
-
-### `src/qualitative_evaluation.py`
-
-Checkpoint comparison entrypoint for visual model selection.
-
-Responsibilities:
-
-- discover qualitative image and mask pairs
-- read per-fold `checkpoint_manifest.csv` files from a run
-- select one mostly-background crop with foreground per qualitative image
-- predict the selected crop with each manifest checkpoint
-- save comparison grid PNGs plus crop-level metrics
-- for k-fold runs, save an additional best-per-fold qualitative comparison
-
-### `src/patching/`
-
-Core patch-generation logic.
-
-Why it matters:
-
-- turns original image and mask pairs into `OriginalImageRecord` objects
-- creates deterministic patch coordinates with full edge coverage for validation and inference
-- creates epoch-specific training patch records with random grid offsets
-- creates scaled-context training crops that are resized back to the model patch size
-- filters empty patches based on mask foreground content
-- preserves the distinction between original-image grouping and patch-level training samples
-- provides `python -m src.patching.explain` for patch count summaries and optional grid overlays
+- `src/train.py`: discovers data, builds splits, prepares loaders, constructs training components, runs folds, evaluates CSV test images, and optionally runs qualitative evaluation.
+- `src/inference.py`: predicts on one image or a non-recursive directory using stitched overlapping patches.
+- `src/test_evaluation.py`: evaluates a checkpoint on the CSV `test` split and writes full-image metrics and artifacts.
+- `src/qualitative_evaluation.py`: compares manifest checkpoints on selected labeled crops.
+- `src/in_folder_inference.py`: recursive binary inference that writes masks next to source images.
+- `src/other_test_data_evaluation.py`: recursive inference for external paper image collections, preserving their folder structure in a results directory.
 
 ### `src/data/`
 
-Dataset and split logic live here.
+- `discovery.py`: matches images and masks by filename stem. Multiclass discovery also checks that every required mask exists and has the image dimensions.
+- `folds.py`: implements CSV, manual train/validation, and grouped k-fold source splits.
+- `dataset.py`: lazy patch loading, binary/multiclass mask composition, resizing, normalization, and Albumentations transforms.
+- `sampling.py`: patch-distribution summaries saved for each training fold.
 
-- `dataset.py`: patch dataset plus Albumentations train and validation transforms.
-- `discovery.py`: scans image and mask directories and matches files by stem.
-- `folds.py`: creates CSV train/validation/test splits, grouped k-fold splits, or a manual train/validation split.
-- `sampling.py`: patch-distribution diagnostics and legacy balanced-sampler helpers.
+The dataset layer keeps source-image grouping separate from patch-level samples, so train/validation boundaries cannot be created by splitting patches from the same original image.
 
-This folder is important because it keeps dataset discovery, patch sampling, and split strategy separate from model code.
+### `src/patching/`
+
+- `core.py`: `OriginalImageRecord` and `PatchRecord`, deterministic edge-covering grids, epoch-specific training offsets, scaled-context crops, mask resampling, and foreground filtering.
+- `explain.py`: binary target patch diagnostics and optional overlay generation.
+
+The full patching contract is maintained in [PATCHING_DESCRIPTION.md](PATCHING_DESCRIPTION.md).
 
 ### `src/models/`
 
-Model construction and output normalization live here.
-
-- `factory.py`: builds segmentation models from config.
-- `wrappers.py`: exposes `extract_logits()` so the rest of the pipeline can treat SMP and torchvision models uniformly.
-- `norms.py`: custom 2D LayerNorm helper used when `decoder_normalization` is set to `layernorm`.
-
-This folder is important because it keeps model-specific details out of the training loop.
-The factory supports SMP Unet++, SMP SegFormer with MiT-B3, and torchvision FCN/DeepLabV3 baselines.
+- `factory.py`: builds SMP U-Net++, SMP SegFormer, or torchvision FCN/DeepLabV3 models from config.
+- `wrappers.py`: normalizes SMP and torchvision outputs through `extract_logits()`.
+- `norms.py`: channel-wise 2D LayerNorm used for U-Net++ decoder normalization.
 
 ### `src/losses/`
 
-Loss functions are organized here.
-
-- `factory.py`: selects the requested loss from config.
-- `combined.py`: contains custom segmentation losses such as BCE+Dice, Tversky, clDice variants, and the combined Tversky + soft-clDice loss.
-
-This folder makes it easy to swap training objectives without rewriting the trainer.
+- `factory.py`: maps configured loss names to implementations.
+- `combined.py`: binary BCE/Dice, Tversky, clDice, soft-clDice, combined losses, and the multiclass CE/Dice/loci-clDice loss.
 
 ### `src/metrics/`
 
-Validation and diagnostic metrics live here.
-
-- `segmentation.py`: Dice and IoU metrics for patch-level and stitched-image evaluation.
-- `loss_components.py`: BCE, soft Dice, soft-clDice, Tversky, and weighted component diagnostics written with training metrics.
-
-This folder stays separate from losses so monitoring and optimization remain independent.
-
-### `src/optim/`
-
-- `factory.py`: builds optimizers from config.
-
-This isolates optimizer choice and hyperparameters from training orchestration.
-
-### `src/schedulers/`
-
-- `factory.py`: builds schedulers from config.
-
-This keeps learning-rate policy selection modular and configurable.
+- `segmentation.py`: binary and multiclass Dice, IoU, precision, recall, and clDice calculations.
+- `loss_components.py`: diagnostics for loss terms and component scores written with training metrics.
 
 ### `src/engine/`
 
-- `trainer.py`: one-fold training and validation engine.
+- `trainer.py`: fold training and validation loop, optional stitched full-image validation, metric aggregation, scheduler stepping, checkpointing, TensorBoard logging, and checkpoint manifests.
 
-Why it matters:
+### `src/optim/` and `src/schedulers/`
 
-- runs epoch loops
-- computes patch-level metrics
-- computes loss-component diagnostics without changing the optimized objective
-- optionally runs full-image stitched validation
-- tracks the monitored metric
-- saves `best.pt`, `last.pt`, and optional best-in-interval snapshots
-- writes a checkpoint manifest with metrics for saved checkpoints
-- writes per-fold metric history
+- `factory.py` in each directory builds the configured optimizer or learning-rate scheduler.
 
 ### `src/utils/`
 
-General support code used across the project.
+- `config.py`: deep-merges YAML over defaults, derives patch stride, resolves the active mask directory, and preserves compatibility with older `paths.masks_dir` configs.
+- `checkpoint.py`: checkpoint save/load helpers.
+- `io.py`: JSON, YAML, CSV, mask, and directory helpers.
+- `logging.py`: console/file logging setup.
+- `seed.py`: reproducibility setup.
 
-- `config.py`: loads YAML config and merges it with defaults.
-- `checkpoint.py`: saves and loads checkpoints.
-- `logging.py`: configures console and file logging.
-- `seed.py`: sets random seeds for reproducibility.
-- `io.py`: small filesystem and serialization helpers.
+## Data and model flow
 
-### Helper Scripts
+### Binary training
 
-These are useful but not central to the main training loop:
+1. `train.py` resolves `segmentation.target` to one mask directory.
+2. `discovery.py` matches image/mask stems.
+3. `patching/core.py` creates source records and phase-specific patch records.
+4. `folds.py` assigns source images to CSV, manual, or grouped k-fold splits.
+5. `dataset.py` loads crops lazily and applies transforms.
+6. The model, loss, optimizer, and scheduler factories build the training stack.
+7. `trainer.py` runs patch-level training and validation, plus optional stitched full-image validation.
+8. `test_evaluation.py` reloads each selected `best.pt` for CSV test evaluation.
+9. `qualitative_evaluation.py` compares checkpoints when enabled.
 
-- `analyze_patches.py`: patch inspection or debugging utility.
-- `visualize_patch_grid.py`: visualization helper for understanding patch coverage.
+### Multiclass training
 
-## How Everything Is Wired Together
+Multiclass discovery requires a complete, dimension-matched loci and inoculum mask for every image. The dataset composes class-index masks in memory with inoculum precedence. Models output three logits; training uses softmax/argmax semantics, foreground-macro metrics, and loci-only clDice. Binary sigmoid thresholds and binary threshold sweeps are not used for this mode.
 
-### Training Flow
+The U-Net++ and SegFormer multiclass configs intentionally share all non-model experiment settings. The model factory supplies either three-channel U-Net++/ResNet34 or three-channel SegFormer MiT-B3 logits to the same architecture-independent dataset, loss, trainer, test-evaluation, inference, and qualitative-evaluation paths.
 
-1. `src/train.py` loads `config.yaml` through `src/utils/config.py`.
-2. `src/utils/config.py` resolves the active segmentation target, such as `loci` or `inoculum`, to its mask directory.
-3. `src/data/discovery.py` matches images and masks by filename stem.
-4. `src/patching/` creates original-image records containing source identity and image size.
-5. `src/data/folds.py` splits by original image from CSV, k-fold, or manual config, never by patch.
-6. `src/patching/` creates deterministic validation/test patch records and epoch-specific training patch records.
-7. `src/data/dataset.py` loads full images lazily, crops native or scaled-context patches on the fly, applies Albumentations, and returns tensors.
-8. `src/models/factory.py` builds the requested segmentation model.
-9. `src/losses/factory.py`, `src/optim/factory.py`, and `src/schedulers/factory.py` build the training components from config.
-10. `src/engine/trainer.py` runs training, validation, per-resolution metrics, loss-component diagnostics, checkpointing, and metric export.
-11. `src.train.py` invokes `src.test_evaluation.py` on each selected `best.pt`, producing stitched full-image test artifacts and metrics in the run directory.
-12. If enabled, `src/qualitative_evaluation.py` compares manifest checkpoints on seeded crops from the configured qualitative split, which defaults to CSV `test`.
+### Inference
 
-### Inference Flow
+`inference.py` uses the same validation normalization and deterministic patch geometry as full-image validation. It averages overlapping sigmoid probabilities for binary models or softmax probabilities for multiclass models, then writes masks and overlays. Edge patches are padded for model input and cropped back to the valid image area before stitching.
 
-1. `src/inference.py` loads config and a checkpoint.
-2. `src/models/factory.py` rebuilds the model architecture.
-3. The full image is tiled using the deterministic patch geometry defined in config.
-4. Each patch is normalized with validation transforms and passed through the model.
-5. Overlapping patch probabilities are averaged back into a full-size probability map.
-6. The final binary mask is thresholded and written to disk.
+## Splits and patch ownership
 
-### Qualitative Evaluation Flow
+Splits are always made from original image IDs, never from patch records. CSV mode requires `filename,split` and non-empty train, validation, and test assignments. K-fold mode distributes source images across grouped validation folds. Manual mode creates one train/validation split from `val_source_ids`.
 
-1. `src/qualitative_evaluation.py` loads the saved run config from `runs/<project>_<timestamp>/config.yaml`.
-2. It matches qualitative images and masks by filename stem under `data/qualitative_evaluation/`.
-3. It reads each fold's `checkpoint_manifest.csv` and evaluates those checkpoints in manifest order.
-4. For each image, it selects a crop using the configured patch grid and foreground-ratio bounds.
-5. It predicts all overlapping patches that contribute to that crop, averages probabilities, and crops away border-only context.
-6. It writes one grid PNG per image plus `selected_crops.csv` and `eval_metrics.csv`.
-7. For k-fold runs, it also writes best-per-fold grids and `fold_comparison_metrics.csv`.
+Training patch records are regenerated with `train.seed + epoch`; validation and full-image inference use deterministic geometry. Foreground filtering affects patch datasets and patch diagnostics, while stitched full-image evaluation covers all deterministic grid positions, including background-only regions.
 
-## Why the Folder Boundaries Matter
+## Run artifacts
 
-- The data code does not need to know which model is being trained.
-- The trainer does not need to know loss internals.
-- The model factory hides architecture-specific details.
-- The patching code enforces the image-level grouping rule.
-- The utils layer keeps repetitive infrastructure code out of the core logic.
+Each run stores the merged config and split manifest at its root. The root also receives aggregate summaries and epoch/fold CSV files. Each fold stores checkpoint files, per-epoch history, patch-distribution diagnostics, TensorBoard data, and a checkpoint manifest recording checkpoint reason, epoch, monitor, and monitor value.
 
-That separation is what makes it practical to swap models, losses, schedulers, and split strategies without rewriting the whole pipeline.
+CSV test evaluation writes `test-evaluation/` with masks, overlays, `test_metrics.csv`, `threshold_metrics.csv`, and `summary.json`. Binary evaluation also writes per-metric threshold plots. Multiclass evaluation writes class metrics and `multiclass_metrics.png` without a threshold sweep.
 
-## Main Dependencies
+Qualitative evaluation writes grids, selected crop metadata, crop-level metrics, and optional masks/probabilities under `qualitative_evaluation/`. K-fold runs additionally write the best-per-fold comparison artifacts.
 
-- `torch`: model definition, tensor operations, optimization, AMP, and checkpoint loading.
-- `torchvision`: optional segmentation baselines such as FCN and DeepLabV3.
-- `segmentation-models-pytorch`: main implementation source for Unet++, SegFormer, and encoder backbones.
-- `albumentations`: image and mask augmentations for training and validation.
-- `numpy`: array manipulation for masks, patches, stitching, and metric preparation.
-- `Pillow`: image file loading and saving.
-- `PyYAML`: config parsing.
-- `tensorboard`: experiment logging.
-- `tqdm`: progress bars for training and inference.
-- `matplotlib`: visualization utilities.
-- `scikit-learn`: installed dependency, though the current split implementation is custom and lightweight.
+## Configuration boundaries
 
-## Current Design Priorities
+Configuration is the source of truth for paths, segmentation mode, target/classes, patch geometry, augmentations, split strategy, model, loss, optimizer, scheduler, training, inference, test evaluation, and qualitative evaluation. `config.py` supplies defaults for omitted keys and supports old single-mask configs through `paths.masks_dir`; new configs should use `paths.mask_dirs` and an explicit segmentation target or mode.
 
-- binary segmentation with output shape `(N, 1, H, W)`
-- patch-based training with full-image grouping
-- modular factories for models, losses, optimizers, and schedulers
-- reproducible experiment runs through config-driven behavior
-- clean separation between training, inference, data preparation, and utilities
+The patch-specific options and their phase behavior belong in [PATCHING_DESCRIPTION.md](PATCHING_DESCRIPTION.md), rather than being duplicated here.
+
+## Dependencies and tests
+
+The runtime stack is PyTorch/torchvision, segmentation-models-pytorch, Albumentations, Pillow, NumPy, PyYAML, TensorBoard, tqdm, and Matplotlib. Tests cover configuration compatibility, patching and multiscale crops, model construction, inference, evaluation, qualitative evaluation, multiclass behavior, and dataloader cleanup.
+
+Run the test suite with:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```

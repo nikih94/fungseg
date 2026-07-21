@@ -1,28 +1,35 @@
 project:
-  name: fungi_segmentation
+  name: fungi_multiclass_segmentation_segformer_mit_b3
 
 segmentation:
-  target: legacy
+  mode: multiclass
+  classes:
+    background: 0
+    loci: 1
+    inoculum: 2
+  overlap_precedence: inoculum
 
 paths:
-  images_dir: data/images-small
-  masks_dir: data/masks-small
+  images_dir: data/images
+  mask_dirs:
+    loci: data/loci_masks
+    inoculum: data/inoculum_masks
   runs_dir: runs
   outputs_dir: outputs
 
 data:
   image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
-  num_workers: 22
-  persistent_workers: true
-  prefetch_factor: 8
+  num_workers: 8 # DEFAULT - 8, for segformer on 1024 use 4
+  persistent_workers: false
+  prefetch_factor: 4
   pin_memory: true
-  batch_size: 4
+  batch_size: 8 # DEFAULT - 8, for segformer on 1024 use 4
   image_size: null
 
 patching:
-  patch_size: 256
-  overlap: 128
-  stride: 128
+  patch_size: 512 #512
+  overlap: 256 #256
+  stride: 256 #256
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 128
@@ -34,15 +41,16 @@ patching:
       max_fraction_of_patch: 0.5
     scaled_context:
       enabled: true
-      probability: 0.25
+      probability: 0.3
       max_scale: 2.0
       beta_alpha: 1.0
-      beta_beta: 4.0
+      beta_beta: 2.0
   validation:
     random_offset:
       enabled: false
     scaled_context:
       enabled: false
+
 
 augmentations:
   normalize: # do not touch this
@@ -83,24 +91,28 @@ cv:
   random_state: 42
 
 split:
-  mode: train_val # train_val or kfold
-  val_source_ids: ['job_6_IN183 SNA 48h x500 4.tif']
+  mode: csv # csv, train_val, or kfold
+  csv_path: data/image_splits.csv
+  val_source_ids: []
 
 model:
-  name: unetplusplus_resnet18
+  name: segformer_mit_b3
   in_channels: 3
-  num_classes: 1
-  encoder_name: resnet18
+  num_classes: 3
+  encoder_name: mit_b3
   encoder_weights: imagenet
-  decoder_normalization: instancenorm
-  decoder_channels: [256, 128, 64, 32, 16]
-  decoder_attention_type: scse # set to scse to enable SMP scSE attention in the decoder
+  encoder_depth: 5
+  decoder_segmentation_channels: 256
+  upsampling: 4
 
 loss:
-  name: bce_dice
-  bce_weight: 0.3
-  dice_weight: 0.7
+  name: multiclass_ce_dice_loci_cldice
+  cross_entropy_weight: 0.2
+  dice_weight: 0.5
+  loci_cldice_weight: 0.3
+  iterations: 30
   smooth: 1.0e-6
+  cldice_smooth: 1.0
 
 optimizer:
   name: adamw
@@ -113,23 +125,41 @@ scheduler:
   factor: 0.5
   patience: 4
   min_lr: 1.0e-6
-  monitor: val_dice_per_patch
+  monitor: val_dice_macro_foreground
 
 
 
 train:
-  epochs: 2
+  epochs: 60
   mixed_precision: true
   grad_clip: 1.0
-  monitor: val_dice_per_patch
+  monitor: val_dice_macro_foreground
   monitor_mode: max
+  best_interval_checkpoint:
+    enabled: true
+    interval_epochs: 10
   threshold: 0.5
   enable_per_image_validation: true
-  per_image_validation_interval: 1
+  per_image_validation_interval: 10
   seed: 42
   device: auto
   use_tqdm: true
 
 inference:
-  threshold: 0.5
-  save_probabilities: false
+  decision: argmax
+  save_probabilities: true
+
+test_evaluation:
+  enabled: true
+  threshold_sweep: false
+  cldice_iterations: 3
+
+qualitative_evaluation:
+  enabled: true
+  data_root: null
+  split: test
+  crop_patch_grid: [3, 3]
+  min_foreground_ratio: 0.005
+  max_foreground_ratio: 0.15
+  selection_seed: 42
+  max_checkpoints: null
