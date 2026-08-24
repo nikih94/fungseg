@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.other_test_data_evaluation import list_input_images, result_path
+from src.inference.other_test_data_evaluation import list_input_images, result_path
 
 
 class OtherTestDataEvaluationTests(unittest.TestCase):

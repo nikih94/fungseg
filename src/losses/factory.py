@@ -9,6 +9,7 @@ from src.losses.combined import (
     BCEDiceSoftCLDiceLoss,
     CLDiceLoss,
     MulticlassCEDiceLociCLDiceLoss,
+    MulticlassGeometryCEDiceLociCLDiceLoss,
     SoftCLDiceLoss,
     TverskyLoss,
     TverskySoftCLDiceLoss,
@@ -17,6 +18,15 @@ from src.losses.combined import (
 
 def build_loss(config: dict[str, Any]):
     loss_name = config["name"].lower()
+    if loss_name == "multiclass_geometry_ce_dice_loci_cldice":
+        return MulticlassGeometryCEDiceLociCLDiceLoss(
+            geometry_aware_ce_weight=float(config.get("geometry_aware_ce_weight", 0.25)),
+            dice_weight=float(config.get("dice_weight", 0.55)),
+            soft_cldice_weight=float(config.get("soft_cldice_weight", 0.20)),
+            iterations=int(config.get("iterations", 30)),
+            smooth=float(config.get("smooth", 1e-6)),
+            cldice_smooth=float(config.get("cldice_smooth", 1.0)),
+        )
     if loss_name == "multiclass_ce_dice_loci_cldice":
         return MulticlassCEDiceLociCLDiceLoss(
             cross_entropy_weight=float(config.get("cross_entropy_weight", 0.2)),
@@ -32,6 +42,7 @@ def build_loss(config: dict[str, Any]):
         return BCEDiceLoss(
             bce_weight=float(config.get("bce_weight", 0.5)),
             dice_weight=float(config.get("dice_weight", 0.5)),
+            smooth=float(config.get("smooth", 1e-6)),
         )
     if loss_name in {"bce_dice_cldice", "bce_dice_soft_cldice", "bcedicecldice"}:
         return BCEDiceSoftCLDiceLoss(
@@ -50,7 +61,6 @@ def build_loss(config: dict[str, Any]):
         )
     if loss_name == "cldice":
         return CLDiceLoss(
-            threshold=float(config.get("threshold", 0.5)),
             iterations=int(config.get("iterations", 3)),
             smooth=float(config.get("cldice_smooth", config.get("smooth", 1.0))),
         )

@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from src.metrics.segmentation import soft_cldice_scores_from_probabilities
+
 
 def _flatten_batch(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.reshape(tensor.shape[0], -1).float()
@@ -11,57 +13,6 @@ def _flatten_batch(tensor: torch.Tensor) -> torch.Tensor:
 
 def _sigmoid_logits(logits: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(logits).float()
-
-
-def _soft_erode(mask: torch.Tensor) -> torch.Tensor:
-    eroded_y = -F.max_pool2d(-mask, kernel_size=(3, 1), stride=1, padding=(1, 0))
-    eroded_x = -F.max_pool2d(-mask, kernel_size=(1, 3), stride=1, padding=(0, 1))
-    return torch.minimum(eroded_x, eroded_y)
-
-
-def _soft_dilate(mask: torch.Tensor) -> torch.Tensor:
-    return F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
-
-
-def _soft_open(mask: torch.Tensor) -> torch.Tensor:
-    return _soft_dilate(_soft_erode(mask))
-
-
-def _soft_skeletonize(mask: torch.Tensor, iterations: int) -> torch.Tensor:
-    mask = mask.float().clamp(0.0, 1.0)
-    skeleton = F.relu(mask - _soft_open(mask))
-    for _ in range(max(0, iterations - 1)):
-        mask = _soft_erode(mask)
-        delta = F.relu(mask - _soft_open(mask))
-        skeleton = skeleton + F.relu(delta - skeleton * delta)
-    return skeleton
-
-
-def _soft_cldice_score(
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-    iterations: int,
-    smooth: float,
-) -> torch.Tensor:
-    predictions = predictions.float()
-    targets = targets.float()
-    prediction_skeleton = _soft_skeletonize(predictions, iterations)
-    target_skeleton = _soft_skeletonize(targets, iterations)
-
-    prediction_skeleton = _flatten_batch(prediction_skeleton)
-    target_skeleton = _flatten_batch(target_skeleton)
-    predictions = _flatten_batch(predictions)
-    targets = _flatten_batch(targets)
-
-    topology_precision = ((prediction_skeleton * targets).sum(dim=1) + smooth) / (
-        prediction_skeleton.sum(dim=1) + smooth
-    )
-    topology_sensitivity = ((target_skeleton * predictions).sum(dim=1) + smooth) / (
-        target_skeleton.sum(dim=1) + smooth
-    )
-    return (2.0 * topology_precision * topology_sensitivity + smooth) / (
-        topology_precision + topology_sensitivity + smooth
-    )
 
 
 class BCEDiceLoss(nn.Module):
@@ -143,17 +94,15 @@ class TverskyLoss(nn.Module):
 
 
 class CLDiceLoss(nn.Module):
-    def __init__(self, threshold: float = 0.5, iterations: int = 3, smooth: float = 1.0) -> None:
+    def __init__(self, iterations: int = 3, smooth: float = 1.0) -> None:
         super().__init__()
-        self.threshold = threshold
         self.iterations = iterations
         self.smooth = smooth
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         probabilities = _sigmoid_logits(logits)
-        hard_predictions = (probabilities >= self.threshold).float()
-        cldice_score = _soft_cldice_score(
-            hard_predictions,
+        cldice_score = soft_cldice_scores_from_probabilities(
+            probabilities,
             targets,
             iterations=self.iterations,
             smooth=self.smooth,
@@ -169,7 +118,7 @@ class SoftCLDiceLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         probabilities = _sigmoid_logits(logits)
-        cldice_score = _soft_cldice_score(
+        cldice_score = soft_cldice_scores_from_probabilities(
             probabilities,
             targets,
             iterations=self.iterations,
@@ -208,7 +157,7 @@ def soft_cldice_from_probabilities(
     smooth: float = 1.0,
 ) -> torch.Tensor:
     """Differentiable clDice loss for probabilities that are already normalized."""
-    return 1.0 - _soft_cldice_score(
+    return 1.0 - soft_cldice_scores_from_probabilities(
         probabilities, targets, iterations=iterations, smooth=smooth
     ).mean()
 
@@ -239,6 +188,10 @@ class MulticlassCEDiceLociCLDiceLoss(nn.Module):
         return 1.0 - ((2.0 * intersection + self.smooth) / (denominator + self.smooth)).mean()
 
     def components(self, logits: torch.Tensor, targets: torch.Tensor) -> dict[str, torch.Tensor]:
+        # Autocast promotes cross-entropy during the training loss, but diagnostics
+        # call this method outside autocast. A large FP16 reduction can overflow
+        # even for finite logits, so keep all multiclass loss components in FP32.
+        logits = logits.float()
         targets = targets.long()
         ce = F.cross_entropy(logits, targets)
         probabilities = torch.softmax(logits, dim=1)
@@ -261,4 +214,84 @@ class MulticlassCEDiceLociCLDiceLoss(nn.Module):
             self.cross_entropy_weight * parts["cross_entropy"]
             + self.dice_weight * parts["dice"]
             + self.loci_cldice_weight * parts["loci_cldice"]
+        )
+
+
+class MulticlassGeometryCEDiceLociCLDiceLoss(MulticlassCEDiceLociCLDiceLoss):
+    def __init__(
+        self,
+        geometry_aware_ce_weight: float = 0.25,
+        dice_weight: float = 0.55,
+        soft_cldice_weight: float = 0.20,
+        iterations: int = 30,
+        smooth: float = 1e-6,
+        cldice_smooth: float = 1.0,
+    ) -> None:
+        super().__init__(
+            cross_entropy_weight=0.0,
+            dice_weight=dice_weight,
+            loci_cldice_weight=soft_cldice_weight,
+            iterations=iterations,
+            smooth=smooth,
+            cldice_smooth=cldice_smooth,
+        )
+        self.geometry_aware_ce_weight = geometry_aware_ce_weight
+        self.soft_cldice_weight = soft_cldice_weight
+
+    def components(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        geometry_weights: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if geometry_weights is None:
+            raise ValueError("Geometry-aware cross-entropy requires geometry weights.")
+        logits = logits.float()
+        targets = targets.long()
+        geometry_weights = geometry_weights.float()
+        if geometry_weights.ndim == 4 and geometry_weights.shape[1] == 1:
+            geometry_weights = geometry_weights.squeeze(1)
+        if geometry_weights.shape != targets.shape:
+            raise ValueError(
+                "Geometry weight shape must match target shape: "
+                f"weights={tuple(geometry_weights.shape)}, targets={tuple(targets.shape)}."
+            )
+        if not bool(torch.isfinite(geometry_weights).all().item()):
+            raise ValueError("Geometry weights must be finite.")
+        if bool((geometry_weights < 1.0).any().item()):
+            raise ValueError("Geometry weights must not reduce any pixel below 1.")
+
+        pixel_ce = F.cross_entropy(logits, targets, reduction="none")
+        geometry_ce = (geometry_weights * pixel_ce).sum() / geometry_weights.sum().clamp_min(
+            1.0e-6
+        )
+        probabilities = torch.softmax(logits, dim=1)
+        p_loci = probabilities[:, 1:2]
+        p_inoculum = probabilities[:, 2:3]
+        y_loci = (targets == 1).float().unsqueeze(1)
+        y_inoculum = (targets == 2).float().unsqueeze(1)
+        dice = 0.5 * (
+            self._dice_loss(p_loci, y_loci)
+            + self._dice_loss(p_inoculum, y_inoculum)
+        )
+        loci_cldice = soft_cldice_from_probabilities(
+            p_loci, y_loci, iterations=self.iterations, smooth=self.cldice_smooth
+        )
+        return {
+            "geometry_aware_ce": geometry_ce,
+            "dice": dice,
+            "loci_cldice": loci_cldice,
+        }
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        geometry_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        parts = self.components(logits, targets, geometry_weights)
+        return (
+            self.geometry_aware_ce_weight * parts["geometry_aware_ce"]
+            + self.dice_weight * parts["dice"]
+            + self.soft_cldice_weight * parts["loci_cldice"]
         )

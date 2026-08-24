@@ -5,7 +5,7 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
-from src.inference import (
+from src.inference.core import (
     predict_probabilities_on_image,
     probabilities_to_binary_mask,
     resolve_device,

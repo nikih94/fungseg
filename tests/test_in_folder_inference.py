@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.in_folder_inference import list_recursive_input_images, mask_output_path
+from src.inference.in_folder import list_recursive_input_images, mask_output_path
 
 
 class InFolderInferenceTests(unittest.TestCase):

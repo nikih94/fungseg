@@ -14,6 +14,7 @@ paths:
 
 data:
   image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+  use_fives: false
   num_workers: 22
   persistent_workers: true
   prefetch_factor: 8
@@ -40,6 +41,10 @@ patching:
       max_scale: 2.0
       beta_alpha: 1.0
       beta_beta: 4.0
+      containment_filter:
+        enabled: true
+        threshold: 0.8
+        preserve_normal_patches: true
   validation:
     random_offset:
       enabled: false
@@ -110,29 +115,35 @@ loss:
 
 optimizer:
   name: adamw
-  lr: 0.0001
+  encoder_lr: 1.0e-5
+  decoder_lr: 1.0e-4
   weight_decay: 0.0001
 
 scheduler:
   name: reduce_on_plateau
   mode: max
   factor: 0.5
-  patience: 4
-  min_lr: 1.0e-6
-  monitor: val_dice_macro_resolution
+  patience: 7
+  min_lr:
+    encoder: 1.0e-7
+    decoder: 1.0e-6
+  monitor: val_dice_cldice_per_image
 
 train:
   epochs: 120
   mixed_precision: true
   grad_clip: 1.0
-  monitor: val_dice_macro_resolution
+  monitor: val_dice_cldice_per_image
   monitor_mode: max
+  full_image_monitor:
+    dice_weight: 0.5
+    cldice_weight: 0.5
   best_interval_checkpoint:
     enabled: true
     interval_epochs: 10
   threshold: 0.5
   enable_per_image_validation: true
-  per_image_validation_interval: 10
+  per_image_validation_interval: 1
   seed: 42
   device: auto
   use_tqdm: true

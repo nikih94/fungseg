@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import random
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +83,8 @@ def make_csv_train_val_test_split(
     unique_sources = list(dict.fromkeys(source_ids))
     lookup = _source_lookup(unique_sources)
     assignments: dict[str, str] = {}
+    csv_assignments: dict[str, str] = {}
+    unavailable_sources: dict[str, str] = {}
     csv_path = Path(csv_path)
 
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -94,17 +97,40 @@ def make_csv_train_val_test_split(
             raw_split = (row.get("split") or "").strip()
             if not filename or not raw_split:
                 raise ValueError(f"Split CSV row {row_index} must include filename and split.")
-            if filename not in lookup and Path(filename).name not in lookup and Path(filename).stem not in lookup:
-                raise ValueError(f"Split CSV references unknown image: {filename}")
 
-            source_id = lookup.get(filename) or lookup.get(Path(filename).name) or lookup[Path(filename).stem]
             split_label = _normalize_split_label(raw_split)
+            csv_key = Path(filename).stem
+            previous_csv_split = csv_assignments.get(csv_key)
+            if previous_csv_split is not None and previous_csv_split != split_label:
+                raise ValueError(
+                    f"Split CSV assigns image '{filename}' to multiple splits: "
+                    f"{previous_csv_split}, {split_label}."
+                )
+            csv_assignments[csv_key] = split_label
+
+            source_id = (
+                lookup.get(filename)
+                or lookup.get(Path(filename).name)
+                or lookup.get(Path(filename).stem)
+            )
+            if source_id is None:
+                unavailable_sources.setdefault(csv_key, filename)
+                continue
+
             previous = assignments.get(source_id)
             if previous is not None and previous != split_label:
                 raise ValueError(
                     f"Split CSV assigns image '{source_id}' to multiple splits: {previous}, {split_label}."
                 )
             assignments[source_id] = split_label
+
+    if unavailable_sources:
+        warnings.warn(
+            "Split CSV entries do not yet have complete, usable image/mask pairs and "
+            "will be ignored: " + ", ".join(sorted(unavailable_sources.values())),
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     unassigned_sources = [source_id for source_id in unique_sources if source_id not in assignments]
     if unassigned_sources:

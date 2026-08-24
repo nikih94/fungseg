@@ -32,9 +32,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def _candidate_config(patching_config: dict[str, Any]) -> dict[str, Any]:
-    config = deepcopy(patching_config)
+    config = _without_containment_config(patching_config)
     config["filter_empty_patches"] = False
     config["min_foreground_pixels"] = 0
+    return config
+
+
+def _without_containment_config(patching_config: dict[str, Any]) -> dict[str, Any]:
+    config = deepcopy(patching_config)
+    containment_config = (
+        config.setdefault("train", {})
+        .setdefault("scaled_context", {})
+        .setdefault("containment_filter", {})
+    )
+    containment_config["enabled"] = False
     return config
 
 
@@ -52,9 +63,14 @@ def _scale_stats(records: list[PatchRecord]) -> dict[str, float]:
     }
 
 
-def _resolution_bin_edges(patch_size: int, num_scaled_bins: int = 10) -> list[int]:
+def _resolution_bin_edges(
+    patch_size: int,
+    max_scale: float,
+    num_scaled_bins: int = 10,
+) -> list[int]:
+    scale_span = max(0.0, float(max_scale) - 1.0)
     return [
-        int(round(patch_size * (1.0 + (index / num_scaled_bins))))
+        int(round(patch_size * (1.0 + scale_span * (index / num_scaled_bins))))
         for index in range(num_scaled_bins + 1)
     ]
 
@@ -70,9 +86,10 @@ def _resolution_bin_index(record: PatchRecord, bin_edges: list[int]) -> int:
 def _print_source_resolution_table(
     kept: list[PatchRecord],
     patch_size: int,
+    max_scale: float,
     title: str = "Patches by source and source-crop resolution:",
 ) -> None:
-    bin_edges = _resolution_bin_edges(patch_size)
+    bin_edges = _resolution_bin_edges(patch_size, max_scale)
     source_rows: dict[str, list[int]] = {}
     for record in kept:
         row = source_rows.setdefault(record.source_id, [0 for _ in bin_edges])
@@ -167,6 +184,7 @@ def _csv_split_definition(config: dict[str, Any], original_records: list[Origina
 def _print_split_resolution_tables(
     kept: list[PatchRecord],
     patch_size: int,
+    max_scale: float,
     split: SplitDefinition | None,
 ) -> None:
     if split is None:
@@ -183,6 +201,7 @@ def _print_split_resolution_tables(
         _print_source_resolution_table(
             split_records,
             patch_size,
+            max_scale,
             title=f"Patches by source and source-crop resolution ({split_name} split):",
         )
 
@@ -190,6 +209,7 @@ def _print_split_resolution_tables(
 def _print_summary(
     original_records: list[OriginalImageRecord],
     candidates: list[PatchRecord],
+    pre_containment: list[PatchRecord],
     kept: list[PatchRecord],
     patching_config: dict[str, Any],
     epoch: int,
@@ -197,9 +217,18 @@ def _print_summary(
     split: SplitDefinition | None = None,
 ) -> None:
     labels = Counter(record.scale_label for record in kept)
-    discarded = max(0, len(candidates) - len(kept))
+    foreground_discarded = max(0, len(candidates) - len(pre_containment))
+    containment_discarded = max(0, len(pre_containment) - len(kept))
+    discarded = foreground_discarded + containment_discarded
     stats = _scale_stats(kept)
     patch_size = int(patching_config["patch_size"])
+    scaled_context_config = patching_config.get("train", {}).get("scaled_context", {})
+    containment_config = scaled_context_config.get("containment_filter", {})
+    max_scale = (
+        max(1.0, float(scaled_context_config.get("max_scale", 2.0)))
+        if bool(scaled_context_config.get("enabled", False))
+        else 1.0
+    )
 
     print(f"Images matched: {len(original_records)}")
     print(f"Epoch: {epoch}")
@@ -210,9 +239,18 @@ def _print_summary(
         f"stride={patching_config['stride']} "
         f"overlap={patching_config['overlap']}"
     )
+    print(
+        "Containment filter: "
+        f"enabled={bool(containment_config.get('enabled', False))} "
+        f"threshold={float(containment_config.get('threshold', 0.8)):.4f} "
+        "preserve_normal_patches="
+        f"{bool(containment_config.get('preserve_normal_patches', True))}"
+    )
     print(f"Base candidate patches: {len(candidates)}")
     print(f"Patches kept: {len(kept)}")
     print(f"Patches discarded: {discarded}")
+    print(f"Foreground-filtered patches: {foreground_discarded}")
+    print(f"Containment-filtered patches: {containment_discarded}")
     print(f"Normal patches: {labels.get('normal', 0)}")
     print(f"Scaled-context patches: {labels.get('scaled_context', 0)}")
     print(
@@ -220,8 +258,8 @@ def _print_summary(
         f"min={stats['min']:.4f} max={stats['max']:.4f} mean={stats['mean']:.4f} "
         f"p50={stats['p50']:.4f} p90={stats['p90']:.4f} p95={stats['p95']:.4f}"
     )
-    _print_source_resolution_table(kept, patch_size)
-    _print_split_resolution_tables(kept, patch_size, split)
+    _print_source_resolution_table(kept, patch_size, max_scale)
+    _print_split_resolution_tables(kept, patch_size, max_scale, split)
 
 
 def _match_image_record(records: list[OriginalImageRecord], image_path: str) -> OriginalImageRecord:
@@ -317,6 +355,13 @@ def main() -> None:
         epoch=int(args.epoch),
         base_seed=seed,
     )
+    pre_containment = build_patch_records(
+        original_records,
+        _without_containment_config(patching_config),
+        phase="train",
+        epoch=int(args.epoch),
+        base_seed=seed,
+    )
     kept = build_patch_records(
         original_records,
         patching_config,
@@ -324,7 +369,16 @@ def main() -> None:
         epoch=int(args.epoch),
         base_seed=seed,
     )
-    _print_summary(original_records, candidates, kept, patching_config, int(args.epoch), seed, split=split)
+    _print_summary(
+        original_records,
+        candidates,
+        pre_containment,
+        kept,
+        patching_config,
+        int(args.epoch),
+        seed,
+        split=split,
+    )
 
     if args.image:
         target = str(config.get("segmentation", {}).get("target", "legacy"))

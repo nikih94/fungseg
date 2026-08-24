@@ -93,6 +93,46 @@ class CrossValidationTests(unittest.TestCase):
         self.assertEqual(split.val_sources, ["b.tif"])
         self.assertEqual(split.test_sources, ["c.tif"])
 
+    def test_csv_split_ignores_future_rows_with_named_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "image_splits.csv"
+            csv_path.write_text(
+                "filename,split\na.tif,train\nb.tif,validation\nc.tif,test\nfuture.tif,train\n",
+                encoding="utf-8",
+            )
+
+            with self.assertWarnsRegex(RuntimeWarning, "future.tif"):
+                split = make_csv_train_val_test_split(["a.tif", "b.tif", "c.tif"], csv_path)
+
+        self.assertEqual(split.train_sources, ["a.tif"])
+        self.assertEqual(split.val_sources, ["b.tif"])
+        self.assertEqual(split.test_sources, ["c.tif"])
+
+    def test_csv_split_validates_future_row_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "image_splits.csv"
+            csv_path.write_text(
+                "filename,split\na.tif,train\nb.tif,validation\nc.tif,test\nfuture.tif,pending\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unsupported CSV split label"):
+                make_csv_train_val_test_split(["a.tif", "b.tif", "c.tif"], csv_path)
+
+    def test_csv_split_rejects_conflicting_future_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "image_splits.csv"
+            csv_path.write_text(
+                (
+                    "filename,split\na.tif,train\nb.tif,validation\nc.tif,test\n"
+                    "future.tif,train\nfuture.png,test\n"
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "multiple splits"):
+                make_csv_train_val_test_split(["a.tif", "b.tif", "c.tif"], csv_path)
+
     def test_csv_split_rejects_unassigned_images(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "image_splits.csv"

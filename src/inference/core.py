@@ -23,7 +23,7 @@ warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run patch-based inference for fungi segmentation.")
+    parser = argparse.ArgumentParser(description="Run patch-based inference for fungal segmentation.")
     parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
     parser.add_argument("--checkpoint", required=True, help="Path to the trained checkpoint.")
     parser.add_argument("--input", required=True, help="Image file or directory.")

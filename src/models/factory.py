@@ -80,6 +80,38 @@ def build_model(config: dict[str, Any]):
     encoder_name = config.get("encoder_name", "resnet18")
 
     if model_name in {
+        "segformer_mit_b1_refinement",
+        "segformer_mit_b2_refinement",
+    }:
+        from src.models.segformer_refinement import (
+            SegformerMitFullResolutionRefinement,
+        )
+
+        refinement_encoders = {
+            "segformer_mit_b1_refinement": "mit_b1",
+            "segformer_mit_b2_refinement": "mit_b2",
+        }
+        expected_encoder = refinement_encoders[model_name]
+        configured_encoder = config.get("encoder_name", expected_encoder)
+        if configured_encoder != expected_encoder:
+            raise ValueError(
+                f"{model_name} requires encoder_name='{expected_encoder}'."
+            )
+        return SegformerMitFullResolutionRefinement(
+            encoder_name=expected_encoder,
+            encoder_weights=config.get("encoder_weights", "imagenet"),
+            encoder_depth=int(config.get("encoder_depth", 5)),
+            decoder_segmentation_channels=int(
+                config.get("decoder_segmentation_channels", 256)
+            ),
+            in_channels=int(config.get("in_channels", 3)),
+            num_classes=int(config.get("num_classes", 3)),
+            shallow_channels=config.get("shallow_channels", [16, 32]),
+            refine_half_channels=config.get("refine_half_channels", [128, 64]),
+            refine_full_channels=config.get("refine_full_channels", [32, 32]),
+        )
+
+    if model_name in {
         "unetplusplus",
         "unetplusplus_resnet18",
         "unetplusplus_resnet34",
@@ -112,11 +144,14 @@ def build_model(config: dict[str, Any]):
             _replace_decoder_layer_norms(model.decoder)
         return model
 
-    if model_name in {"segformer", "segformer_mit_b3"}:
+    if model_name in {"segformer", "segformer_mit_b3", "segformer_mit_b5"}:
         import segmentation_models_pytorch as smp
 
-        if model_name == "segformer_mit_b3":
-            encoder_name = "mit_b3"
+        encoder_aliases = {
+            "segformer_mit_b3": "mit_b3",
+            "segformer_mit_b5": "mit_b5",
+        }
+        encoder_name = encoder_aliases.get(model_name, encoder_name)
 
         return smp.Segformer(
             encoder_name=encoder_name,

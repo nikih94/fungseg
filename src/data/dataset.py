@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import albumentations as A
 import numpy as np
@@ -16,9 +16,14 @@ def compose_multiclass_mask(
     loci_mask: np.ndarray,
     inoculum_mask: np.ndarray,
     threshold: int = 127,
+    join_mask: np.ndarray | None = None,
+    merge_join_masks: bool = False,
 ) -> tuple[np.ndarray, dict[str, float | int]]:
     loci = loci_mask > threshold
     inoculum = inoculum_mask > threshold
+    join = None if join_mask is None else join_mask > threshold
+    if merge_join_masks and join is not None:
+        loci = loci | join
     overlap_pixels = int((loci & inoculum).sum())
     mask = np.zeros(loci.shape, dtype=np.uint8)
     mask[loci] = 1
@@ -39,6 +44,7 @@ def _build_normalize(augmentations_config: Optional[dict[str, Any]]) -> A.Normal
 def get_train_transforms(
     image_size: Optional[int] = None,
     augmentations_config: Optional[dict[str, Any]] = None,
+    seed: int | None = None,
 ) -> A.Compose:
     train_config = (augmentations_config or {}).get("train", {})
     affine_config = train_config.get("affine", {})
@@ -97,7 +103,7 @@ def get_train_transforms(
             ToTensorV2(),
         ]
     )
-    return A.Compose(ops)
+    return A.Compose(ops, seed=seed)
 
 
 def get_val_transforms(
@@ -125,6 +131,8 @@ class SegmentationPatchDataset(Dataset):
         image_resampling: str = "lanczos",
         mask_resampling: str = "foreground_preserving",
         segmentation_mode: str = "binary",
+        target_weight_builder: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        merge_join_masks: bool = False,
     ) -> None:
         self.records = records
         self.mask_threshold = mask_threshold
@@ -132,6 +140,8 @@ class SegmentationPatchDataset(Dataset):
         self.image_resampling = image_resampling
         self.mask_resampling = mask_resampling
         self.segmentation_mode = str(segmentation_mode).lower()
+        self.target_weight_builder = target_weight_builder
+        self.merge_join_masks = bool(merge_join_masks)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -149,9 +159,11 @@ class SegmentationPatchDataset(Dataset):
         if self.segmentation_mode == "multiclass":
             if not record.mask_paths or "loci" not in record.mask_paths or "inoculum" not in record.mask_paths:
                 raise ValueError("Multiclass records require named loci and inoculum mask paths.")
-            for name in ("loci", "inoculum"):
-                with Image.open(record.mask_paths[name]) as mask:
-                    mask_arrays[name] = np.array(mask.convert("L"), dtype=np.uint8)
+            for name in ("loci", "inoculum", "join"):
+                mask_path = record.mask_paths.get(name)
+                if mask_path is not None:
+                    with Image.open(mask_path) as mask:
+                        mask_arrays[name] = np.array(mask.convert("L"), dtype=np.uint8)
         else:
             with Image.open(record.mask_path) as mask:
                 mask_arrays["binary"] = np.array(mask.convert("L"), dtype=np.uint8)
@@ -173,7 +185,11 @@ class SegmentationPatchDataset(Dataset):
         }
         if self.segmentation_mode == "multiclass":
             target_mask, overlap = compose_multiclass_mask(
-                mask_patches["loci"], mask_patches["inoculum"], self.mask_threshold
+                mask_patches["loci"],
+                mask_patches["inoculum"],
+                self.mask_threshold,
+                join_mask=mask_patches.get("join"),
+                merge_join_masks=self.merge_join_masks,
             )
         else:
             target_mask = (mask_patches["binary"] > self.mask_threshold).astype(np.float32)
@@ -198,7 +214,7 @@ class SegmentationPatchDataset(Dataset):
                 mask_tensor = mask_tensor[:1]
             mask_tensor = mask_tensor.float()
 
-        return {
+        sample = {
             "image": image_tensor,
             "mask": mask_tensor,
             "source_id": record.source_id,
@@ -213,3 +229,6 @@ class SegmentationPatchDataset(Dataset):
             "source_crop_size": record.source_crop_size or record.patch_size,
             **overlap,
         }
+        if self.target_weight_builder is not None:
+            sample["loss_weight"] = self.target_weight_builder(mask_tensor).float()
+        return sample

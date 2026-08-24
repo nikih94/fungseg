@@ -1,5 +1,6 @@
 filename,split
 IN123 YNA 48h x500 1.tif,train
+IN123 YNA 48h x500 3.tif,train
 IN125 Agar 48h x500 1.tif,train
 IN125 Agar 48h x500 3.tif,train
 IN125 Agar 48h x500 4.tif,train
@@ -19,12 +20,23 @@ IN183 SNA 48h x500 5.tif,train
 IN183 YNA 48h x500 1.tif,train
 IN183 YNA 48h x500 2.tif,train
 IN183 YNA 48h x500 4.tif,train
+IN123 C MEA 48h x500 1.tif,train
+IN123 E 2%A 48h x500 1.tif,train
+IN123 E 2%A 48h x500 2.tif,train
+IN7 Agar 48h x500 1.tif,train
+IN7 F MEA 48h x500 1.tif,train
+IN123 YNA 48h x500 5.tif,train
+IN7 F YNA 48h x500 3.tif,train
 IN125 Agar 48h x500 2.tif,validation
 IN183 Agar 48h x500 2.tif,validation
 IN183 SNA 48h x500 3.tif,validation
 IN183 YNA 48h x500 5.tif,validation
+IN123 G SNA 48h x500 2.tif,validation
+IN7 D MEA 48h x500 3.tif,validation
 IN125 SNA 48h x500 5.tif,test
 IN183 Agar 48h x500 3.tif,test
 IN183 SNA 48h x500 2.tif,test
 IN183 YNA 48h x500 3.tif,test
 IN183 YNA 48h x500 6.tif,test
+IN123 B MEA 48h x500 2.tif,test
+IN7 J SNA 48h x500 2.tif,test

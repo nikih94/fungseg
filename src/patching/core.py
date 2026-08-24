@@ -285,6 +285,82 @@ def _sample_context_scale(
     return min(scale, max_scale)
 
 
+def _source_crop_bounds(record: PatchRecord) -> tuple[int, int, int, int]:
+    return _centered_source_bounds(
+        record.scaled_width,
+        record.scaled_height,
+        record.x,
+        record.y,
+        record.patch_size,
+        record.scale,
+    )
+
+
+def _intersection_area(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> int:
+    x0 = max(first[0], second[0])
+    y0 = max(first[1], second[1])
+    x1 = min(first[2], second[2])
+    y1 = min(first[3], second[3])
+    return max(0, x1 - x0) * max(0, y1 - y0)
+
+
+def _filter_contained_patch_records(
+    records: list[PatchRecord],
+    phase_config: dict[str, Any],
+) -> list[PatchRecord]:
+    containment_config = (
+        phase_config.get("scaled_context", {}).get("containment_filter", {})
+    )
+    if not bool(containment_config.get("enabled", False)):
+        return records
+
+    threshold = float(containment_config.get("threshold", 0.8))
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError(
+            "scaled_context.containment_filter.threshold must be in (0, 1]."
+        )
+    if len(records) < 2:
+        return records
+    preserve_normal = bool(containment_config.get("preserve_normal_patches", True))
+
+    bounds = [_source_crop_bounds(record) for record in records]
+    areas = [
+        max(0, x1 - x0) * max(0, y1 - y0)
+        for x0, y0, x1, y1 in bounds
+    ]
+    largest_first = sorted(
+        range(len(records)), key=lambda index: (-areas[index], index)
+    )
+    retained_larger_indices: list[int] = []
+    removed_indices: set[int] = set()
+
+    for index in largest_first:
+        record = records[index]
+        if preserve_normal and record.scale_label == "normal":
+            retained_larger_indices.append(index)
+            continue
+
+        smaller_area = areas[index]
+        if smaller_area > 0:
+            for larger_index in retained_larger_indices:
+                if areas[larger_index] <= smaller_area:
+                    break
+                covered_fraction = _intersection_area(
+                    bounds[index], bounds[larger_index]
+                ) / smaller_area
+                if covered_fraction >= threshold:
+                    removed_indices.add(index)
+                    break
+
+        if index not in removed_indices:
+            retained_larger_indices.append(index)
+
+    return [record for index, record in enumerate(records) if index not in removed_indices]
+
+
 def build_patch_records(
     original_records: Iterable[OriginalImageRecord],
     patching_config: dict[str, Any],
@@ -305,8 +381,22 @@ def build_patch_records(
 
     patch_records: list[PatchRecord] = []
     for record in original_records:
+        source_patch_records: list[PatchRecord] = []
         mask_arrays: list[np.ndarray] = []
-        paths = record.mask_paths.values() if record.mask_paths else [record.mask_path]
+        if record.mask_paths:
+            mask_names = [
+                name for name in ("loci", "inoculum") if name in record.mask_paths
+            ]
+            if not mask_names:
+                mask_names = list(record.mask_paths)
+            if (
+                patching_config.get("include_join_masks", False)
+                and "join" in record.mask_paths
+            ):
+                mask_names.append("join")
+            paths = [record.mask_paths[name] for name in mask_names]
+        else:
+            paths = [record.mask_path]
         for mask_path in paths:
             with Image.open(mask_path) as mask_image:
                 mask_arrays.append(np.array(mask_image.convert("L"), dtype=np.uint8))
@@ -337,7 +427,7 @@ def build_patch_records(
                     continue
 
                 scale_label = "scaled_context" if scale > 1.0 else "normal"
-                patch_records.append(
+                source_patch_records.append(
                     PatchRecord(
                         source_id=record.source_id,
                         image_path=record.image_path,
@@ -354,6 +444,10 @@ def build_patch_records(
                         mask_paths=record.mask_paths,
                     )
                 )
+
+        patch_records.extend(
+            _filter_contained_patch_records(source_patch_records, phase_cfg)
+        )
 
     return patch_records
 

@@ -4,7 +4,7 @@ import math
 import gc
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -15,12 +15,14 @@ from tqdm.auto import tqdm
 
 from src.data.dataset import compose_multiclass_mask, get_val_transforms
 from src.metrics.segmentation import (
+    cldice_score_from_masks,
     dice_score,
     dice_score_from_masks,
     dice_scores,
     iou_score,
     iou_score_from_masks,
     iou_scores,
+    join_region_metrics_from_masks,
     multiclass_metrics_from_masks,
     multiclass_predictions,
 )
@@ -63,6 +65,9 @@ class Trainer:
         tensorboard_writer=None,
         fold_index: int = 0,
         segmentation_config: dict[str, Any] | None = None,
+        join_masks_config: dict[str, Any] | None = None,
+        validation_config: dict[str, Any] | None = None,
+        epoch_metrics_callback: Callable[[dict[str, float]], None] | None = None,
     ) -> None:
         self.model = model
         self.loss_fn = loss_fn
@@ -79,21 +84,66 @@ class Trainer:
         self.tensorboard_writer = tensorboard_writer
         self.fold_index = fold_index
         self.segmentation_config = segmentation_config or {}
+        self.join_masks_config = join_masks_config or {}
+        self.merge_join_masks = bool(self.join_masks_config.get("merge_with_loci", False))
+        if validation_config is None:
+            validation_config = {
+                "full_image": {
+                    "enabled": train_config.get("enable_per_image_validation", True),
+                    "interval_epochs": train_config.get("per_image_validation_interval", 1),
+                    "monitor": train_config.get("full_image_monitor", {}),
+                }
+            }
+        self.validation_config = validation_config
+        self.epoch_metrics_callback = epoch_metrics_callback
         self.segmentation_mode = str(self.segmentation_config.get("mode", "binary")).lower()
         self.class_names = {
             name: int(class_id) for name, class_id in self.segmentation_config.get(
                 "classes", {"background": 0, "loci": 1, "inoculum": 2}
             ).items() if name != "background"
         }
-        self.monitor = self._normalize_metric_name(train_config.get("monitor", "val_dice_per_patch"))
+        self.monitor = self._normalize_metric_name(train_config.get("monitor", "val_dice_cldice_per_image"))
         self.monitor_mode = train_config.get("monitor_mode", "max")
         interval_checkpoint_config = train_config.get("best_interval_checkpoint", {})
         self.best_interval_checkpoint_enabled = bool(interval_checkpoint_config.get("enabled", False))
         self.best_interval_checkpoint_epochs = max(1, int(interval_checkpoint_config.get("interval_epochs", 10)))
         self.threshold = float(train_config.get("threshold", 0.5))
         self.use_tqdm = bool(train_config.get("use_tqdm", True))
-        self.enable_per_image_validation = bool(train_config.get("enable_per_image_validation", True))
-        self.per_image_validation_interval = max(1, int(train_config.get("per_image_validation_interval", 1)))
+        full_image_config = self.validation_config.get("full_image", {})
+        self.enable_per_image_validation = bool(full_image_config.get("enabled", True))
+        self.per_image_validation_interval = max(
+            1,
+            int(full_image_config.get("interval_epochs", 1)),
+        )
+        full_image_monitor = full_image_config.get("monitor", {})
+        if not isinstance(full_image_monitor, dict):
+            raise ValueError("validation.full_image.monitor must be a mapping.")
+        dice_weight = float(full_image_monitor.get("dice_weight", 0.5))
+        cldice_weight = float(full_image_monitor.get("cldice_weight", 0.5))
+        if dice_weight < 0.0 or cldice_weight < 0.0 or dice_weight + cldice_weight <= 0.0:
+            raise ValueError(
+                "validation.full_image.monitor weights must be non-negative and have a positive sum."
+            )
+        weight_sum = dice_weight + cldice_weight
+        self.full_image_dice_weight = dice_weight / weight_sum
+        self.full_image_cldice_weight = cldice_weight / weight_sum
+        self.scheduler_monitor = self._normalize_metric_name(
+            train_config.get("scheduler_monitor", self.monitor)
+        )
+        monitored_metrics = {self.monitor}
+        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            monitored_metrics.add(self.scheduler_monitor)
+        if any(metric.endswith("_per_image") for metric in monitored_metrics):
+            if not self.enable_per_image_validation:
+                raise ValueError(
+                    "Full-image monitor metrics require validation.full_image.enabled: true."
+                )
+            if not self.val_original_records:
+                raise ValueError("Full-image monitor metrics require validation image records.")
+            if self.per_image_validation_interval != 1:
+                raise ValueError(
+                    "Full-image monitor metrics require validation.full_image.interval_epochs: 1."
+                )
         use_amp = bool(train_config.get("mixed_precision", True)) and device.type == "cuda"
         self.use_amp = use_amp
         self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -137,14 +187,16 @@ class Trainer:
                     val_metrics.update(self._evaluate_full_images(epoch=epoch, epochs=epochs))
                 epoch_metrics = {
                     "epoch": epoch,
-                    "lr": self._current_lr(),
+                    **self._current_learning_rates(),
                     **train_metrics,
                     **val_metrics,
                 }
+                self._validate_finite_epoch_metrics(epoch_metrics, epoch)
                 history.append(epoch_metrics)
                 epoch_rows.append({"fold": self.fold_index, **epoch_metrics})
 
                 current_metric = float(epoch_metrics[self.monitor])
+                self._step_scheduler(epoch_metrics)
                 is_best = current_metric > best_metric if self.monitor_mode == "max" else current_metric < best_metric
                 if is_best:
                     best_metric = current_metric
@@ -208,25 +260,63 @@ class Trainer:
                     epoch_metrics,
                 )
 
-                self._step_scheduler(epoch_metrics)
+                self._persist_training_progress(
+                    best_metric=best_metric,
+                    history=history,
+                    epoch_rows=epoch_rows,
+                    checkpoint_manifest=checkpoint_manifest,
+                )
+                if self.epoch_metrics_callback is not None:
+                    self.epoch_metrics_callback(epoch_metrics)
                 self._log_tensorboard(epoch_metrics, epoch)
                 self.logger.info(
-                    "Epoch %s/%s - lr=%.8f train_loss=%.4f val_loss=%.4f val_dice_per_patch=%.4f val_iou_per_patch=%.4f val_dice_macro_resolution=%.4f val_dice_per_image=%s val_iou_per_image=%s",
+                    "Epoch %s/%s - %s train_loss=%.4f val_loss=%.4f val_dice_per_patch=%.4f val_iou_per_patch=%.4f val_dice_macro_resolution=%.4f val_dice_per_image=%s val_cldice_loci_per_image=%s val_dice_cldice_per_image=%s val_iou_per_image=%s",
                     epoch,
                     epochs,
-                    epoch_metrics["lr"],
+                    self._format_learning_rates(epoch_metrics),
                     epoch_metrics["train_loss"],
                     epoch_metrics["val_loss"],
                     epoch_metrics["val_dice_per_patch"],
                     epoch_metrics["val_iou_per_patch"],
                     epoch_metrics["val_dice_macro_resolution"],
                     self._format_optional_metric(epoch_metrics.get("val_dice_per_image")),
+                    self._format_optional_metric(epoch_metrics.get("val_cldice_loci_per_image")),
+                    self._format_optional_metric(epoch_metrics.get("val_dice_cldice_per_image")),
                     self._format_optional_metric(epoch_metrics.get("val_iou_per_image")),
                 )
         finally:
             shutdown_dataloader(train_loader)
             shutdown_dataloader(val_loader)
 
+        self._persist_training_progress(
+            best_metric=best_metric,
+            history=history,
+            epoch_rows=epoch_rows,
+            checkpoint_manifest=checkpoint_manifest,
+        )
+        metrics_payload = {
+            "best_metric": best_metric,
+            "monitor": self.monitor,
+            "history": history,
+            "best_epoch": self._best_epoch(history),
+        }
+        best_epoch = metrics_payload["best_epoch"]
+        best_metrics = next(item for item in history if item["epoch"] == best_epoch)
+        return {
+            "history": history,
+            "best_epoch": best_epoch,
+            **best_metrics,
+        }
+
+    def _persist_training_progress(
+        self,
+        *,
+        best_metric: float,
+        history: list[dict[str, float]],
+        epoch_rows: list[dict[str, float]],
+        checkpoint_manifest: dict[str, dict[str, Any]],
+    ) -> None:
+        """Refresh fold artifacts so completed epochs are visible during training."""
         metrics_payload = {
             "best_metric": best_metric,
             "monitor": self.monitor,
@@ -245,16 +335,10 @@ class Trainer:
             ),
         )
         save_csv(self.fold_dir / "checkpoint_manifest.csv", manifest_rows)
-        save_json(self.fold_dir / "checkpoint_manifest.json", {"checkpoints": manifest_rows})
-        best_epoch = metrics_payload["best_epoch"]
-        best_metrics = next(item for item in history if item["epoch"] == best_epoch)
-        return {
-            "history": history,
-            "best_epoch": best_epoch,
-            **best_metrics,
-            "val_dice_per_image": self._latest_metric(history, "val_dice_per_image"),
-            "val_iou_per_image": self._latest_metric(history, "val_iou_per_image"),
-        }
+        save_json(
+            self.fold_dir / "checkpoint_manifest.json",
+            {"checkpoints": manifest_rows},
+        )
 
     def evaluate(
         self,
@@ -287,7 +371,7 @@ class Trainer:
         total_loss = 0.0
         total_dice = 0.0
         total_iou = 0.0
-        num_batches = 0
+        num_samples = 0
         bucket_dice_totals: dict[str, float] = {}
         bucket_iou_totals: dict[str, float] = {}
         bucket_counts: dict[str, int] = {}
@@ -306,9 +390,13 @@ class Trainer:
             iterator = progress
 
         try:
-            for batch in iterator:
+            for batch_index, batch in enumerate(iterator, start=1):
                 images = batch["image"].to(self.device, non_blocking=True)
                 masks = batch["mask"].to(self.device, non_blocking=True)
+                geometry_weights = batch.get("loss_weight")
+                if geometry_weights is not None:
+                    geometry_weights = geometry_weights.to(self.device, non_blocking=True)
+                batch_size = int(masks.shape[0])
 
                 if training:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -317,7 +405,17 @@ class Trainer:
                 with context:
                     with torch.amp.autocast(device_type=autocast_device, enabled=self.use_amp):
                         logits = extract_logits(self.model(images))
-                        loss = self.loss_fn(logits, masks)
+                        loss = (
+                            self.loss_fn(logits, masks, geometry_weights=geometry_weights)
+                            if geometry_weights is not None
+                            else self.loss_fn(logits, masks)
+                        )
+
+                    if not bool(torch.isfinite(loss).item()):
+                        raise FloatingPointError(
+                            f"Fold {self.fold_index} epoch {epoch} {stage} batch "
+                            f"{batch_index} produced non-finite loss: {loss.item()}."
+                        )
 
                     if training:
                         self.scaler.scale(loss).backward()
@@ -328,22 +426,39 @@ class Trainer:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
 
-                total_loss += float(loss.item())
+                total_loss += float(loss.item()) * batch_size
                 if self.segmentation_mode == "multiclass":
                     batch_task_metrics = multiclass_metrics_from_masks(
                         multiclass_predictions(logits.detach()), masks.detach(), self.class_names
                     )
-                    total_dice += batch_task_metrics["dice_macro_foreground"]
-                    total_iou += batch_task_metrics["iou_macro_foreground"]
+                    total_dice += batch_task_metrics["dice_macro_foreground"] * batch_size
+                    total_iou += batch_task_metrics["iou_macro_foreground"] * batch_size
                     for metric_name, metric_value in batch_task_metrics.items():
-                        component_totals[metric_name] = component_totals.get(metric_name, 0.0) + float(metric_value)
+                        component_totals[metric_name] = (
+                            component_totals.get(metric_name, 0.0) + float(metric_value) * batch_size
+                        )
                 else:
-                    total_dice += dice_score(logits.detach(), masks.detach(), threshold=self.threshold)
-                    total_iou += iou_score(logits.detach(), masks.detach(), threshold=self.threshold)
+                    total_dice += dice_score(logits.detach(), masks.detach(), threshold=self.threshold) * batch_size
+                    total_iou += iou_score(logits.detach(), masks.detach(), threshold=self.threshold) * batch_size
                 with torch.no_grad():
-                    batch_components = loss_component_metrics(logits.detach(), masks.detach(), self.loss_config)
+                    batch_components = loss_component_metrics(
+                        logits.detach(),
+                        masks.detach(),
+                        self.loss_config,
+                        geometry_weights=(
+                            geometry_weights.detach() if geometry_weights is not None else None
+                        ),
+                    )
                 for metric_name, metric_value in batch_components.items():
-                    component_totals[metric_name] = component_totals.get(metric_name, 0.0) + float(metric_value)
+                    if not math.isfinite(float(metric_value)):
+                        raise FloatingPointError(
+                            f"Fold {self.fold_index} epoch {epoch} {stage} batch "
+                            f"{batch_index} produced non-finite loss component "
+                            f"{metric_name}: {metric_value}."
+                        )
+                    component_totals[metric_name] = (
+                        component_totals.get(metric_name, 0.0) + float(metric_value) * batch_size
+                    )
                 if not training and "resolution_bucket" in batch and self.segmentation_mode != "multiclass":
                     batch_buckets = self._as_string_list(batch["resolution_bucket"])
                     batch_dice_scores = dice_scores(
@@ -360,13 +475,13 @@ class Trainer:
                         bucket_dice_totals[bucket] = bucket_dice_totals.get(bucket, 0.0) + float(dice_value)
                         bucket_iou_totals[bucket] = bucket_iou_totals.get(bucket, 0.0) + float(iou_value)
                         bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-                num_batches += 1
+                num_samples += batch_size
                 if progress is not None:
                     progress.set_postfix(
-                        lr=f"{self._current_lr():.2e}",
-                        loss=f"{total_loss / num_batches:.4f}",
-                        dice=f"{total_dice / num_batches:.4f}",
-                        iou=f"{total_iou / num_batches:.4f}",
+                        lr=self._progress_learning_rates(),
+                        loss=f"{total_loss / num_samples:.4f}",
+                        dice=f"{total_dice / num_samples:.4f}",
+                        iou=f"{total_iou / num_samples:.4f}",
                     )
                 del batch, images, masks, logits, loss
         finally:
@@ -376,7 +491,7 @@ class Trainer:
             gc.collect()
 
         prefix = stage
-        divisor = max(num_batches, 1)
+        divisor = max(num_samples, 1)
         metrics = {
             f"{prefix}_loss": total_loss / divisor,
             f"{prefix}_dice_per_patch": total_dice / divisor,
@@ -424,6 +539,10 @@ class Trainer:
         mask_threshold = int(self.data_config["mask_threshold"])
         total_dice = 0.0
         total_iou = 0.0
+        total_cldice = 0.0
+        total_join_dice = 0.0
+        total_join_iou = 0.0
+        num_join_images = 0
         num_images = 0
         records = self.val_original_records if original_records is None else original_records
 
@@ -447,8 +566,16 @@ class Trainer:
                         loci_array = np.array(mask.convert("L"), dtype=np.uint8)
                     with Image.open(record.mask_paths["inoculum"]) as mask:
                         inoculum_array = np.array(mask.convert("L"), dtype=np.uint8)
+                    join_array = None
+                    if "join" in record.mask_paths:
+                        with Image.open(record.mask_paths["join"]) as mask:
+                            join_array = np.array(mask.convert("L"), dtype=np.uint8)
                     mask_array, _ = compose_multiclass_mask(
-                        loci_array, inoculum_array, mask_threshold
+                        loci_array,
+                        inoculum_array,
+                        mask_threshold,
+                        join_mask=join_array,
+                        merge_join_masks=getattr(self, "merge_join_masks", False),
                     )
                     height, width = mask_array.shape
                     probability_sum = np.zeros((3, height, width), dtype=np.float32)
@@ -513,31 +640,78 @@ class Trainer:
                     image_metrics = multiclass_metrics_from_masks(
                         prediction_mask, target_mask, self.class_names
                     )
-                    total_dice += image_metrics["dice_macro_foreground"]
-                    total_iou += image_metrics["iou_macro_foreground"]
+                    image_dice = image_metrics["dice_macro_foreground"]
+                    image_iou = image_metrics["iou_macro_foreground"]
+                    image_cldice = image_metrics["cldice_loci"]
+                    join_metrics = join_region_metrics_from_masks(
+                        prediction_mask,
+                        target_mask,
+                        None if join_array is None else torch.from_numpy(join_array > mask_threshold),
+                        loci_class_id=self.class_names.get("loci", 1),
+                    )
+                    if join_metrics["dice_join"] is not None:
+                        total_join_dice += float(join_metrics["dice_join"])
+                        total_join_iou += float(join_metrics["iou_join"])
+                        num_join_images += 1
                 else:
-                    averaged_probabilities = probability_sum / np.clip(probability_count, a_min=1.0, a_max=None)
-                    prediction_mask = torch.from_numpy((averaged_probabilities >= self.threshold).astype(np.float32))
-                    target_mask = torch.from_numpy((mask_array > mask_threshold).astype(np.float32))
-                    total_dice += dice_score_from_masks(prediction_mask, target_mask)
-                    total_iou += iou_score_from_masks(prediction_mask, target_mask)
+                    averaged_probabilities = probability_sum / np.clip(
+                        probability_count, a_min=1.0, a_max=None
+                    )
+                    prediction_mask = torch.from_numpy(
+                        (averaged_probabilities >= self.threshold).astype(np.float32)
+                    )
+                    target_mask = torch.from_numpy(
+                        (mask_array > mask_threshold).astype(np.float32)
+                    )
+                    image_dice = dice_score_from_masks(prediction_mask, target_mask)
+                    image_iou = iou_score_from_masks(prediction_mask, target_mask)
+                    image_cldice = cldice_score_from_masks(prediction_mask, target_mask)
+                total_dice += image_dice
+                total_iou += image_iou
+                total_cldice += image_cldice
                 num_images += 1
 
                 if self.use_tqdm:
+                    mean_dice = total_dice / max(num_images, 1)
+                    mean_cldice = total_cldice / max(num_images, 1)
                     iterator.set_postfix(
-                        dice=f"{total_dice / max(num_images, 1):.4f}",
-                        iou=f"{total_iou / max(num_images, 1):.4f}",
+                        dice=f"{mean_dice:.4f}",
+                        cldice=f"{mean_cldice:.4f}",
+                        score=f"{self._combined_full_image_score(mean_dice, mean_cldice):.4f}",
                     )
 
         divisor = max(num_images, 1)
+        mean_dice = total_dice / divisor
+        mean_iou = total_iou / divisor
+        mean_cldice = total_cldice / divisor
         result = {
-            f"{stage}_dice_per_image": total_dice / divisor,
-            f"{stage}_iou_per_image": total_iou / divisor,
+            f"{stage}_dice_per_image": mean_dice,
+            f"{stage}_iou_per_image": mean_iou,
+            f"{stage}_cldice_per_image": mean_cldice,
+            f"{stage}_dice_cldice_per_image": self._combined_full_image_score(
+                mean_dice, mean_cldice
+            ),
         }
         if self.segmentation_mode == "multiclass":
-            result[f"{stage}_dice_macro_foreground_per_image"] = total_dice / divisor
-            result[f"{stage}_iou_macro_foreground_per_image"] = total_iou / divisor
+            result[f"{stage}_dice_macro_foreground_per_image"] = mean_dice
+            result[f"{stage}_iou_macro_foreground_per_image"] = mean_iou
+            result[f"{stage}_cldice_loci_per_image"] = mean_cldice
+            result[f"{stage}_join_images"] = num_join_images
+            result[f"{stage}_dice_join_per_image"] = (
+                total_join_dice / num_join_images if num_join_images else None
+            )
+            result[f"{stage}_iou_join_per_image"] = (
+                total_join_iou / num_join_images if num_join_images else None
+            )
+        elif str(self.segmentation_config.get("target", "")).lower() == "loci":
+            result[f"{stage}_cldice_loci_per_image"] = mean_cldice
         return result
+
+    def _combined_full_image_score(self, dice: float, cldice: float) -> float:
+        return (
+            self.full_image_dice_weight * float(dice)
+            + self.full_image_cldice_weight * float(cldice)
+        )
 
     def _should_run_per_image_validation(self, epoch: int) -> bool:
         return (
@@ -550,10 +724,23 @@ class Trainer:
         if self.scheduler is None:
             return
         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            monitor_key = self._normalize_metric_name(self.train_config.get("scheduler_monitor", self.monitor))
-            self.scheduler.step(epoch_metrics[monitor_key])
+            self.scheduler.step(epoch_metrics[self.scheduler_monitor])
             return
         self.scheduler.step()
+
+    @staticmethod
+    def _validate_finite_epoch_metrics(
+        epoch_metrics: dict[str, float],
+        epoch: int,
+    ) -> None:
+        for metric_name, metric_value in epoch_metrics.items():
+            if metric_value is None or not isinstance(metric_value, (int, float)):
+                continue
+            if not math.isfinite(float(metric_value)):
+                raise FloatingPointError(
+                    f"Epoch {epoch} produced non-finite metric "
+                    f"'{metric_name}': {metric_value}."
+                )
 
     def _best_epoch(self, history: list[dict[str, float]]) -> int:
         reverse = self.monitor_mode == "max"
@@ -570,8 +757,37 @@ class Trainer:
                 continue
             self.tensorboard_writer.add_scalar(key, value, epoch)
 
-    def _current_lr(self) -> float:
-        return float(self.optimizer.param_groups[0]["lr"])
+    def _current_learning_rates(self) -> dict[str, float]:
+        named_rates = {
+            str(group["group_name"]): float(group["lr"])
+            for group in self.optimizer.param_groups
+            if group.get("group_name") is not None
+        }
+        if {"encoder", "decoder"} <= named_rates.keys():
+            return {
+                "lr": named_rates["decoder"],
+                "encoder_lr": named_rates["encoder"],
+                "decoder_lr": named_rates["decoder"],
+            }
+        return {"lr": float(self.optimizer.param_groups[0]["lr"])}
+
+    def _progress_learning_rates(self) -> str:
+        learning_rates = self._current_learning_rates()
+        if "encoder_lr" in learning_rates:
+            return (
+                f"enc:{learning_rates['encoder_lr']:.2e}/"
+                f"dec:{learning_rates['decoder_lr']:.2e}"
+            )
+        return f"{learning_rates['lr']:.2e}"
+
+    @staticmethod
+    def _format_learning_rates(epoch_metrics: dict[str, float]) -> str:
+        if "encoder_lr" in epoch_metrics:
+            return (
+                f"encoder_lr={epoch_metrics['encoder_lr']:.8f} "
+                f"decoder_lr={epoch_metrics['decoder_lr']:.8f}"
+            )
+        return f"lr={epoch_metrics['lr']:.8f}"
 
     @staticmethod
     def _normalize_metric_name(metric_name: str) -> str:
@@ -582,14 +798,6 @@ class Trainer:
             "val_iou": "val_iou_per_patch",
         }
         return legacy_map.get(metric_name, metric_name)
-
-    @staticmethod
-    def _latest_metric(history: list[dict[str, float]], key: str) -> float | None:
-        for item in reversed(history):
-            value = item.get(key)
-            if value is not None:
-                return float(value)
-        return None
 
     @staticmethod
     def _format_optional_metric(value: float | None) -> str:

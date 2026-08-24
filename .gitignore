@@ -32,9 +32,11 @@ funi-temporal-masks.zip
 /data/images
 /data/inoculum_masks
 /data/loci_masks
+/data/join_masks
 /data/small-test
 /data/test
 data/other-test-data
+/data/FIVES
 
 # Logs and notebooks
 *.log

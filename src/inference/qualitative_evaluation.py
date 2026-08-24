@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import math
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -15,10 +16,19 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 from src.data.dataset import compose_multiclass_mask, get_val_transforms
-from src.data.discovery import discover_image_mask_pairs, discover_image_mask_sets
+from src.data.discovery import (
+    discover_image_mask_pairs,
+    discover_image_mask_sets,
+    discovery_diagnostic_messages,
+)
 from src.data.folds import make_csv_train_val_test_split
-from src.inference import create_overlay
-from src.metrics.segmentation import dice_score_from_masks, iou_score_from_masks, multiclass_metrics_from_masks
+from src.inference.core import create_overlay
+from src.metrics.segmentation import (
+    dice_score_from_masks,
+    iou_score_from_masks,
+    join_region_metrics_from_masks,
+    multiclass_metrics_from_masks,
+)
 from src.models.factory import build_model
 from src.models.wrappers import extract_logits
 from src.patching import _compute_positions, crop_and_pad_array
@@ -308,6 +318,7 @@ def metric_row(
     prediction_mask: np.ndarray,
     target_mask: np.ndarray,
     multiclass: bool = False,
+    join_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     prediction_tensor = torch.from_numpy(
         prediction_mask.astype(np.int64) if multiclass else (prediction_mask > 0).astype(np.float32)
@@ -341,6 +352,11 @@ def metric_row(
     if multiclass:
         task_metrics = multiclass_metrics_from_masks(prediction_tensor, target_tensor)
         row.update(task_metrics)
+        row.update(join_region_metrics_from_masks(
+            prediction_tensor,
+            target_tensor,
+            None if join_mask is None else torch.from_numpy(join_mask > 0),
+        ))
         row["dice"] = task_metrics["dice_macro_foreground"]
     return row
 
@@ -511,6 +527,12 @@ def resolve_qualitative_pairs(
             pairs, diagnostics = discover_image_mask_sets(
                 images_dir, {"loci": loci_dir, "inoculum": inoculum_dir},
                 config["data"]["image_extensions"],
+                optional_mask_dirs=(
+                    {"join": root / "join_masks"}
+                    if config.get("join_masks", {}).get("enabled", False)
+                    and (root / "join_masks").is_dir()
+                    else None
+                ),
             )
         else:
             masks_dir = root / "masks"
@@ -531,6 +553,11 @@ def resolve_qualitative_pairs(
                 "inoculum": config["paths"]["mask_dirs"]["inoculum"],
             },
             config["data"]["image_extensions"],
+            optional_mask_dirs=(
+                {"join": config["join_masks"]["masks_dir"]}
+                if config.get("join_masks", {}).get("enabled", False)
+                else None
+            ),
         )
     else:
         masks_dir = resolve_mask_dir(config)
@@ -590,10 +617,16 @@ def run_qualitative_evaluation(
         if logger:
             logger.warning(message)
         return {"skipped": True, "reason": message}
-    if diagnostics["missing_masks"] and logger:
-        logger.warning("Qualitative evaluation missing masks for %s images.", len(diagnostics["missing_masks"]))
-    if diagnostics["missing_images"] and logger:
-        logger.warning("Qualitative evaluation found %s masks without images.", len(diagnostics["missing_images"]))
+    diagnostic_messages = discovery_diagnostic_messages(diagnostics)
+    if diagnostic_messages:
+        message = (
+            "Qualitative evaluation excluded incomplete or invalid image/mask sets: "
+            + "; ".join(diagnostic_messages)
+        )
+        if logger:
+            logger.warning(message)
+        else:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
     if not pairs:
         message = f"No qualitative image/mask pairs found for {pairs_source}"
         if logger:
@@ -642,7 +675,19 @@ def run_qualitative_evaluation(
                 loci_array = np.array(mask.convert("L"), dtype=np.uint8)
             with Image.open(mask_path["inoculum"]) as mask:
                 inoculum_array = np.array(mask.convert("L"), dtype=np.uint8)
-            mask_array, overlap = compose_multiclass_mask(loci_array, inoculum_array, mask_threshold)
+            join_array = None
+            if "join" in mask_path:
+                with Image.open(mask_path["join"]) as mask:
+                    join_array = np.array(mask.convert("L"), dtype=np.uint8)
+            mask_array, overlap = compose_multiclass_mask(
+                loci_array,
+                inoculum_array,
+                mask_threshold,
+                join_mask=join_array,
+                merge_join_masks=bool(
+                    config.get("join_masks", {}).get("merge_with_loci", False)
+                ),
+            )
         else:
             with Image.open(mask_path) as mask:
                 mask_array = np.array(mask.convert("L"), dtype=np.uint8)
@@ -657,7 +702,7 @@ def run_qualitative_evaluation(
             patch_size=patch_size,
             stride=stride,
             crop_patch_grid=(int(crop_patch_grid[0]), int(crop_patch_grid[1])),
-            mask_threshold=mask_threshold,
+            mask_threshold=0 if multiclass else mask_threshold,
             min_foreground_ratio=min_foreground_ratio,
             max_foreground_ratio=max_foreground_ratio,
             rng=image_selection_rng(selection_seed, image_path.stem),
@@ -670,6 +715,10 @@ def run_qualitative_evaluation(
         crop_rows.append(crop_metadata)
         image_crop = image_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width]
         raw_target_crop = mask_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width]
+        join_crop = (
+            None if not multiclass or join_array is None
+            else (join_array[crop.y : crop.y + crop.height, crop.x : crop.x + crop.width] > mask_threshold).astype(np.uint8)
+        )
         target_crop = (
             raw_target_crop.astype(np.uint8)
             if multiclass else (raw_target_crop > mask_threshold).astype(np.uint8)
@@ -687,6 +736,7 @@ def run_qualitative_evaluation(
                 "image_path": image_path,
                 "image_crop": image_crop,
                 "target_crop": target_crop,
+                "join_crop": join_crop,
                 "crop": crop,
                 "panels": panels,
             }
@@ -723,6 +773,7 @@ def run_qualitative_evaluation(
                     prediction_mask,
                     payload["target_crop"],
                     multiclass=multiclass,
+                    join_mask=payload.get("join_crop"),
                 )
             )
             if multiclass:
@@ -739,6 +790,7 @@ def run_qualitative_evaluation(
                         prediction_mask,
                         payload["target_crop"],
                         multiclass=multiclass,
+                        join_mask=payload.get("join_crop"),
                     )
                 )
                 payload.setdefault(

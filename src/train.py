@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import argparse
 import statistics
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.data.dataset import SegmentationPatchDataset, get_train_transforms, get_val_transforms
 from src.data.discovery import discover_image_mask_pairs, discover_image_mask_sets
+from src.data.fives import FivesPatchDataset, load_fives_training_records
 from src.data.folds import (
     SplitDefinition,
     make_csv_train_val_test_split,
@@ -20,11 +22,12 @@ from src.data.folds import (
 from src.data.sampling import patch_distribution
 from src.engine.trainer import Trainer
 from src.losses.factory import build_loss
+from src.losses.geometry import build_geometry_weight_map_builder
 from src.models.factory import build_model
 from src.optim.factory import build_optimizer
 from src.patching import build_original_image_records, build_patch_records
 from src.schedulers.factory import build_scheduler
-from src.utils.config import load_config, resolve_mask_dir
+from src.utils.config import config_for_persistence, load_config, resolve_mask_dir
 from src.utils.io import ensure_dir, save_csv, save_json, save_yaml
 from src.utils.logging import setup_logger
 from src.utils.seed import set_seed
@@ -40,6 +43,38 @@ def configure_torch_multiprocessing() -> str:
 
 def _worker_init_fn(_: int) -> None:
     torch.multiprocessing.set_sharing_strategy(TORCH_SHARING_STRATEGY)
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        _seed_dataset_transforms(
+            worker_info.dataset,
+            seed=int(torch.initial_seed() % (2**32)),
+        )
+
+
+def _seed_dataset_transforms(dataset: Dataset, seed: int) -> None:
+    """Seed each distinct Albumentations pipeline in a worker deterministically."""
+    pending = [dataset]
+    seen_datasets: set[int] = set()
+    seen_transforms: set[int] = set()
+    transform_index = 0
+
+    while pending:
+        current = pending.pop()
+        if id(current) in seen_datasets:
+            continue
+        seen_datasets.add(id(current))
+
+        transforms = getattr(current, "transforms", None)
+        if transforms is not None and id(transforms) not in seen_transforms:
+            set_random_seed = getattr(transforms, "set_random_seed", None)
+            if callable(set_random_seed):
+                set_random_seed(int((seed + transform_index) % (2**32)))
+                transform_index += 1
+            seen_transforms.add(id(transforms))
+
+        children = getattr(current, "datasets", None)
+        if children is not None:
+            pending.extend(children)
 
 
 def _collect_optional_metric(values: list[float | None]) -> tuple[float | None, float | None]:
@@ -111,6 +146,45 @@ def build_splits(config: dict, original_records: list) -> tuple[list[SplitDefini
     raise ValueError(f"Unsupported split mode: {split_mode}. Expected 'csv', 'train_val', or 'kfold'.")
 
 
+def build_fast_validation_patching_config(
+    patching_config: dict,
+    validation_config: dict,
+) -> dict:
+    """Build deterministic validation patching settings from the shared patch config."""
+    fast_config = validation_config.get("fast", {})
+    patch_size = int(patching_config["patch_size"])
+    overlap = int(fast_config.get("overlap", 0))
+    config = deepcopy(patching_config)
+    config["overlap"] = overlap
+    config["stride"] = patch_size - overlap
+    config["filter_empty_patches"] = bool(
+        fast_config.get("foreground_only", True)
+    )
+    return config
+
+
+def select_full_image_validation_records(records: list, validation_config: dict) -> list:
+    """Select source images used by the slower stitched validation pass."""
+    selection_config = validation_config.get("full_image", {})
+    selection = str(selection_config.get("selection", "all")).lower()
+    if selection == "all":
+        return list(records)
+    if selection != "smallest_area":
+        raise ValueError(
+            "validation.full_image.selection must be 'all' or 'smallest_area'."
+        )
+
+    max_images = selection_config.get("max_images")
+    if max_images is None or int(max_images) <= 0:
+        raise ValueError(
+            "validation.full_image.max_images must be positive for smallest_area selection."
+        )
+    return sorted(
+        records,
+        key=lambda record: (record.width * record.height, record.source_id),
+    )[: int(max_images)]
+
+
 def split_manifest_rows(
     splits: list[SplitDefinition | tuple[list[str], list[str]]],
 ) -> list[dict[str, int | str]]:
@@ -158,6 +232,15 @@ def make_loader(
     return DataLoader(**loader_kwargs)
 
 
+def combine_training_datasets(
+    fungal_dataset: Dataset,
+    fives_dataset: Dataset | None,
+) -> Dataset:
+    if fives_dataset is None:
+        return fungal_dataset
+    return ConcatDataset([fungal_dataset, fives_dataset])
+
+
 def create_run_dir(runs_root: Path, project_name: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = runs_root / f"{project_name}_{timestamp}"
@@ -167,6 +250,30 @@ def create_run_dir(runs_root: Path, project_name: str) -> Path:
         suffix += 1
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+def segmentation_summary_metadata(config: dict, mask_dir: Path) -> dict:
+    segmentation = config.get("segmentation", {})
+    segmentation_mode = str(segmentation.get("mode", "binary")).lower()
+    if segmentation_mode == "multiclass":
+        mask_dirs = {
+            str(name): str(path)
+            for name, path in config.get("paths", {}).get("mask_dirs", {}).items()
+        }
+        return {
+            "segmentation_mode": "multiclass",
+            "segmentation_target": None,
+            "mask_dir": None,
+            "mask_dirs": mask_dirs,
+        }
+
+    target = str(segmentation.get("target", "legacy"))
+    return {
+        "segmentation_mode": "binary",
+        "segmentation_target": target,
+        "mask_dir": str(mask_dir),
+        "mask_dirs": {target: str(mask_dir)},
+    }
 
 
 def log_run_summary(
@@ -182,23 +289,36 @@ def log_run_summary(
     data_cfg = config["data"]
     patching_cfg = config["patching"]
     optimizer_cfg = config["optimizer"]
+    segmentation_metadata = segmentation_summary_metadata(config, mask_dir)
+    mask_summary = ", ".join(
+        f"{name}:{path}"
+        for name, path in segmentation_metadata["mask_dirs"].items()
+    )
+    if "encoder_lr" in optimizer_cfg and "decoder_lr" in optimizer_cfg:
+        learning_rate_summary = (
+            f"encoder_lr={optimizer_cfg['encoder_lr']} | "
+            f"decoder_lr={optimizer_cfg['decoder_lr']}"
+        )
+    else:
+        learning_rate_summary = f"lr={optimizer_cfg['lr']}"
 
     logger.info("Training summary")
     logger.info(
-        "Model: %s | encoder=%s | epochs=%s | batch_size=%s | optimizer=%s | lr=%s | device=%s",
+        "Model: %s | encoder=%s | epochs=%s | batch_size=%s | optimizer=%s | %s | device=%s",
         model_cfg["name"],
         model_cfg.get("encoder_name", "-"),
         train_cfg["epochs"],
         data_cfg["batch_size"],
         optimizer_cfg["name"],
-        optimizer_cfg["lr"],
+        learning_rate_summary,
         device,
     )
     logger.info(
-        "Dataset: %s images | target=%s | masks=%s | split_mode=%s | patch_size=%s | stride=%s | empty_patch_filter=%s",
+        "Dataset: %s images | mode=%s | target=%s | masks=%s | split_mode=%s | patch_size=%s | stride=%s | empty_patch_filter=%s",
         num_images,
-        config.get("segmentation", {}).get("target", "legacy"),
-        mask_dir,
+        segmentation_metadata["segmentation_mode"],
+        segmentation_metadata["segmentation_target"] or "-",
+        mask_summary,
         split_mode,
         patching_cfg["patch_size"],
         patching_cfg["stride"],
@@ -249,6 +369,7 @@ def log_fold_summary(
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    training_date = datetime.now().astimezone().date().isoformat()
 
     set_seed(int(config["train"]["seed"]))
     device = resolve_device(str(config["train"].get("device", "auto")))
@@ -258,13 +379,23 @@ def main() -> None:
     run_dir = create_run_dir(runs_root, project_name)
     outputs_root = ensure_dir(Path(config["paths"]["outputs_dir"]) / project_name)
     logger = setup_logger("train", run_dir / "logs")
-    save_yaml(run_dir / "config.yaml", config)
+    save_yaml(
+        run_dir / "config.yaml",
+        config_for_persistence(config, training_date=training_date),
+    )
     sharing_strategy = configure_torch_multiprocessing()
     logger.info("Using device: %s", device)
     logger.info("Run directory: %s", run_dir)
     logger.info("Torch multiprocessing sharing strategy: %s", sharing_strategy)
 
     segmentation_mode = str(config.get("segmentation", {}).get("mode", "binary")).lower()
+    join_masks_cfg = config.get("join_masks", {})
+    optional_mask_dirs = (
+        {"join": join_masks_cfg["masks_dir"]}
+        if segmentation_mode == "multiclass" and join_masks_cfg.get("enabled", False)
+        else None
+    )
+    merge_join_masks = bool(join_masks_cfg.get("merge_with_loci", False))
     if segmentation_mode == "multiclass":
         mask_dir = Path(config["paths"]["mask_dirs"]["loci"])
         pairs, diagnostics = discover_image_mask_sets(
@@ -274,6 +405,7 @@ def main() -> None:
                 "inoculum": config["paths"]["mask_dirs"]["inoculum"],
             },
             config["data"]["image_extensions"],
+            optional_mask_dirs=optional_mask_dirs,
         )
     else:
         mask_dir = resolve_mask_dir(config)
@@ -296,6 +428,11 @@ def main() -> None:
                 "Excluded %s image/mask sets with dimension mismatches.",
                 len(diagnostics["dimension_mismatches"]),
             )
+        if diagnostics.get("optional_dimension_mismatches"):
+            logger.warning(
+                "Ignored %s optional join masks with dimension mismatches.",
+                len(diagnostics["optional_dimension_mismatches"]),
+            )
     else:
         if diagnostics["missing_masks"]:
             logger.warning("Missing masks for %s images.", len(diagnostics["missing_masks"]))
@@ -303,6 +440,7 @@ def main() -> None:
             logger.warning("Found %s masks without matching images.", len(diagnostics["missing_images"]))
 
     original_records = build_original_image_records(pairs)
+    fives_patch_records = load_fives_training_records(config)
     splits, split_mode = build_splits(config, original_records)
     manifest_rows = split_manifest_rows(splits)
     save_csv(run_dir / "split_manifest.csv", manifest_rows)
@@ -315,12 +453,27 @@ def main() -> None:
         split_mode=split_mode,
         mask_dir=mask_dir,
     )
+    if fives_patch_records:
+        logger.info(
+            "FIVES auxiliary training enabled | images=%s | patches_per_image=4 | total_patches=%s",
+            len({record.source_id for record in fives_patch_records}),
+            len(fives_patch_records),
+        )
 
     fold_results = []
     all_epoch_rows: list[dict[str, float]] = []
     data_cfg = config["data"]
-    patching_cfg = config["patching"]
+    patching_cfg = {
+        **config["patching"],
+        "include_join_masks": merge_join_masks,
+    }
+    validation_cfg = config["validation"]
+    fast_validation_patching_cfg = build_fast_validation_patching_config(
+        patching_cfg,
+        validation_cfg,
+    )
     augmentations_cfg = config.get("augmentations", {})
+    target_weight_builder = build_geometry_weight_map_builder(config["loss"])
     total_folds = len(splits)
 
     for fold_index, split in enumerate(splits):
@@ -334,6 +487,12 @@ def main() -> None:
         train_originals = [record for record in original_records if record.source_id in set(train_sources)]
         val_originals = [record for record in original_records if record.source_id in set(val_sources)]
         test_originals = [record for record in original_records if record.source_id in set(test_sources)]
+        full_image_enabled = bool(validation_cfg["full_image"]["enabled"])
+        full_image_val_originals = (
+            select_full_image_validation_records(val_originals, validation_cfg)
+            if full_image_enabled
+            else []
+        )
 
         train_patch_records = build_patch_records(
             train_originals,
@@ -342,11 +501,18 @@ def main() -> None:
             epoch=1,
             base_seed=int(config["train"]["seed"]),
         )
+        combined_train_patch_records = train_patch_records + fives_patch_records
         val_patch_records = build_patch_records(
             val_originals,
-            patching_cfg,
+            fast_validation_patching_cfg,
             phase="validation",
         )
+        if not val_patch_records:
+            raise ValueError(
+                "Fast validation produced no patches. Lower "
+                "patching.min_foreground_pixels or set "
+                "validation.fast.foreground_only: false."
+            )
         test_patch_records = build_patch_records(
             test_originals,
             patching_cfg,
@@ -360,21 +526,51 @@ def main() -> None:
             train_originals=train_originals,
             val_originals=val_originals,
             test_originals=test_originals,
-            train_patch_records=train_patch_records,
+            train_patch_records=combined_train_patch_records,
             val_patch_records=val_patch_records,
             test_patch_records=test_patch_records,
         )
+        logger.info(
+            "Fast validation foreground_only=%s | overlap=%s | stride=%s | patches=%s",
+            validation_cfg["fast"]["foreground_only"],
+            validation_cfg["fast"]["overlap"],
+            fast_validation_patching_cfg["stride"],
+            len(val_patch_records),
+        )
+        logger.info(
+            "Full-image validation enabled=%s | selection=%s | images=%s/%s | sources=%s",
+            full_image_enabled,
+            validation_cfg["full_image"]["selection"],
+            len(full_image_val_originals),
+            len(val_originals),
+            ", ".join(record.source_id for record in full_image_val_originals),
+        )
 
+        train_transforms = get_train_transforms(
+            data_cfg.get("image_size"),
+            augmentations_config=augmentations_cfg,
+            seed=int(config["train"]["seed"]),
+        )
         train_dataset = SegmentationPatchDataset(
             records=train_patch_records,
             mask_threshold=int(patching_cfg["mask_threshold"]),
-            transforms=get_train_transforms(
-                data_cfg.get("image_size"),
-                augmentations_config=augmentations_cfg,
-            ),
+            transforms=train_transforms,
             image_resampling=str(patching_cfg.get("image_resampling", "lanczos")),
             mask_resampling=str(patching_cfg.get("mask_resampling", "foreground_preserving")),
             segmentation_mode=segmentation_mode,
+            target_weight_builder=target_weight_builder,
+            merge_join_masks=merge_join_masks,
+        )
+        fives_dataset = (
+            FivesPatchDataset(
+                records=fives_patch_records,
+                mask_threshold=int(patching_cfg["mask_threshold"]),
+                transforms=train_transforms,
+                segmentation_mode=segmentation_mode,
+                target_weight_builder=target_weight_builder,
+            )
+            if fives_patch_records
+            else None
         )
         val_dataset = SegmentationPatchDataset(
             records=val_patch_records,
@@ -386,12 +582,30 @@ def main() -> None:
             image_resampling=str(patching_cfg.get("image_resampling", "lanczos")),
             mask_resampling=str(patching_cfg.get("mask_resampling", "foreground_preserving")),
             segmentation_mode=segmentation_mode,
+            target_weight_builder=target_weight_builder,
+            merge_join_masks=merge_join_masks,
         )
 
         patch_diagnostics = {
-            "train": patch_distribution(train_patch_records),
+            "train": patch_distribution(combined_train_patch_records),
+            "fives": patch_distribution(fives_patch_records),
             "val": patch_distribution(val_patch_records),
             "test": patch_distribution(test_patch_records),
+            "full_image_validation": {
+                "enabled": full_image_enabled,
+                "interval_epochs": validation_cfg["full_image"]["interval_epochs"],
+                "selection": validation_cfg["full_image"]["selection"],
+                "max_images": validation_cfg["full_image"]["max_images"],
+                "sources": [
+                    {
+                        "source_id": record.source_id,
+                        "width": record.width,
+                        "height": record.height,
+                        "area": record.width * record.height,
+                    }
+                    for record in full_image_val_originals
+                ],
+            },
         }
         save_json(fold_dir / "patch_distribution.json", patch_diagnostics)
 
@@ -405,7 +619,7 @@ def main() -> None:
             )
             train_dataset.set_records(epoch_records)
             return make_loader(
-                train_dataset,
+                combine_training_datasets(train_dataset, fives_dataset),
                 batch_size=int(data_cfg["batch_size"]),
                 num_workers=int(data_cfg["num_workers"]),
                 pin_memory=bool(data_cfg["pin_memory"]),
@@ -434,9 +648,13 @@ def main() -> None:
 
         model = build_model(config["model"]).to(device)
         loss_fn = build_loss(config["loss"])
-        optimizer = build_optimizer(model.parameters(), config["optimizer"])
+        optimizer = build_optimizer(model, config["optimizer"])
         scheduler = build_scheduler(optimizer, config["scheduler"])
         writer = SummaryWriter(log_dir=str(tensorboard_dir))
+
+        def persist_run_epoch_metrics(epoch_metrics: dict[str, float]) -> None:
+            all_epoch_rows.append({"fold": fold_index, **epoch_metrics})
+            save_csv(run_dir / "epoch_metrics.csv", all_epoch_rows)
 
         trainer = Trainer(
             model=model,
@@ -453,10 +671,13 @@ def main() -> None:
             fold_dir=Path(fold_dir),
             data_config={**data_cfg, **patching_cfg},
             augmentations_config=augmentations_cfg,
-            val_original_records=val_originals,
+            val_original_records=full_image_val_originals,
             tensorboard_writer=writer,
             fold_index=fold_index,
             segmentation_config=config.get("segmentation", {}),
+            join_masks_config=join_masks_cfg,
+            validation_config=validation_cfg,
+            epoch_metrics_callback=persist_run_epoch_metrics,
         )
         fold_result = trainer.fit(
             None,
@@ -466,7 +687,7 @@ def main() -> None:
         )
         writer.close()
         if test_originals and bool(config.get("test_evaluation", {}).get("enabled", True)):
-            from src.test_evaluation import run_test_evaluation
+            from src.inference.test_evaluation import run_test_evaluation
 
             best_checkpoint_path = fold_dir / "best.pt"
             evaluation_dir = run_dir / "test-evaluation"
@@ -490,14 +711,15 @@ def main() -> None:
                 evaluation_dir,
             )
         fold_result["fold"] = fold_index
-        fold_result["num_train_patches"] = len(train_patch_records)
+        fold_result["num_train_patches"] = len(combined_train_patch_records)
+        fold_result["num_train_fives_patches"] = len(fives_patch_records)
         fold_result["num_val_patches"] = len(val_patch_records)
         fold_result["num_test_patches"] = len(test_patch_records)
         fold_result["num_train_normal_patches"] = sum(
-            1 for record in train_patch_records if record.scale_label == "normal"
+            1 for record in combined_train_patch_records if record.scale_label == "normal"
         )
         fold_result["num_train_scaled_context_patches"] = sum(
-            1 for record in train_patch_records if record.scale_label == "scaled_context"
+            1 for record in combined_train_patch_records if record.scale_label == "scaled_context"
         )
         fold_result["num_val_normal_patches"] = sum(
             1 for record in val_patch_records if record.scale_label == "normal"
@@ -506,9 +728,12 @@ def main() -> None:
             1 for record in test_patch_records if record.scale_label == "normal"
         )
         fold_results.append(fold_result)
-        all_epoch_rows.extend(
-            {"fold": fold_index, **row}
-            for row in fold_result["history"]
+        save_csv(
+            run_dir / "fold_metrics.csv",
+            [
+                {key: value for key, value in item.items() if key != "history"}
+                for item in fold_results
+            ],
         )
 
     val_dice_per_patch_values = [float(item["val_dice_per_patch"]) for item in fold_results]
@@ -524,6 +749,12 @@ def main() -> None:
     )
     val_iou_per_image_mean, val_iou_per_image_std = _collect_optional_metric(
         [item.get("val_iou_per_image") for item in fold_results]
+    )
+    val_cldice_per_image_mean, val_cldice_per_image_std = _collect_optional_metric(
+        [item.get("val_cldice_per_image") for item in fold_results]
+    )
+    val_dice_cldice_per_image_mean, val_dice_cldice_per_image_std = _collect_optional_metric(
+        [item.get("val_dice_cldice_per_image") for item in fold_results]
     )
     test_dice_per_patch_mean, test_dice_per_patch_std = _collect_optional_metric(
         [item.get("test_dice_per_patch") for item in fold_results]
@@ -547,8 +778,7 @@ def main() -> None:
         "project": project_name,
         "run_dir": str(run_dir),
         "split_mode": split_mode,
-        "segmentation_target": config.get("segmentation", {}).get("target", "legacy"),
-        "mask_dir": str(mask_dir),
+        **segmentation_summary_metadata(config, mask_dir),
         "folds": fold_results,
         "mean_dice_per_patch": statistics.mean(val_dice_per_patch_values),
         "std_dice_per_patch": (
@@ -578,6 +808,10 @@ def main() -> None:
         "std_dice_per_image": val_dice_per_image_std,
         "mean_iou_per_image": val_iou_per_image_mean,
         "std_iou_per_image": val_iou_per_image_std,
+        "mean_cldice_per_image": val_cldice_per_image_mean,
+        "std_cldice_per_image": val_cldice_per_image_std,
+        "mean_dice_cldice_per_image": val_dice_cldice_per_image_mean,
+        "std_dice_cldice_per_image": val_dice_cldice_per_image_std,
         "mean_test_dice_per_patch": test_dice_per_patch_mean,
         "std_test_dice_per_patch": test_dice_per_patch_std,
         "mean_test_iou_per_patch": test_iou_per_patch_mean,
@@ -600,7 +834,7 @@ def main() -> None:
 
     qualitative_cfg = config.get("qualitative_evaluation", {})
     if bool(qualitative_cfg.get("enabled", False)):
-        from src.qualitative_evaluation import run_qualitative_evaluation
+        from src.inference.qualitative_evaluation import run_qualitative_evaluation
 
         qualitative_result = run_qualitative_evaluation(
             run_dir=run_dir,

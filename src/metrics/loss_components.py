@@ -5,33 +5,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from src.metrics.segmentation import soft_cldice_scores_from_probabilities
+
 
 def _flatten_batch(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.reshape(tensor.shape[0], -1).float()
-
-
-def _soft_erode(mask: torch.Tensor) -> torch.Tensor:
-    eroded_y = -F.max_pool2d(-mask, kernel_size=(3, 1), stride=1, padding=(1, 0))
-    eroded_x = -F.max_pool2d(-mask, kernel_size=(1, 3), stride=1, padding=(0, 1))
-    return torch.minimum(eroded_x, eroded_y)
-
-
-def _soft_dilate(mask: torch.Tensor) -> torch.Tensor:
-    return F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
-
-
-def _soft_open(mask: torch.Tensor) -> torch.Tensor:
-    return _soft_dilate(_soft_erode(mask))
-
-
-def _soft_skeletonize(mask: torch.Tensor, iterations: int) -> torch.Tensor:
-    mask = mask.float().clamp(0.0, 1.0)
-    skeleton = F.relu(mask - _soft_open(mask))
-    for _ in range(max(0, iterations - 1)):
-        mask = _soft_erode(mask)
-        delta = F.relu(mask - _soft_open(mask))
-        skeleton = skeleton + F.relu(delta - skeleton * delta)
-    return skeleton
 
 
 def soft_dice_score(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
@@ -50,25 +28,12 @@ def soft_cldice_score(
     smooth: float = 1.0,
 ) -> torch.Tensor:
     probabilities = torch.sigmoid(logits).float()
-    targets = targets.float()
-    prediction_skeleton = _soft_skeletonize(probabilities, iterations)
-    target_skeleton = _soft_skeletonize(targets, iterations)
-
-    prediction_skeleton = _flatten_batch(prediction_skeleton)
-    target_skeleton = _flatten_batch(target_skeleton)
-    probabilities = _flatten_batch(probabilities)
-    targets = _flatten_batch(targets)
-
-    topology_precision = ((prediction_skeleton * targets).sum(dim=1) + smooth) / (
-        prediction_skeleton.sum(dim=1) + smooth
-    )
-    topology_sensitivity = ((target_skeleton * probabilities).sum(dim=1) + smooth) / (
-        target_skeleton.sum(dim=1) + smooth
-    )
-    cldice = (2.0 * topology_precision * topology_sensitivity + smooth) / (
-        topology_precision + topology_sensitivity + smooth
-    )
-    return cldice.mean()
+    return soft_cldice_scores_from_probabilities(
+        probabilities,
+        targets.float(),
+        iterations=iterations,
+        smooth=smooth,
+    ).mean()
 
 
 def tversky_index(
@@ -90,10 +55,31 @@ def tversky_index(
     return score.mean()
 
 
-def loss_component_metrics(logits: torch.Tensor, targets: torch.Tensor, config: dict[str, Any]) -> dict[str, float]:
+def loss_component_metrics(
+    logits: torch.Tensor, targets: torch.Tensor, config: dict[str, Any],
+    geometry_weights: torch.Tensor | None = None,
+) -> dict[str, float]:
     loss_name = str(config.get("name", "")).strip().lower()
     metrics: dict[str, float] = {}
     smooth = float(config.get("smooth", 1e-6))
+
+    if loss_name == "multiclass_geometry_ce_dice_loci_cldice":
+        from src.losses.combined import MulticlassGeometryCEDiceLociCLDiceLoss
+
+        loss = MulticlassGeometryCEDiceLociCLDiceLoss(
+            geometry_aware_ce_weight=float(config.get("geometry_aware_ce_weight", 0.25)),
+            dice_weight=float(config.get("dice_weight", 0.55)),
+            soft_cldice_weight=float(config.get("soft_cldice_weight", 0.20)),
+            iterations=int(config.get("iterations", 30)),
+            smooth=smooth,
+            cldice_smooth=float(config.get("cldice_smooth", 1.0)),
+        )
+        parts = loss.components(logits, targets, geometry_weights)
+        return {
+            "geometry_aware_cross_entropy": float(parts["geometry_aware_ce"].item()),
+            "multiclass_dice_loss": float(parts["dice"].item()),
+            "loci_soft_cldice_loss": float(parts["loci_cldice"].item()),
+        }
 
     if loss_name == "multiclass_ce_dice_loci_cldice":
         from src.losses.combined import MulticlassCEDiceLociCLDiceLoss

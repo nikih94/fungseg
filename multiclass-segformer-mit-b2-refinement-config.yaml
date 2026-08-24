@@ -1,8 +1,13 @@
 project:
-  name: fungi_segmentation
+  name: fungi_multiclass_segmentation_segformer_mit_b2_refinement
 
 segmentation:
-  target: loci
+  mode: multiclass
+  classes:
+    background: 0
+    loci: 1
+    inoculum: 2
+  overlap_precedence: inoculum
 
 paths:
   images_dir: data/images
@@ -12,6 +17,11 @@ paths:
   runs_dir: runs
   outputs_dir: outputs
 
+join_masks:
+  enabled: true
+  masks_dir: data/join_masks
+  merge_with_loci: true
+
 data:
   image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
   use_fives: false
@@ -19,13 +29,13 @@ data:
   persistent_workers: false
   prefetch_factor: 4
   pin_memory: true
-  batch_size: 8
+  batch_size: 4
   image_size: null
 
 patching:
-  patch_size: 512 #512
-  overlap: 256 #256
-  stride: 256 #256
+  patch_size: 1024 # 512 #512
+  overlap: 256
+  stride: 768 #384 #256
   filter_empty_patches: true
   mask_threshold: 127
   min_foreground_pixels: 128
@@ -34,11 +44,11 @@ patching:
   train:
     random_offset:
       enabled: true
-      max_fraction_of_patch: 0.5
+      max_fraction_of_patch: 0.4
     scaled_context:
       enabled: true
-      probability: 0.3
-      max_scale: 2.0
+      probability: 0.4
+      max_scale: 4.0
       beta_alpha: 1.0
       beta_beta: 2.0
       containment_filter:
@@ -50,6 +60,19 @@ patching:
       enabled: false
     scaled_context:
       enabled: false
+
+validation:
+  fast:
+    foreground_only: true
+    overlap: 0
+  full_image:
+    enabled: false
+    interval_epochs: 1
+    selection: all
+    max_images: null
+    monitor:
+      dice_weight: 0.5
+      cldice_weight: 0.5
 
 
 augmentations:
@@ -96,27 +119,30 @@ split:
   val_source_ids: []
 
 model:
-  name: unetplusplus_resnet34
+  name: segformer_mit_b2_refinement
   in_channels: 3
-  num_classes: 1
-  encoder_name: resnet34
+  num_classes: 3
+  encoder_name: mit_b2
   encoder_weights: imagenet
-  decoder_normalization: batchnorm
-  decoder_channels: [256, 128, 64, 32, 16]
-  decoder_attention_type: null # set to scse to enable SMP scSE attention in the decoder, null for no attention
+  encoder_depth: 5
+  decoder_segmentation_channels: 256
+  shallow_channels: [16, 32]
+  refine_half_channels: [128, 64]
+  refine_full_channels: [32, 32]
 
 loss:
-  name: bce_dice_cldice
-  bce_weight: 0
+  name: multiclass_ce_dice_loci_cldice
+  cross_entropy_weight: 0.15
   dice_weight: 0.5
-  soft_cldice_weight: 0.5
+  loci_cldice_weight: 0.35
   iterations: 30
   smooth: 1.0e-6
   cldice_smooth: 1.0
 
 optimizer:
   name: adamw
-  lr: 0.0001
+  encoder_lr: 1.0e-5
+  decoder_lr: 1.0e-4
   weight_decay: 0.0001
 
 scheduler:
@@ -124,8 +150,10 @@ scheduler:
   mode: max
   factor: 0.5
   patience: 7
-  min_lr: 1.0e-6
-  monitor: val_dice_cldice_per_image
+  min_lr:
+    encoder: 1.0e-7
+    decoder: 1.0e-6
+  monitor: val_dice_per_patch
 
 
 
@@ -133,30 +161,23 @@ train:
   epochs: 80
   mixed_precision: true
   grad_clip: 1.0
-  monitor: val_dice_cldice_per_image
+  monitor: val_dice_per_patch
   monitor_mode: max
-  full_image_monitor:
-    dice_weight: 0.5
-    cldice_weight: 0.5
   best_interval_checkpoint:
     enabled: true
     interval_epochs: 10
   threshold: 0.5
-  enable_per_image_validation: true
-  per_image_validation_interval: 1
   seed: 42
   device: auto
   use_tqdm: true
 
 inference:
-  threshold: 0.5
+  decision: argmax
   save_probabilities: true
 
 test_evaluation:
   enabled: true
-  threshold_start: 0.5
-  threshold_stop: 1.0
-  threshold_step: 0.01
+  threshold_sweep: false
 
 qualitative_evaluation:
   enabled: true

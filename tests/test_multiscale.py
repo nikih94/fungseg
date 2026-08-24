@@ -10,8 +10,11 @@ import numpy as np
 import yaml
 from PIL import Image
 
+from src.patching.core import _filter_contained_patch_records
+
 from src.patching import (
     OriginalImageRecord,
+    PatchRecord,
     _compute_positions,
     build_patch_records,
     compute_shifted_positions,
@@ -72,6 +75,57 @@ class DynamicPatchingTests(unittest.TestCase):
         self.assertEqual([(item.x, item.y, item.scale) for item in first], [(item.x, item.y, item.scale) for item in second])
         self.assertNotEqual([(item.x, item.y, item.scale) for item in first], [(item.x, item.y, item.scale) for item in different])
 
+    def test_containment_filter_removes_covered_scaled_patches(self) -> None:
+        def patch(x: int, scale: float, label: str) -> PatchRecord:
+            return PatchRecord(
+                source_id="image.tif",
+                image_path=Path("image.tif"),
+                mask_path=Path("mask.png"),
+                x=x,
+                y=x,
+                patch_size=256,
+                scale=scale,
+                scaled_width=2048,
+                scaled_height=2048,
+                scale_label=label,
+                source_crop_size=int(round(256 * scale)),
+            )
+
+        normal = patch(384, 1.0, "normal")
+        covered_scaled = patch(384, 2.0, "scaled_context")
+        covering_scaled = patch(384, 4.0, "scaled_context")
+        separate_scaled = patch(1280, 2.0, "scaled_context")
+        records = [normal, covered_scaled, covering_scaled, separate_scaled]
+        phase_config = {
+            "scaled_context": {
+                "containment_filter": {
+                    "enabled": True,
+                    "threshold": 0.8,
+                    "preserve_normal_patches": True,
+                }
+            }
+        }
+
+        filtered = _filter_contained_patch_records(records, phase_config)
+
+        self.assertEqual(filtered, [normal, covering_scaled, separate_scaled])
+
+        phase_config["scaled_context"]["containment_filter"][
+            "preserve_normal_patches"
+        ] = False
+        filtered_without_normal_preservation = _filter_contained_patch_records(
+            records, phase_config
+        )
+        phase_config["scaled_context"]["containment_filter"]["threshold"] = 0.0
+        with self.assertRaisesRegex(ValueError, "must be in"):
+            _filter_contained_patch_records(records, phase_config)
+
+        self.assertEqual(
+            filtered_without_normal_preservation,
+            [covering_scaled, separate_scaled],
+        )
+
+
     def test_scaled_context_distribution_and_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             record = _write_pair(Path(tmp), width=4096, height=4096)
@@ -130,6 +184,8 @@ class DynamicPatchingTests(unittest.TestCase):
             Image.fromarray(image).save(images_dir / "sample.tif")
             Image.fromarray(mask).save(masks_dir / "sample.png")
             config_path = root / "config.yaml"
+            patching_config = yaml.safe_load(yaml.safe_dump(PATCHING_CONFIG))
+            patching_config["train"]["scaled_context"]["max_scale"] = 4.0
             config = {
                 "project": {"name": "test"},
                 "paths": {
@@ -138,7 +194,7 @@ class DynamicPatchingTests(unittest.TestCase):
                     "outputs_dir": str(root / "outputs"),
                 },
                 "data": {"image_extensions": [".tif"], "num_workers": 0, "batch_size": 1},
-                "patching": PATCHING_CONFIG,
+                "patching": patching_config,
                 "train": {"seed": 7},
             }
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -153,9 +209,11 @@ class DynamicPatchingTests(unittest.TestCase):
 
         self.assertIn("Images matched: 1", result.stdout)
         self.assertIn("Scaled-context patches:", result.stdout)
+        self.assertIn("Containment filter:", result.stdout)
+        self.assertIn("Containment-filtered patches:", result.stdout)
         self.assertIn("Patches by source and source-crop resolution:", result.stdout)
         self.assertIn("<=256", result.stdout)
-        self.assertIn("<=512", result.stdout)
+        self.assertIn("<=1024", result.stdout)
         self.assertIn("percent", result.stdout)
         self.assertIn("100.0%", result.stdout)
 

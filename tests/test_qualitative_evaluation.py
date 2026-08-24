@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from src.qualitative_evaluation import (
+from src.inference.qualitative_evaluation import (
     CheckpointEntry,
     SelectedCrop,
     _cross_fold_checkpoint_entries,
@@ -36,6 +36,25 @@ class QualitativeEvaluationTests(unittest.TestCase):
         )
 
         self.assertEqual((crop.width, crop.height), (512, 512))
+        self.assertGreaterEqual(crop.foreground_ratio, 0.005)
+        self.assertLessEqual(crop.foreground_ratio, 0.15)
+        self.assertEqual(crop.selection_reason, "in_range")
+
+    def test_selects_multiclass_class_id_foreground_with_zero_threshold(self) -> None:
+        mask = np.zeros((768, 768), dtype=np.uint8)
+        mask[180:260, 180:260] = 1
+        mask[300:360, 300:380] = 2
+
+        crop = select_qualitative_crop(
+            mask_array=mask,
+            patch_size=256,
+            stride=128,
+            crop_patch_grid=(3, 3),
+            mask_threshold=0,
+            min_foreground_ratio=0.005,
+            max_foreground_ratio=0.15,
+        )
+
         self.assertGreaterEqual(crop.foreground_ratio, 0.005)
         self.assertLessEqual(crop.foreground_ratio, 0.15)
         self.assertEqual(crop.selection_reason, "in_range")
@@ -103,6 +122,7 @@ class QualitativeEvaluationTests(unittest.TestCase):
             for stem in ["train_image", "val_image", "test_image"]:
                 (images_dir / f"{stem}.tif").write_bytes(b"image")
                 (masks_dir / f"{stem}.png").write_bytes(b"mask")
+            (images_dir / "awaiting_mask.tif").write_bytes(b"image")
             split_path = root / "image_splits.csv"
             split_path.write_text(
                 "\n".join(
@@ -111,6 +131,8 @@ class QualitativeEvaluationTests(unittest.TestCase):
                         "train_image.tif,train",
                         "val_image.tif,validation",
                         "test_image.tif,test",
+                        "awaiting_mask.tif,train",
+                        "future_image.tif,test",
                     ]
                 ),
                 encoding="utf-8",
@@ -126,9 +148,10 @@ class QualitativeEvaluationTests(unittest.TestCase):
                 "qualitative_evaluation": {"data_root": None, "split": "test"},
             }
 
-            pairs, diagnostics, source = resolve_qualitative_pairs(config, data_root=None)
+            with self.assertWarnsRegex(RuntimeWarning, "awaiting_mask.tif"):
+                pairs, diagnostics, source = resolve_qualitative_pairs(config, data_root=None)
 
-        self.assertEqual(diagnostics, {"missing_masks": [], "missing_images": []})
+        self.assertEqual(diagnostics, {"missing_masks": ["awaiting_mask"], "missing_images": []})
         self.assertEqual(source, "split:test")
         self.assertEqual([image_path.name for image_path, _ in pairs], ["test_image.tif"])
 

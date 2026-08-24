@@ -9,7 +9,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-from src.test_evaluation import default_config_path, run_test_evaluation, threshold_values
+from src.inference.test_evaluation import (
+    _BINARY_OVERLAY_COLORS,
+    create_test_evaluation_overlay,
+    default_config_path,
+    run_test_evaluation,
+    threshold_values,
+)
 
 
 class TestEvaluationTests(unittest.TestCase):
@@ -85,6 +91,60 @@ class TestEvaluationTests(unittest.TestCase):
             self.assertEqual(len(threshold_rows), 51)
             self.assertEqual(threshold_rows[0]["threshold"], "0.5")
             self.assertEqual(threshold_rows[-1]["threshold"], "1.0")
+
+    def test_binary_overlay_distinguishes_ground_truth_prediction_and_overlap(self) -> None:
+        image = np.zeros((2, 4, 3), dtype=np.uint8)
+        target = np.array([[0, 1, 0, 1], [0, 0, 0, 0]], dtype=np.uint8)
+        prediction = np.array([[0, 0, 255, 255], [0, 0, 0, 0]], dtype=np.uint8)
+
+        overlay = create_test_evaluation_overlay(
+            image, target, prediction, multiclass=False, include_legend=False
+        )
+
+        expected_scale = 0.65
+        np.testing.assert_array_equal(overlay[0, 0], image[0, 0])
+        np.testing.assert_array_equal(
+            overlay[0, 1],
+            (_BINARY_OVERLAY_COLORS["Ground truth only"] * expected_scale).astype(np.uint8),
+        )
+        np.testing.assert_array_equal(
+            overlay[0, 2],
+            (_BINARY_OVERLAY_COLORS["Prediction only"] * expected_scale).astype(np.uint8),
+        )
+        np.testing.assert_array_equal(
+            overlay[0, 3],
+            (_BINARY_OVERLAY_COLORS["Correct overlap"] * expected_scale).astype(np.uint8),
+        )
+
+    def test_binary_overlay_includes_bottom_right_legend(self) -> None:
+        image = np.zeros((120, 240, 3), dtype=np.uint8)
+        mask = np.zeros((120, 240), dtype=np.uint8)
+
+        overlay = create_test_evaluation_overlay(image, mask, mask, multiclass=False)
+
+        self.assertTrue(np.any(overlay[-50:, -180:] != 0))
+
+    def test_skips_incomplete_and_absent_future_csv_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._make_config(root)
+            Image.fromarray(np.zeros((4, 5, 3), dtype=np.uint8)).save(
+                root / "images" / "awaiting_mask.png"
+            )
+            with (root / "splits.csv").open("a", encoding="utf-8") as handle:
+                handle.write("awaiting_mask.png,train\nfuture_image.png,test\n")
+
+            with self.assertWarnsRegex(RuntimeWarning, "awaiting_mask"):
+                result = run_test_evaluation(
+                    root / "best.pt",
+                    config,
+                    root / "test-evaluation",
+                    torch.device("cpu"),
+                    model=torch.nn.Identity(),
+                    predictor=lambda *_: np.zeros((4, 5), dtype=np.float32),
+                )
+
+        self.assertEqual(result["num_test_images"], 1)
 
     def test_threshold_defaults_include_both_endpoints(self) -> None:
         values = threshold_values({"test_evaluation": {"threshold_start": 0.5, "threshold_stop": 1.0, "threshold_step": 0.01}})

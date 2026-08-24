@@ -70,7 +70,7 @@ def evaluate_other_test_data(
 ) -> int:
     from tqdm.auto import tqdm
 
-    from src.inference import resolve_device, run_inference_on_image, save_rgb_image
+    from src.inference.core import resolve_device, run_inference_on_image, save_rgb_image
     from src.models.factory import build_model
     from src.utils.checkpoint import load_checkpoint
     from src.utils.config import load_config
