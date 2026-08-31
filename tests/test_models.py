@@ -196,6 +196,7 @@ class ModelFactoryTests(unittest.TestCase):
             config["validation"]["full_image"],
             {
                 "enabled": False,
+                "batch_size": 1,
                 "interval_epochs": 1,
                 "selection": "smallest_area",
                 "max_images": 3,

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+import numpy as np
 import torch
 import torch.nn.functional as F
+from skimage.morphology import skeletonize
 
 
 # PyTorch core does not currently ship Dice/IoU segmentation metrics,
@@ -38,25 +42,8 @@ def _soft_open(mask: torch.Tensor) -> torch.Tensor:
     return F.max_pool2d(eroded, kernel_size=3, stride=1, padding=1)
 
 
-def _hard_erode(mask: torch.Tensor) -> torch.Tensor:
-    eroded_y = -F.max_pool2d(
-        -F.pad(mask, (0, 0, 1, 1), value=0.0),
-        kernel_size=(3, 1),
-        stride=1,
-    )
-    eroded_x = -F.max_pool2d(
-        -F.pad(mask, (1, 1, 0, 0), value=0.0),
-        kernel_size=(1, 3),
-        stride=1,
-    )
-    return torch.minimum(eroded_x, eroded_y)
-
-
-def _hard_open(mask: torch.Tensor) -> torch.Tensor:
-    return F.max_pool2d(_hard_erode(mask), kernel_size=3, stride=1, padding=1)
-
-
-def _soft_skeletonize(mask: torch.Tensor, iterations: int) -> torch.Tensor:
+def soft_skeletonize(mask: torch.Tensor, iterations: int) -> torch.Tensor:
+    """Return the differentiable morphological skeleton used by soft-clDice."""
     mask = mask.float().clamp(0.0, 1.0)
     skeleton = F.relu(mask - _soft_open(mask))
     for _ in range(max(0, iterations)):
@@ -94,34 +81,82 @@ def _cldice_from_skeletons(
 def soft_cldice_scores_from_probabilities(
     predictions: torch.Tensor,
     targets: torch.Tensor,
-    iterations: int = 3,
+    iterations: int | Sequence[int] | torch.Tensor = 3,
     smooth: float = 1.0,
 ) -> torch.Tensor:
     """Return differentiable per-sample clDice scores for normalized predictions."""
     predictions = _as_nchw(predictions)
     targets = _as_nchw(targets)
+    if not isinstance(iterations, int):
+        values = (
+            iterations.detach().cpu().reshape(-1).tolist()
+            if isinstance(iterations, torch.Tensor)
+            else list(iterations)
+        )
+        values = [int(value) for value in values]
+        if len(values) != predictions.shape[0]:
+            raise ValueError(
+                "Per-sample Soft-clDice iterations must match the batch size: "
+                f"iterations={len(values)}, batch={predictions.shape[0]}."
+            )
+        if any(value < 0 for value in values):
+            raise ValueError("Soft-clDice iterations must be non-negative.")
+        scores: list[torch.Tensor | None] = [None] * len(values)
+        for value in sorted(set(values)):
+            indices = [index for index, item in enumerate(values) if item == value]
+            group_scores = soft_cldice_scores_from_probabilities(
+                predictions[indices],
+                targets[indices],
+                iterations=value,
+                smooth=smooth,
+            )
+            for index, score in zip(indices, group_scores):
+                scores[index] = score
+        return torch.stack([score for score in scores if score is not None])
     return _cldice_from_skeletons(
-        _soft_skeletonize(predictions, iterations),
-        _soft_skeletonize(targets, iterations),
+        soft_skeletonize(predictions, iterations),
+        soft_skeletonize(targets, iterations),
         predictions,
         targets,
         smooth,
     )
 
 
-def _hard_skeletonize(mask: torch.Tensor) -> torch.Tensor:
-    # Morphologically skeletonize binary masks until erosion converges.
-    mask = (_as_nchw(mask) > 0.5).float()
-    skeleton = torch.zeros_like(mask)
-    max_iterations = max(mask.shape[-2:])
-    for _ in range(max_iterations):
-        delta = F.relu(mask - _hard_open(mask))
-        skeleton = skeleton + F.relu(delta - skeleton * delta)
-        eroded = _hard_erode(mask)
-        if not bool(eroded.any()):
-            return skeleton
-        mask = eroded
-    return skeleton + F.relu(mask - skeleton * mask)
+def hard_skeletonize_masks(mask: torch.Tensor) -> torch.Tensor:
+    """Return paper-reference Zhang skeletons for independent binary masks.
+
+    scikit-image runs on CPU. The returned NCHW boolean tensor is moved back to
+    the input device so callers that score GPU-resident patch masks remain
+    device-compatible.
+    """
+    prepared = _as_nchw(mask)
+    binary = prepared.detach().cpu().numpy() > 0.5
+    skeletons = np.empty_like(binary, dtype=np.bool_)
+    for batch_index in range(binary.shape[0]):
+        for channel_index in range(binary.shape[1]):
+            skeletons[batch_index, channel_index] = skeletonize(
+                binary[batch_index, channel_index],
+                method="zhang",
+            )
+    return torch.from_numpy(skeletons).to(device=prepared.device)
+
+
+def cldice_score_from_skeletons(
+    prediction_skeleton: torch.Tensor,
+    target_skeleton: torch.Tensor,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    smooth: float = 1e-6,
+) -> float:
+    """Return hard clDice using caller-supplied skeletons."""
+    score = _cldice_from_skeletons(
+        prediction_skeleton,
+        target_skeleton,
+        _as_nchw(predictions),
+        _as_nchw(targets),
+        smooth,
+    )
+    return float(score.mean().item())
 
 
 def dice_score_from_masks(
@@ -228,17 +263,27 @@ def cldice_score_from_masks(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     smooth: float = 1e-6,
+    *,
+    prediction_skeleton: torch.Tensor | None = None,
+    target_skeleton: torch.Tensor | None = None,
 ) -> float:
     predictions = _as_nchw(predictions)
     targets = _as_nchw(targets)
-    cldice = _cldice_from_skeletons(
-        _hard_skeletonize(predictions),
-        _hard_skeletonize(targets),
+    if prediction_skeleton is None:
+        prediction_skeleton = hard_skeletonize_masks(predictions)
+    else:
+        prediction_skeleton = _as_nchw(prediction_skeleton).to(predictions.device)
+    if target_skeleton is None:
+        target_skeleton = hard_skeletonize_masks(targets)
+    else:
+        target_skeleton = _as_nchw(target_skeleton).to(targets.device)
+    return cldice_score_from_skeletons(
+        prediction_skeleton,
+        target_skeleton,
         predictions,
         targets,
         smooth,
     )
-    return float(cldice.mean().item())
 
 
 def multiclass_predictions(logits: torch.Tensor) -> torch.Tensor:
@@ -250,6 +295,8 @@ def multiclass_metrics_from_masks(
     targets: torch.Tensor,
     class_names: dict[str, int] | None = None,
     smooth: float = 1e-6,
+    *,
+    loci_target_skeleton: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Return per-class and foreground-macro metrics for class-index masks."""
     classes = class_names or {"loci": 1, "inoculum": 2}
@@ -285,7 +332,9 @@ def multiclass_metrics_from_masks(
     metrics["iou_macro_foreground"] = macro_present(iou_values, valid_values)
     loci_id = classes.get("loci", 1)
     metrics["cldice_loci"] = cldice_score_from_masks(
-        (predictions == loci_id).float(), (targets == loci_id).float()
+        (predictions == loci_id).float(),
+        (targets == loci_id).float(),
+        target_skeleton=loci_target_skeleton,
     )
     return metrics
 

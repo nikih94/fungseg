@@ -62,9 +62,16 @@ class BCEDiceSoftCLDiceLoss(nn.Module):
             smooth=cldice_smooth,
         )
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        soft_cldice_iterations: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         bce_dice_loss = self.bce_dice(logits, targets)
-        soft_cldice_loss = self.soft_cldice(logits, targets)
+        soft_cldice_loss = self.soft_cldice(
+            logits, targets, soft_cldice_iterations=soft_cldice_iterations
+        )
         return bce_dice_loss + (self.soft_cldice_weight * soft_cldice_loss)
 
 
@@ -99,12 +106,21 @@ class CLDiceLoss(nn.Module):
         self.iterations = iterations
         self.smooth = smooth
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        soft_cldice_iterations: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         probabilities = _sigmoid_logits(logits)
         cldice_score = soft_cldice_scores_from_probabilities(
             probabilities,
             targets,
-            iterations=self.iterations,
+            iterations=(
+                self.iterations
+                if soft_cldice_iterations is None
+                else soft_cldice_iterations
+            ),
             smooth=self.smooth,
         )
         return 1.0 - cldice_score.mean()
@@ -116,12 +132,21 @@ class SoftCLDiceLoss(nn.Module):
         self.iterations = iterations
         self.smooth = smooth
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        soft_cldice_iterations: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         probabilities = _sigmoid_logits(logits)
         cldice_score = soft_cldice_scores_from_probabilities(
             probabilities,
             targets,
-            iterations=self.iterations,
+            iterations=(
+                self.iterations
+                if soft_cldice_iterations is None
+                else soft_cldice_iterations
+            ),
             smooth=self.smooth,
         )
         return 1.0 - cldice_score.mean()
@@ -144,16 +169,23 @@ class TverskySoftCLDiceLoss(nn.Module):
         self.tversky = TverskyLoss(alpha=alpha, beta=beta, smooth=smooth)
         self.soft_cldice = SoftCLDiceLoss(iterations=iterations, smooth=cldice_smooth)
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        soft_cldice_iterations: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         tversky_loss = self.tversky(logits, targets)
-        soft_cldice_loss = self.soft_cldice(logits, targets)
+        soft_cldice_loss = self.soft_cldice(
+            logits, targets, soft_cldice_iterations=soft_cldice_iterations
+        )
         return (self.tversky_weight * tversky_loss) + (self.soft_cldice_weight * soft_cldice_loss)
 
 
 def soft_cldice_from_probabilities(
     probabilities: torch.Tensor,
     targets: torch.Tensor,
-    iterations: int = 3,
+    iterations: int | torch.Tensor = 3,
     smooth: float = 1.0,
 ) -> torch.Tensor:
     """Differentiable clDice loss for probabilities that are already normalized."""
@@ -187,7 +219,12 @@ class MulticlassCEDiceLociCLDiceLoss(nn.Module):
         denominator = probabilities.sum(dim=1) + targets.sum(dim=1)
         return 1.0 - ((2.0 * intersection + self.smooth) / (denominator + self.smooth)).mean()
 
-    def components(self, logits: torch.Tensor, targets: torch.Tensor) -> dict[str, torch.Tensor]:
+    def components(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        soft_cldice_iterations: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         # Autocast promotes cross-entropy during the training loss, but diagnostics
         # call this method outside autocast. A large FP16 reduction can overflow
         # even for finite logits, so keep all multiclass loss components in FP32.
@@ -204,12 +241,24 @@ class MulticlassCEDiceLociCLDiceLoss(nn.Module):
             + self._dice_loss(p_inoculum, y_inoculum)
         )
         loci_cldice = soft_cldice_from_probabilities(
-            p_loci, y_loci, iterations=self.iterations, smooth=self.cldice_smooth
+            p_loci,
+            y_loci,
+            iterations=(
+                self.iterations
+                if soft_cldice_iterations is None
+                else soft_cldice_iterations
+            ),
+            smooth=self.cldice_smooth,
         )
         return {"cross_entropy": ce, "dice": dice, "loci_cldice": loci_cldice}
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        parts = self.components(logits, targets)
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        soft_cldice_iterations: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        parts = self.components(logits, targets, soft_cldice_iterations)
         return (
             self.cross_entropy_weight * parts["cross_entropy"]
             + self.dice_weight * parts["dice"]
@@ -243,6 +292,7 @@ class MulticlassGeometryCEDiceLociCLDiceLoss(MulticlassCEDiceLociCLDiceLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
         geometry_weights: torch.Tensor | None = None,
+        soft_cldice_iterations: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if geometry_weights is None:
             raise ValueError("Geometry-aware cross-entropy requires geometry weights.")
@@ -275,7 +325,14 @@ class MulticlassGeometryCEDiceLociCLDiceLoss(MulticlassCEDiceLociCLDiceLoss):
             + self._dice_loss(p_inoculum, y_inoculum)
         )
         loci_cldice = soft_cldice_from_probabilities(
-            p_loci, y_loci, iterations=self.iterations, smooth=self.cldice_smooth
+            p_loci,
+            y_loci,
+            iterations=(
+                self.iterations
+                if soft_cldice_iterations is None
+                else soft_cldice_iterations
+            ),
+            smooth=self.cldice_smooth,
         )
         return {
             "geometry_aware_ce": geometry_ce,
@@ -288,8 +345,11 @@ class MulticlassGeometryCEDiceLociCLDiceLoss(MulticlassCEDiceLociCLDiceLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
         geometry_weights: torch.Tensor | None = None,
+        soft_cldice_iterations: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        parts = self.components(logits, targets, geometry_weights)
+        parts = self.components(
+            logits, targets, geometry_weights, soft_cldice_iterations
+        )
         return (
             self.geometry_aware_ce_weight * parts["geometry_aware_ce"]
             + self.dice_weight * parts["dice"]

@@ -133,6 +133,8 @@ class SegmentationPatchDataset(Dataset):
         segmentation_mode: str = "binary",
         target_weight_builder: Callable[[torch.Tensor], torch.Tensor] | None = None,
         merge_join_masks: bool = False,
+        soft_cldice_iterations: dict[str, int] | None = None,
+        default_soft_cldice_iterations: int = 0,
     ) -> None:
         self.records = records
         self.mask_threshold = mask_threshold
@@ -142,6 +144,8 @@ class SegmentationPatchDataset(Dataset):
         self.segmentation_mode = str(segmentation_mode).lower()
         self.target_weight_builder = target_weight_builder
         self.merge_join_masks = bool(merge_join_masks)
+        self.soft_cldice_iterations = soft_cldice_iterations
+        self.default_soft_cldice_iterations = int(default_soft_cldice_iterations)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -226,9 +230,17 @@ class SegmentationPatchDataset(Dataset):
             "scaled_height": record.scaled_height,
             "resolution_bucket": record.resolution_bucket,
             "scale_label": record.scale_label,
+            "foreground_pixels": record.foreground_pixels,
+            "is_background_only": record.is_background_only,
             "source_crop_size": record.source_crop_size or record.patch_size,
             **overlap,
         }
         if self.target_weight_builder is not None:
             sample["loss_weight"] = self.target_weight_builder(mask_tensor).float()
+        if self.soft_cldice_iterations is not None:
+            sample["soft_cldice_iterations"] = int(
+                self.soft_cldice_iterations.get(
+                    record.source_id, self.default_soft_cldice_iterations
+                )
+            )
         return sample

@@ -15,11 +15,13 @@ from src.data.discovery import discover_image_mask_pairs, discover_image_mask_se
 from src.data.fives import FivesPatchDataset, load_fives_training_records
 from src.data.folds import (
     SplitDefinition,
+    make_csv_kfold_splits,
     make_csv_train_val_test_split,
     make_grouped_kfold_splits,
     make_manual_train_val_split,
 )
 from src.data.sampling import patch_distribution
+from src.data.soft_cldice_iterations import map_training_iterations_to_sources
 from src.engine.trainer import Trainer
 from src.losses.factory import build_loss
 from src.losses.geometry import build_geometry_weight_map_builder
@@ -34,6 +36,18 @@ from src.utils.seed import set_seed
 
 
 TORCH_SHARING_STRATEGY = "file_system"
+SOFT_CLDICE_LOSS_NAMES = {
+    "bce_dice_cldice",
+    "bce_dice_soft_cldice",
+    "bcedicecldice",
+    "cldice",
+    "soft_cldice",
+    "softcldice",
+    "tversky_soft_cldice",
+    "tversky_softcldice",
+    "multiclass_ce_dice_loci_cldice",
+    "multiclass_geometry_ce_dice_loci_cldice",
+}
 
 
 def configure_torch_multiprocessing() -> str:
@@ -86,6 +100,66 @@ def _collect_optional_metric(values: list[float | None]) -> tuple[float | None, 
     return mean_value, std_value
 
 
+def build_cross_fold_test_summary(fold_results: list[dict]) -> tuple[dict, list[dict], list[dict]]:
+    metric_names = sorted({
+        key
+        for result in fold_results
+        for key, value in result.items()
+        if key.startswith("mean_")
+        and value is not None
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    })
+    fold_rows = [
+        {
+            "fold": int(result["fold"]),
+            "checkpoint": result["checkpoint"],
+            "output_dir": result["output_dir"],
+            "num_test_images": int(result["num_test_images"]),
+            "threshold": result["threshold"],
+            **{metric_name: result.get(metric_name) for metric_name in metric_names},
+        }
+        for result in fold_results
+    ]
+    metric_rows: list[dict] = []
+    metrics: dict[str, dict[str, float | int]] = {}
+    for metric_name in metric_names:
+        values = [
+            float(result[metric_name])
+            for result in fold_results
+            if result.get(metric_name) is not None
+        ]
+        metric_summary = {
+            "mean": statistics.mean(values),
+            "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+            "num_folds": len(values),
+        }
+        metrics[metric_name] = metric_summary
+        metric_rows.append({"metric": metric_name, **metric_summary})
+
+    payload = {
+        "num_folds": len(fold_results),
+        "num_test_images": (
+            int(fold_results[0]["num_test_images"]) if fold_results else 0
+        ),
+        "folds": fold_rows,
+        "metrics": metrics,
+    }
+    return payload, fold_rows, metric_rows
+
+
+def persist_cross_fold_test_summary(
+    output_dir: str | Path,
+    fold_results: list[dict],
+) -> dict:
+    output_dir = ensure_dir(output_dir)
+    payload, fold_rows, metric_rows = build_cross_fold_test_summary(fold_results)
+    save_csv(output_dir / "fold_metrics.csv", fold_rows)
+    save_csv(output_dir / "summary.csv", metric_rows)
+    save_json(output_dir / "summary.json", payload)
+    return payload
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train fungi segmentation with grouped cross-validation.")
     parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
@@ -115,6 +189,16 @@ def build_splits(config: dict, original_records: list) -> tuple[list[SplitDefini
         )
         return [split], split_mode
 
+    if split_mode == "csv_kfold":
+        splits = make_csv_kfold_splits(
+            source_ids,
+            csv_path=split_cfg.get("csv_path", "data/image_splits.csv"),
+            n_splits=int(config["cv"]["n_splits"]),
+            shuffle_groups=bool(config["cv"]["shuffle_groups"]),
+            random_state=int(config["cv"]["random_state"]),
+        )
+        return splits, split_mode
+
     if split_mode == "kfold":
         splits = make_grouped_kfold_splits(
             source_ids,
@@ -143,23 +227,35 @@ def build_splits(config: dict, original_records: list) -> tuple[list[SplitDefini
             ]
         return split_definitions, split_mode
 
-    raise ValueError(f"Unsupported split mode: {split_mode}. Expected 'csv', 'train_val', or 'kfold'.")
+    raise ValueError(
+        f"Unsupported split mode: {split_mode}. Expected 'csv', 'csv_kfold', "
+        "'train_val', or 'kfold'."
+    )
 
 
 def build_fast_validation_patching_config(
     patching_config: dict,
     validation_config: dict,
 ) -> dict:
-    """Build deterministic validation patching settings from the shared patch config."""
+    """Build deterministic fast-validation settings with 50% patch overlap."""
     fast_config = validation_config.get("fast", {})
     patch_size = int(patching_config["patch_size"])
-    overlap = int(fast_config.get("overlap", 0))
     config = deepcopy(patching_config)
+    overlap = patch_size // 2
     config["overlap"] = overlap
-    config["stride"] = patch_size - overlap
+    config["stride"] = overlap
     config["filter_empty_patches"] = bool(
         fast_config.get("foreground_only", True)
     )
+    return config
+
+
+def build_full_image_validation_patching_config(patching_config: dict) -> dict:
+    """Build full-image validation settings with 50% patch overlap."""
+    config = deepcopy(patching_config)
+    overlap = int(config["patch_size"]) // 2
+    config["overlap"] = overlap
+    config["stride"] = overlap
     return config
 
 
@@ -440,6 +536,19 @@ def main() -> None:
             logger.warning("Found %s masks without matching images.", len(diagnostics["missing_images"]))
 
     original_records = build_original_image_records(pairs)
+    iterations_csv = config["loss"].get("iterations_csv")
+    if (
+        iterations_csv
+        and str(config["loss"]["name"]).lower() not in SOFT_CLDICE_LOSS_NAMES
+    ):
+        raise ValueError(
+            "loss.iterations_csv requires a loss that contains Soft-clDice."
+        )
+    soft_cldice_iterations = (
+        map_training_iterations_to_sources(iterations_csv, original_records)
+        if iterations_csv
+        else None
+    )
     fives_patch_records = load_fives_training_records(config)
     splits, split_mode = build_splits(config, original_records)
     manifest_rows = split_manifest_rows(splits)
@@ -459,8 +568,24 @@ def main() -> None:
             len({record.source_id for record in fives_patch_records}),
             len(fives_patch_records),
         )
+    if soft_cldice_iterations is not None:
+        logger.info(
+            "Per-image Soft-clDice iterations enabled | csv=%s | images=%s | "
+            "minimum=%s | maximum=%s",
+            iterations_csv,
+            len(soft_cldice_iterations),
+            min(soft_cldice_iterations.values()),
+            max(soft_cldice_iterations.values()),
+        )
+        if fives_patch_records:
+            logger.info(
+                "FIVES patches use the fixed fallback loss.iterations=%s.",
+                config["loss"]["iterations"],
+            )
 
     fold_results = []
+    fold_test_results: list[dict] = []
+    cross_fold_test_summary: dict | None = None
     all_epoch_rows: list[dict[str, float]] = []
     data_cfg = config["data"]
     patching_cfg = {
@@ -468,6 +593,9 @@ def main() -> None:
         "include_join_masks": merge_join_masks,
     }
     validation_cfg = config["validation"]
+    full_image_validation_patching_cfg = build_full_image_validation_patching_config(
+        patching_cfg
+    )
     fast_validation_patching_cfg = build_fast_validation_patching_config(
         patching_cfg,
         validation_cfg,
@@ -531,15 +659,17 @@ def main() -> None:
             test_patch_records=test_patch_records,
         )
         logger.info(
-            "Fast validation foreground_only=%s | overlap=%s | stride=%s | patches=%s",
+            "Fast validation foreground_only=%s | effective_overlap=%s | stride=%s | patches=%s",
             validation_cfg["fast"]["foreground_only"],
-            validation_cfg["fast"]["overlap"],
+            fast_validation_patching_cfg["overlap"],
             fast_validation_patching_cfg["stride"],
             len(val_patch_records),
         )
         logger.info(
-            "Full-image validation enabled=%s | selection=%s | images=%s/%s | sources=%s",
+            "Validation start_epoch=%s | full_image_enabled=%s | full_image_batch_size=%s | selection=%s | images=%s/%s | sources=%s",
+            validation_cfg["start_epoch"],
             full_image_enabled,
+            validation_cfg["full_image"]["batch_size"],
             validation_cfg["full_image"]["selection"],
             len(full_image_val_originals),
             len(val_originals),
@@ -560,6 +690,8 @@ def main() -> None:
             segmentation_mode=segmentation_mode,
             target_weight_builder=target_weight_builder,
             merge_join_masks=merge_join_masks,
+            soft_cldice_iterations=soft_cldice_iterations,
+            default_soft_cldice_iterations=int(config["loss"]["iterations"]),
         )
         fives_dataset = (
             FivesPatchDataset(
@@ -568,6 +700,10 @@ def main() -> None:
                 transforms=train_transforms,
                 segmentation_mode=segmentation_mode,
                 target_weight_builder=target_weight_builder,
+                soft_cldice_iterations=(
+                    {} if soft_cldice_iterations is not None else None
+                ),
+                default_soft_cldice_iterations=int(config["loss"]["iterations"]),
             )
             if fives_patch_records
             else None
@@ -584,6 +720,8 @@ def main() -> None:
             segmentation_mode=segmentation_mode,
             target_weight_builder=target_weight_builder,
             merge_join_masks=merge_join_masks,
+            soft_cldice_iterations=soft_cldice_iterations,
+            default_soft_cldice_iterations=int(config["loss"]["iterations"]),
         )
 
         patch_diagnostics = {
@@ -593,6 +731,8 @@ def main() -> None:
             "test": patch_distribution(test_patch_records),
             "full_image_validation": {
                 "enabled": full_image_enabled,
+                "start_epoch": validation_cfg["start_epoch"],
+                "batch_size": validation_cfg["full_image"]["batch_size"],
                 "interval_epochs": validation_cfg["full_image"]["interval_epochs"],
                 "selection": validation_cfg["full_image"]["selection"],
                 "max_images": validation_cfg["full_image"]["max_images"],
@@ -669,7 +809,7 @@ def main() -> None:
             loss_config=config["loss"],
             logger=logger,
             fold_dir=Path(fold_dir),
-            data_config={**data_cfg, **patching_cfg},
+            data_config={**data_cfg, **full_image_validation_patching_cfg},
             augmentations_config=augmentations_cfg,
             val_original_records=full_image_val_originals,
             tensorboard_writer=writer,
@@ -703,6 +843,12 @@ def main() -> None:
                 "test_dice_per_image": test_result["mean_dice"],
                 "test_iou_per_image": test_result["mean_iou"],
             })
+            if total_folds > 1:
+                fold_test_results.append({"fold": fold_index, **test_result})
+                cross_fold_test_summary = persist_cross_fold_test_summary(
+                    run_dir / "test-evaluation",
+                    fold_test_results,
+                )
             logger.info(
                 "Fold %s test evaluation - test_dice_per_image=%.4f test_iou_per_image=%.4f output=%s",
                 fold_index,
@@ -780,6 +926,7 @@ def main() -> None:
         "split_mode": split_mode,
         **segmentation_summary_metadata(config, mask_dir),
         "folds": fold_results,
+        "test_evaluation": cross_fold_test_summary,
         "mean_dice_per_patch": statistics.mean(val_dice_per_patch_values),
         "std_dice_per_patch": (
             statistics.pstdev(val_dice_per_patch_values) if len(val_dice_per_patch_values) > 1 else 0.0

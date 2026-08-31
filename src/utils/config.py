@@ -55,6 +55,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "enabled": True,
                 "max_fraction_of_patch": 0.5,
             },
+            "background_only": {
+                "enabled": False,
+                "percentage_of_foreground": 5.0,
+            },
             "scaled_context": {
                 "enabled": True,
                 "probability": 0.25,
@@ -74,12 +78,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "validation": {
+        "start_epoch": 1,
         "fast": {
             "foreground_only": True,
-            "overlap": 0,
+            "overlap": 256,
         },
         "full_image": {
             "enabled": True,
+            "batch_size": 1,
             "interval_epochs": 1,
             "selection": "all",
             "max_images": None,
@@ -154,6 +160,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dice_weight": 0.6,
         "soft_cldice_weight": 0.1,
         "iterations": 5,
+        "iterations_csv": None,
         "smooth": 1e-6,
         "cldice_smooth": 1.0,
     },
@@ -176,6 +183,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
             "interval_epochs": 10,
         },
+        "save_last_checkpoint": True,
         "threshold": 0.5,
         "seed": 42,
         "device": "auto",
@@ -228,6 +236,7 @@ def _normalize_validation_config(
         if not isinstance(legacy_monitor, dict):
             raise ValueError("train.full_image_monitor must be a mapping.")
         config["validation"] = {
+            "start_epoch": 1,
             "fast": {
                 "foreground_only": bool(
                     patching.get("filter_empty_patches", True)
@@ -236,6 +245,7 @@ def _normalize_validation_config(
             },
             "full_image": {
                 "enabled": bool(train.get("enable_per_image_validation", True)),
+                "batch_size": 1,
                 "interval_epochs": int(
                     train.get("per_image_validation_interval", 1)
                 ),
@@ -256,19 +266,23 @@ def _normalize_validation_config(
     if not isinstance(full_image, dict):
         raise ValueError("validation.full_image must be a mapping.")
 
+    start_epoch = int(validation.get("start_epoch", 1))
+    if start_epoch <= 0:
+        raise ValueError("validation.start_epoch must be positive.")
+    if start_epoch > int(train["epochs"]):
+        raise ValueError("validation.start_epoch must not exceed train.epochs.")
+    validation["start_epoch"] = start_epoch
+
     patch_size = int(patching["patch_size"])
-    fast_overlap = int(fast.get("overlap", 0))
-    if not 0 <= fast_overlap < patch_size:
-        raise ValueError(
-            "validation.fast.overlap must be greater than or equal to 0 and "
-            "smaller than patching.patch_size."
-        )
     fast["foreground_only"] = bool(fast.get("foreground_only", True))
-    fast["overlap"] = fast_overlap
+    fast["overlap"] = patch_size // 2
 
     interval_epochs = int(full_image.get("interval_epochs", 1))
     if interval_epochs <= 0:
         raise ValueError("validation.full_image.interval_epochs must be positive.")
+    batch_size = int(full_image.get("batch_size", 1))
+    if batch_size <= 0:
+        raise ValueError("validation.full_image.batch_size must be positive.")
     selection = str(full_image.get("selection", "all")).strip().lower()
     if selection not in {"all", "smallest_area"}:
         raise ValueError(
@@ -292,6 +306,7 @@ def _normalize_validation_config(
             "a positive sum."
         )
     full_image["enabled"] = bool(full_image.get("enabled", True))
+    full_image["batch_size"] = batch_size
     full_image["interval_epochs"] = interval_epochs
     full_image["selection"] = selection
     full_image["max_images"] = None if max_images is None else int(max_images)
@@ -381,6 +396,26 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         patching_cfg.get("stride")
         or (int(patching_cfg["patch_size"]) - int(patching_cfg["overlap"]))
     )
+    background_only_cfg = patching_cfg.get("train", {}).get(
+        "background_only", {}
+    )
+    if not isinstance(background_only_cfg, dict):
+        raise ValueError("patching.train.background_only must be a mapping.")
+    background_percentage = float(
+        background_only_cfg.get("percentage_of_foreground", 0.0)
+    )
+    if not 0.0 <= background_percentage <= 100.0:
+        raise ValueError(
+            "patching.train.background_only.percentage_of_foreground must be "
+            "between 0 and 100."
+        )
+    background_only_cfg["enabled"] = bool(
+        background_only_cfg.get("enabled", False)
+    )
+    background_only_cfg["percentage_of_foreground"] = background_percentage
+    config["train"]["save_last_checkpoint"] = bool(
+        config["train"].get("save_last_checkpoint", True)
+    )
     _normalize_validation_config(config, loaded)
     _normalize_join_masks_config(config)
     return config
@@ -467,35 +502,36 @@ def config_for_persistence(
         "bce_dice": {"bce_weight", "dice_weight", "smooth"},
         "bce_dice_cldice": {
             "bce_weight", "dice_weight", "soft_cldice_weight", "iterations",
-            "smooth", "cldice_smooth",
+            "iterations_csv", "smooth", "cldice_smooth",
         },
         "bce_dice_soft_cldice": {
             "bce_weight", "dice_weight", "soft_cldice_weight", "iterations",
-            "smooth", "cldice_smooth",
+            "iterations_csv", "smooth", "cldice_smooth",
         },
         "bcedicecldice": {
             "bce_weight", "dice_weight", "soft_cldice_weight", "iterations",
-            "smooth", "cldice_smooth",
+            "iterations_csv", "smooth", "cldice_smooth",
         },
         "multiclass_ce_dice_loci_cldice": {
             "cross_entropy_weight", "dice_weight", "loci_cldice_weight",
-            "iterations", "smooth", "cldice_smooth",
+            "iterations", "iterations_csv", "smooth", "cldice_smooth",
         },
         "multiclass_geometry_ce_dice_loci_cldice": {
             "geometry_aware_ce_weight", "dice_weight", "soft_cldice_weight",
-            "geometry_aware_ce", "iterations", "smooth", "cldice_smooth",
+            "geometry_aware_ce", "iterations", "iterations_csv", "smooth",
+            "cldice_smooth",
         },
         "tversky": {"alpha", "beta", "smooth"},
-        "cldice": {"iterations", "cldice_smooth"},
-        "soft_cldice": {"iterations", "cldice_smooth"},
-        "softcldice": {"iterations", "cldice_smooth"},
+        "cldice": {"iterations", "iterations_csv", "cldice_smooth"},
+        "soft_cldice": {"iterations", "iterations_csv", "cldice_smooth"},
+        "softcldice": {"iterations", "iterations_csv", "cldice_smooth"},
         "tversky_soft_cldice": {
             "alpha", "beta", "tversky_weight", "soft_cldice_weight",
-            "iterations", "smooth", "cldice_smooth",
+            "iterations", "iterations_csv", "smooth", "cldice_smooth",
         },
         "tversky_softcldice": {
             "alpha", "beta", "tversky_weight", "soft_cldice_weight",
-            "iterations", "smooth", "cldice_smooth",
+            "iterations", "iterations_csv", "smooth", "cldice_smooth",
         },
     }
     if loss_name in loss_keys_by_name:
@@ -523,13 +559,16 @@ def config_for_persistence(
 
     split = persisted.get("split", {})
     split_mode = str(split.get("mode", "")).lower()
-    if split_mode != "kfold":
+    if split_mode not in {"kfold", "csv_kfold"}:
         persisted.pop("cv", None)
     if split_mode == "csv":
         split.pop("val_source_ids", None)
         split.pop("test_source_ids", None)
     elif split_mode == "train_val":
         split.pop("csv_path", None)
+    elif split_mode == "csv_kfold":
+        split.pop("val_source_ids", None)
+        split.pop("test_source_ids", None)
     elif split_mode == "kfold":
         for key in ("csv_path", "val_source_ids", "test_source_ids"):
             split.pop(key, None)

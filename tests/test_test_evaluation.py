@@ -40,7 +40,7 @@ class TestEvaluationTests(unittest.TestCase):
             "segmentation": {"target": "loci"},
             "data": {"image_extensions": [".png"]},
             "split": {"mode": "csv", "csv_path": str(root / "splits.csv")},
-            "patching": {"mask_threshold": 127},
+            "patching": {"patch_size": 4, "stride": 4, "mask_threshold": 127},
             "inference": {"threshold": 0.5},
             "test_evaluation": {"threshold_start": 0.5, "threshold_stop": 1.0, "threshold_step": 0.01},
         }
@@ -49,6 +49,7 @@ class TestEvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self._make_config(root)
+            config["split"]["mode"] = "csv_kfold"
             output_dir = root / "test-evaluation"
 
             def predictor(*_args):
@@ -91,6 +92,28 @@ class TestEvaluationTests(unittest.TestCase):
             self.assertEqual(len(threshold_rows), 51)
             self.assertEqual(threshold_rows[0]["threshold"], "0.5")
             self.assertEqual(threshold_rows[-1]["threshold"], "1.0")
+
+    def test_test_evaluation_uses_half_patch_stride_without_mutating_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._make_config(root)
+            observed_strides = []
+
+            def predictor(_model, _image_path, evaluation_config, _device):
+                observed_strides.append(evaluation_config["patching"]["stride"])
+                return np.zeros((4, 5), dtype=np.float32)
+
+            run_test_evaluation(
+                root / "best.pt",
+                config,
+                root / "test-evaluation",
+                torch.device("cpu"),
+                model=torch.nn.Identity(),
+                predictor=predictor,
+            )
+
+            self.assertEqual(observed_strides, [2])
+            self.assertEqual(config["patching"]["stride"], 4)
 
     def test_binary_overlay_distinguishes_ground_truth_prediction_and_overlap(self) -> None:
         image = np.zeros((2, 4, 3), dtype=np.uint8)

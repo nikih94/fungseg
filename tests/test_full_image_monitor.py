@@ -5,16 +5,19 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from PIL import Image
 
+import src.metrics.segmentation as segmentation_metrics
 from src.engine.trainer import Trainer
 from src.metrics.segmentation import multiclass_metrics_from_masks
 from src.patching import OriginalImageRecord, build_patch_records
 from src.schedulers.factory import build_scheduler
 from src.train import (
+    build_full_image_validation_patching_config,
     build_fast_validation_patching_config,
     select_full_image_validation_records,
 )
@@ -24,6 +27,16 @@ from src.utils.config import load_config
 class _SilentLogger:
     def info(self, *args, **kwargs) -> None:
         return None
+
+
+class _BatchRecordingIdentity(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_sizes: list[int] = []
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        self.batch_sizes.append(int(inputs.shape[0]))
+        return inputs
 
 
 class _StubTrainer(Trainer):
@@ -41,12 +54,15 @@ class _StubTrainer(Trainer):
         self.monitor_mode = "max"
         self.best_interval_checkpoint_enabled = True
         self.best_interval_checkpoint_epochs = 10
+        self.save_last_checkpoint = True
         self.fold_dir = fold_dir
         self.train_config = {}
         self.tensorboard_writer = None
         self.logger = _SilentLogger()
         self.fold_index = 0
         self.scores = scores
+        self.validation_start_epoch = 1
+        self.validation_epochs: list[int] = []
         self.epoch_metrics_callback = epoch_metrics_callback
 
     def _run_epoch(
@@ -63,6 +79,7 @@ class _StubTrainer(Trainer):
                 "train_dice_per_patch": 0.1,
                 "train_iou_per_patch": 0.1,
             }
+        self.validation_epochs.append(epoch)
         return {
             "val_loss": float(epoch),
             "val_dice_per_patch": 0.8 - (0.1 * epoch),
@@ -135,7 +152,8 @@ class FullImageMonitorTests(unittest.TestCase):
             )
 
             trainer = Trainer.__new__(Trainer)
-            trainer.model = torch.nn.Identity()
+            batched_model = _BatchRecordingIdentity()
+            trainer.model = batched_model
             trainer.device = torch.device("cpu")
             trainer.data_config = {"patch_size": 4, "stride": 2, "mask_threshold": 127}
             trainer.val_patch_transforms = self._raw_transform
@@ -152,8 +170,24 @@ class FullImageMonitorTests(unittest.TestCase):
             trainer.fold_index = 0
             trainer.full_image_dice_weight = 0.25
             trainer.full_image_cldice_weight = 0.75
+            trainer.full_image_batch_size = 8
 
-            metrics = trainer._evaluate_full_images(epoch=1, epochs=1)
+            with patch.object(
+                segmentation_metrics,
+                "skeletonize",
+                wraps=segmentation_metrics.skeletonize,
+            ) as skeletonize_mock:
+                metrics = trainer._evaluate_full_images(epoch=1, epochs=1)
+                single_patch_model = _BatchRecordingIdentity()
+                trainer.model = single_patch_model
+                trainer.full_image_batch_size = 1
+                single_patch_metrics = trainer._evaluate_full_images(epoch=1, epochs=1)
+                skeletonize_call_count = skeletonize_mock.call_count
+
+        self.assertEqual(batched_model.batch_sizes, [8, 1])
+        self.assertEqual(single_patch_model.batch_sizes, [1] * 9)
+        self.assertEqual(metrics, single_patch_metrics)
+        self.assertEqual(skeletonize_call_count, 3)
 
         expected = multiclass_metrics_from_masks(
             torch.from_numpy(prediction.astype(np.int64)),
@@ -262,7 +296,7 @@ class FullImageMonitorTests(unittest.TestCase):
             records,
         )
 
-    def test_fast_validation_uses_shared_foreground_threshold_and_zero_overlap(self) -> None:
+    def test_fast_validation_uses_shared_foreground_threshold_and_half_patch_stride(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             image_path = root / "image.png"
@@ -295,10 +329,15 @@ class FullImageMonitorTests(unittest.TestCase):
             )
             records = build_patch_records([record], effective, phase="validation")
 
-        self.assertEqual(effective["stride"], 4)
+        self.assertEqual(effective["stride"], 2)
+        self.assertEqual(effective["overlap"], 2)
         self.assertEqual(effective["mask_threshold"], 127)
         self.assertEqual(effective["min_foreground_pixels"], 2)
         self.assertEqual([(record.x, record.y) for record in records], [(0, 0)])
+
+        full_image_effective = build_full_image_validation_patching_config(shared)
+        self.assertEqual(full_image_effective["stride"], 2)
+        self.assertEqual(full_image_effective["overlap"], 2)
 
     def test_ready_configs_keep_monitor_dependencies_internally_consistent(self) -> None:
         for filename in (
@@ -314,6 +353,10 @@ class FullImageMonitorTests(unittest.TestCase):
                 config = load_config(filename)
                 train_monitor = str(config["train"]["monitor"])
                 scheduler_monitor = str(config["scheduler"]["monitor"])
+                self.assertGreaterEqual(config["validation"]["start_epoch"], 1)
+                self.assertGreater(
+                    config["validation"]["full_image"]["batch_size"], 0
+                )
                 self.assertEqual(scheduler_monitor, train_monitor)
                 if train_monitor.endswith("_per_image"):
                     self.assertTrue(config["validation"]["full_image"]["enabled"])
@@ -328,15 +371,6 @@ class FullImageMonitorTests(unittest.TestCase):
                     self.assertGreater(
                         float(weights["dice_weight"]) + float(weights["cldice_weight"]),
                         0.0,
-                    )
-                if filename.startswith("multiclass"):
-                    self.assertEqual(train_monitor, "val_dice_per_patch")
-                    self.assertTrue(
-                        config["validation"]["fast"]["foreground_only"]
-                    )
-                    self.assertEqual(config["validation"]["fast"]["overlap"], 0)
-                    self.assertFalse(
-                        config["validation"]["full_image"]["enabled"]
                     )
 
 
@@ -375,6 +409,36 @@ class TrainerLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual([item[:2] for item in observed], [(1, 1), (2, 2)])
         self.assertTrue(all(manifest_count >= 2 for _, _, manifest_count in observed))
 
+    def test_validation_start_epoch_delays_metrics_scheduler_and_best_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fold_dir = Path(tmpdir)
+            trainer = _StubTrainer(fold_dir, scores=[0.1, 0.2, 0.9])
+            trainer.validation_start_epoch = 3
+            trainer.save_last_checkpoint = False
+            trainer.best_interval_checkpoint_enabled = False
+            trainer.scheduler = build_scheduler(
+                trainer.optimizer,
+                {
+                    "name": "reduce_on_plateau",
+                    "mode": "max",
+                    "factor": 0.5,
+                    "patience": 7,
+                    "min_lr": 0.001,
+                    "monitor": "val_dice_cldice_per_image",
+                },
+            )
+
+            result = trainer.fit([object()], [object()], epochs=3)
+            checkpoint = torch.load(fold_dir / "best.pt", map_location="cpu")
+
+        self.assertEqual(trainer.validation_epochs, [3])
+        self.assertNotIn("val_loss", result["history"][0])
+        self.assertNotIn("val_loss", result["history"][1])
+        self.assertEqual(result["history"][2]["val_dice_cldice_per_image"], 0.9)
+        self.assertEqual(result["best_epoch"], 3)
+        self.assertEqual(checkpoint["epoch"], 3)
+        self.assertEqual(trainer.scheduler.last_epoch, 1)
+
     def test_fit_returns_metrics_from_one_consistent_best_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer = _StubTrainer(Path(tmpdir), scores=[0.9, 0.2])
@@ -385,6 +449,27 @@ class TrainerLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(result["val_loss"], 1.0)
         self.assertEqual(result["val_dice_per_image"], 0.9)
         self.assertEqual(result["val_dice_cldice_per_image"], 0.9)
+
+    def test_best_only_checkpoint_setting_omits_last_and_interval_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fold_dir = Path(tmpdir)
+            trainer = _StubTrainer(fold_dir, scores=[0.9, 0.2])
+            trainer.save_last_checkpoint = False
+            trainer.best_interval_checkpoint_enabled = False
+
+            trainer.fit([object()], [object()], epochs=2)
+
+            checkpoints = sorted(path.name for path in fold_dir.glob("*.pt"))
+            with (fold_dir / "checkpoint_manifest.csv").open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                manifest_rows = list(csv.DictReader(handle))
+
+        self.assertEqual(checkpoints, ["best.pt"])
+        self.assertEqual(len(manifest_rows), 1)
+        self.assertEqual(manifest_rows[0]["checkpoint"], "best.pt")
+        self.assertEqual(manifest_rows[0]["reason"], "global_best")
 
     def test_last_checkpoint_contains_post_scheduler_learning_rate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

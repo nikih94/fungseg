@@ -75,10 +75,118 @@ class DynamicPatchingTests(unittest.TestCase):
         self.assertEqual([(item.x, item.y, item.scale) for item in first], [(item.x, item.y, item.scale) for item in second])
         self.assertNotEqual([(item.x, item.y, item.scale) for item in first], [(item.x, item.y, item.scale) for item in different])
 
+    def test_background_only_quota_is_per_source_and_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            originals = []
+            for source_name in ("first", "second"):
+                image_path = root / f"{source_name}.tif"
+                mask_path = root / f"{source_name}.png"
+                image = np.zeros((20, 20, 3), dtype=np.uint8)
+                mask = np.ones((20, 20), dtype=np.uint8) * 255
+                mask[:4, :] = 0
+                Image.fromarray(image).save(image_path)
+                Image.fromarray(mask).save(mask_path)
+                originals.append(
+                    OriginalImageRecord(
+                        image_path.name,
+                        image_path,
+                        mask_path,
+                        width=20,
+                        height=20,
+                    )
+                )
+
+            config = {
+                "patch_size": 4,
+                "overlap": 0,
+                "stride": 4,
+                "filter_empty_patches": True,
+                "mask_threshold": 127,
+                "min_foreground_pixels": 1,
+                "mask_resampling": "foreground_preserving",
+                "train": {
+                    "random_offset": {"enabled": False},
+                    "background_only": {
+                        "enabled": True,
+                        "percentage_of_foreground": 5.0,
+                    },
+                    "scaled_context": {"enabled": False},
+                },
+            }
+            first = build_patch_records(
+                originals, config, phase="train", epoch=2, base_seed=17
+            )
+            second = build_patch_records(
+                originals, config, phase="train", epoch=2, base_seed=17
+            )
+
+        for source_name in ("first.tif", "second.tif"):
+            source_records = [
+                record for record in first if record.source_id == source_name
+            ]
+            self.assertEqual(len(source_records), 21)
+            self.assertEqual(
+                sum(record.is_background_only for record in source_records),
+                1,
+            )
+            self.assertEqual(
+                sum(not record.is_background_only for record in source_records),
+                20,
+            )
+        self.assertEqual(
+            [(record.source_id, record.x, record.y) for record in first],
+            [(record.source_id, record.x, record.y) for record in second],
+        )
+
+    def test_background_only_quota_keeps_one_when_calculation_is_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "background.tif"
+            mask_path = root / "background.png"
+            Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(image_path)
+            Image.fromarray(np.zeros((8, 8), dtype=np.uint8)).save(mask_path)
+            original = OriginalImageRecord(
+                image_path.name,
+                image_path,
+                mask_path,
+                width=8,
+                height=8,
+            )
+            config = {
+                "patch_size": 4,
+                "overlap": 0,
+                "stride": 4,
+                "filter_empty_patches": True,
+                "mask_threshold": 127,
+                "min_foreground_pixels": 1,
+                "mask_resampling": "foreground_preserving",
+                "train": {
+                    "random_offset": {"enabled": False},
+                    "background_only": {
+                        "enabled": True,
+                        "percentage_of_foreground": 0.0,
+                    },
+                    "scaled_context": {"enabled": False},
+                },
+            }
+
+            records = build_patch_records(
+                [original],
+                config,
+                phase="train",
+                epoch=1,
+                base_seed=7,
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0].is_background_only)
+        self.assertEqual(records[0].foreground_pixels, 0)
     def test_containment_filter_removes_covered_scaled_patches(self) -> None:
         def patch(x: int, scale: float, label: str) -> PatchRecord:
             return PatchRecord(
                 source_id="image.tif",
+
                 image_path=Path("image.tif"),
                 mask_path=Path("mask.png"),
                 x=x,
@@ -181,11 +289,17 @@ class DynamicPatchingTests(unittest.TestCase):
             masks_dir.mkdir()
             image = np.zeros((512, 512, 3), dtype=np.uint8)
             mask = np.ones((512, 512), dtype=np.uint8) * 255
+            mask[256:, 256:] = 0
             Image.fromarray(image).save(images_dir / "sample.tif")
             Image.fromarray(mask).save(masks_dir / "sample.png")
             config_path = root / "config.yaml"
             patching_config = yaml.safe_load(yaml.safe_dump(PATCHING_CONFIG))
             patching_config["train"]["scaled_context"]["max_scale"] = 4.0
+            patching_config["filter_empty_patches"] = True
+            patching_config["train"]["background_only"] = {
+                "enabled": True,
+                "percentage_of_foreground": 5.0,
+            }
             config = {
                 "project": {"name": "test"},
                 "paths": {
@@ -200,22 +314,47 @@ class DynamicPatchingTests(unittest.TestCase):
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
             result = subprocess.run(
-                [sys.executable, "-m", "src.patching.explain", "--config", str(config_path), "--epoch", "1"],
+                [
+                    sys.executable,
+                    "-m",
+                    "src.patching.explain",
+                    "--config",
+                    str(config_path),
+                    "--image",
+                    str(images_dir / "sample.tif"),
+                    "--epoch",
+                    "1",
+                ],
                 cwd=Path(__file__).resolve().parents[1],
                 text=True,
                 capture_output=True,
                 check=True,
             )
 
+            overlay_path = (
+                root
+                / "outputs"
+                / "test"
+                / "patching_explain"
+                / "sample_legacy_epoch_001_patches.png"
+            )
+            with Image.open(overlay_path) as overlay:
+                background_outline_pixel = overlay.convert("RGB").getpixel(
+                    (256, 348)
+                )
+
         self.assertIn("Images matched: 1", result.stdout)
         self.assertIn("Scaled-context patches:", result.stdout)
         self.assertIn("Containment filter:", result.stdout)
         self.assertIn("Containment-filtered patches:", result.stdout)
+        self.assertIn("Background-only patches: 1", result.stdout)
+        self.assertIn("background", result.stdout)
         self.assertIn("Patches by source and source-crop resolution:", result.stdout)
         self.assertIn("<=256", result.stdout)
         self.assertIn("<=1024", result.stdout)
         self.assertIn("percent", result.stdout)
         self.assertIn("100.0%", result.stdout)
+        self.assertEqual(background_outline_pixel, (31, 119, 180))
 
 
 if __name__ == "__main__":

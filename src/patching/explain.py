@@ -91,18 +91,28 @@ def _print_source_resolution_table(
 ) -> None:
     bin_edges = _resolution_bin_edges(patch_size, max_scale)
     source_rows: dict[str, list[int]] = {}
+    background_by_source: Counter[str] = Counter()
     for record in kept:
         row = source_rows.setdefault(record.source_id, [0 for _ in bin_edges])
         row[_resolution_bin_index(record, bin_edges)] += 1
+        if record.is_background_only:
+            background_by_source[record.source_id] += 1
 
     source_header = "source"
     total_header = "total"
+    background_header = "background"
     bin_headers = [f"<={edge}" for edge in bin_edges]
     bin_totals = [
         sum(row[index] for row in source_rows.values())
         for index in range(len(bin_edges))
     ]
     total_patches = sum(bin_totals)
+    total_background = sum(background_by_source.values())
+    background_percentage = (
+        f"{(100.0 * total_background / total_patches):.1f}%"
+        if total_patches
+        else "0.0%"
+    )
     percentage_values = [
         f"{(100.0 * value / total_patches):.1f}%" if total_patches else "0.0%"
         for value in bin_totals
@@ -117,6 +127,13 @@ def _print_source_resolution_table(
         len("100.0%"),
         *(len(str(sum(row))) for row in source_rows.values()),
     ) if source_rows else len(total_header)
+    background_width = max(
+        len(background_header),
+        len(background_percentage),
+        *(
+            len(str(background_by_source[source_id])) for source_id in source_rows
+        ),
+    ) if source_rows else len(background_header)
     bin_widths = [
         max(
             len(header),
@@ -130,6 +147,7 @@ def _print_source_resolution_table(
     header = (
         f"  {source_header:<{source_width}}  "
         f"{total_header:>{total_width}}  "
+        f"{background_header:>{background_width}}  "
         + "  ".join(
             f"{header:>{width}}"
             for header, width in zip(bin_headers, bin_widths)
@@ -142,6 +160,7 @@ def _print_source_resolution_table(
         print(
             f"  {source_id:<{source_width}}  "
             f"{sum(row):>{total_width}}  "
+            f"{background_by_source[source_id]:>{background_width}}  "
             + "  ".join(
                 f"{value:>{width}}"
                 for value, width in zip(row, bin_widths)
@@ -150,6 +169,7 @@ def _print_source_resolution_table(
     print(
         f"  {'total':<{source_width}}  "
         f"{total_patches:>{total_width}}  "
+        f"{total_background:>{background_width}}  "
         + "  ".join(
             f"{value:>{width}}"
             for value, width in zip(bin_totals, bin_widths)
@@ -158,6 +178,7 @@ def _print_source_resolution_table(
     print(
         f"  {'percent':<{source_width}}  "
         f"{'100.0%':>{total_width}}  "
+        f"{background_percentage:>{background_width}}  "
         + "  ".join(
             f"{value:>{width}}"
             for value, width in zip(percentage_values, bin_widths)
@@ -217,12 +238,21 @@ def _print_summary(
     split: SplitDefinition | None = None,
 ) -> None:
     labels = Counter(record.scale_label for record in kept)
-    foreground_discarded = max(0, len(candidates) - len(pre_containment))
-    containment_discarded = max(0, len(pre_containment) - len(kept))
-    discarded = foreground_discarded + containment_discarded
+    pre_containment_foreground = sum(
+        not record.is_background_only for record in pre_containment
+    )
+    kept_foreground = sum(
+        not record.is_background_only for record in kept
+    )
+    containment_discarded = max(0, pre_containment_foreground - kept_foreground)
+    discarded = max(0, len(candidates) - len(kept))
+    foreground_discarded = max(0, discarded - containment_discarded)
+    background_count = sum(record.is_background_only for record in kept)
     stats = _scale_stats(kept)
     patch_size = int(patching_config["patch_size"])
-    scaled_context_config = patching_config.get("train", {}).get("scaled_context", {})
+    train_config = patching_config.get("train", {})
+    background_config = train_config.get("background_only", {})
+    scaled_context_config = train_config.get("scaled_context", {})
     containment_config = scaled_context_config.get("containment_filter", {})
     max_scale = (
         max(1.0, float(scaled_context_config.get("max_scale", 2.0)))
@@ -246,6 +276,12 @@ def _print_summary(
         "preserve_normal_patches="
         f"{bool(containment_config.get('preserve_normal_patches', True))}"
     )
+    print(
+        "Background-only retention: "
+        f"enabled={bool(background_config.get('enabled', False))} "
+        "percentage_of_foreground="
+        f"{float(background_config.get('percentage_of_foreground', 0.0)):.1f}%"
+    )
     print(f"Base candidate patches: {len(candidates)}")
     print(f"Patches kept: {len(kept)}")
     print(f"Patches discarded: {discarded}")
@@ -253,6 +289,7 @@ def _print_summary(
     print(f"Containment-filtered patches: {containment_discarded}")
     print(f"Normal patches: {labels.get('normal', 0)}")
     print(f"Scaled-context patches: {labels.get('scaled_context', 0)}")
+    print(f"Background-only patches: {background_count}")
     print(
         "Scale stats: "
         f"min={stats['min']:.4f} max={stats['max']:.4f} mean={stats['mean']:.4f} "
@@ -282,6 +319,7 @@ def _draw_overlay(
 ) -> None:
     image = Image.open(record.image_path).convert("RGB")
     scaled_count = sum(1 for item in records if item.scale_label == "scaled_context")
+    background_count = sum(item.is_background_only for item in records)
     scaled_percent = (100.0 * scaled_count / len(records)) if records else 0.0
     header_height = 92
     canvas = Image.new("RGB", (image.width, image.height + header_height), "white")
@@ -290,7 +328,8 @@ def _draw_overlay(
     font = ImageFont.load_default()
     title = (
         f"{record.source_id} | epoch={epoch} seed={seed + epoch} | "
-        f"scaled={scaled_count}/{len(records)} ({scaled_percent:.1f}%)"
+        f"scaled={scaled_count}/{len(records)} ({scaled_percent:.1f}%) | "
+        f"background={background_count}"
     )
     draw.text((10, 8), title, fill=(0, 0, 0), font=font)
     draw.rectangle((10, 36, 30, 56), outline=(44, 160, 44), width=3)
@@ -300,9 +339,16 @@ def _draw_overlay(
     draw.rectangle((450, 36, 470, 56), outline=(214, 39, 40), width=3)
     draw.line((450, 46, 470, 46), fill=(214, 39, 40), width=2)
     draw.text((478, 39), "scaled source crop", fill=(0, 0, 0), font=font)
+    draw.rectangle((10, 64, 30, 84), outline=(31, 119, 180), width=3)
+    draw.text((38, 67), "background-only patch", fill=(0, 0, 0), font=font)
 
     for patch_record in records:
-        color = (44, 160, 44) if patch_record.scale_label == "normal" else (255, 127, 14)
+        if patch_record.is_background_only:
+            color = (31, 119, 180)
+        elif patch_record.scale_label == "normal":
+            color = (44, 160, 44)
+        else:
+            color = (255, 127, 14)
         draw.rectangle(
             (
                 patch_record.x,

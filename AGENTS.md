@@ -30,6 +30,12 @@ When documentation and implementation disagree, inspect the code, active YAML co
 ├── requirements.txt                  # runtime dependencies
 ├── data/                             # local datasets and split metadata
 ├── src/                              # application code
+│   ├── analyze_soft_skeleton_iterations.py # Soft-clDice iteration diagnostic
+│   ├── build_soft_cldice_iteration_map.py # Exact per-loci-mask iteration CSV
+│   ├── add_soft_cldice_iteration_margin.py # Safety-margin training CSV
+│   ├── benchmark_cldice.py           # Reference Zhang CPU/CUDA diagnostic benchmark
+│   ├── benchmark_cldice_patches.py   # Batched foreground-patch hard-clDice benchmark
+│   ├── data/soft_cldice_iterations.py # Per-mask training-iteration CSV mapping
 │   ├── inference/                    # inference, recursive prediction, and evaluation workflows
 │   ├── models/segformer_refinement.py # MiT-B1/B2 full-resolution refinement model
 │   └── ...                           # data, engine, models, patching, metrics, and utilities
@@ -66,7 +72,7 @@ Rules:
 - Training discovery is top-level within the configured image and mask directories; matching is by filename stem.
 - Binary mode uses the directory selected by `segmentation.target` and `paths.mask_dirs`.
 - Multiclass mode uses only complete, dimension-matched image/loci-mask/inoculum-mask sets. Training and evaluation exclude incomplete or mismatched required sets with named warnings. Configured join masks are optional per image; valid masks can be merged into loci for training, or loaded only by CSV test evaluation for join metrics and red overlay boundaries. Absent masks leave targets unchanged and dimension-mismatched optional masks are ignored with warnings.
-- `data/image_splits.csv` must contain `filename,split`. Forward-looking rows without a currently usable pair are validated, named in a warning, and ignored. Every currently usable pair must be assigned to exactly one non-empty `train`, `validation`/`val`, or `test` split.
+- `data/image_splits.csv` must contain `filename,split`. Forward-looking rows without a currently usable pair are validated, named in a warning, and ignored. Every currently usable pair must be assigned to exactly one non-empty `train`, `validation`/`val`, or `test` split. In `csv_kfold` mode, test membership remains fixed in every fold while the combined train/validation pool is partitioned for cross-validation.
 - Split membership is assigned to original images, never to individual patches. Never introduce patch-level leakage between train and validation/test.
 - `data/other-test-data/` is recursively processed by `src.inference.other_test_data_evaluation`; its generated results belong under its results directory and must not be treated as training data.
 - `data/FIVES/` is optional auxiliary training data controlled by `data.use_fives`; it never participates in fungal splits, validation, or test evaluation.
@@ -78,7 +84,9 @@ Do not commit private datasets, large archives, checkpoints, or generated masks 
 
 ### Entrypoints
 
-- `src/train.py`: discovery, split construction, loaders, model/loss/optimizer/scheduler construction, fold execution, test evaluation, and optional qualitative evaluation.
+- `src/train.py`: discovery, split construction, loaders, model/loss/optimizer/scheduler construction, fold execution, per-fold test evaluation and aggregation, and optional qualitative evaluation.
+- `src/benchmark_cldice_patches.py`: seeded foreground-patch CPU/CUDA hard-clDice timing and per-patch equivalence artifacts.
+- `src/benchmark_cldice.py`: paper-reference Zhang CPU/CUDA diagnostic timing and equivalence overlays for a prediction/target mask pair; production hard-clDice uses scikit-image on CPU.
 - `src/inference/__main__.py`: single-image or non-recursive directory inference with overlapping-patch stitching.
 - `src/inference/recursive_masks.py`: recursive binary/multiclass mask-only inference into a mirrored sibling directory.
 - `src/inference/in_folder.py`: legacy recursive binary inference that writes masks next to source images.

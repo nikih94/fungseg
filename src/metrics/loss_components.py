@@ -24,7 +24,7 @@ def soft_dice_score(logits: torch.Tensor, targets: torch.Tensor, smooth: float =
 def soft_cldice_score(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    iterations: int = 3,
+    iterations: int | torch.Tensor = 3,
     smooth: float = 1.0,
 ) -> torch.Tensor:
     probabilities = torch.sigmoid(logits).float()
@@ -58,6 +58,7 @@ def tversky_index(
 def loss_component_metrics(
     logits: torch.Tensor, targets: torch.Tensor, config: dict[str, Any],
     geometry_weights: torch.Tensor | None = None,
+    soft_cldice_iterations: torch.Tensor | None = None,
 ) -> dict[str, float]:
     loss_name = str(config.get("name", "")).strip().lower()
     metrics: dict[str, float] = {}
@@ -74,7 +75,9 @@ def loss_component_metrics(
             smooth=smooth,
             cldice_smooth=float(config.get("cldice_smooth", 1.0)),
         )
-        parts = loss.components(logits, targets, geometry_weights)
+        parts = loss.components(
+            logits, targets, geometry_weights, soft_cldice_iterations
+        )
         return {
             "geometry_aware_cross_entropy": float(parts["geometry_aware_ce"].item()),
             "multiclass_dice_loss": float(parts["dice"].item()),
@@ -92,7 +95,7 @@ def loss_component_metrics(
             smooth=smooth,
             cldice_smooth=float(config.get("cldice_smooth", 1.0)),
         )
-        parts = loss.components(logits, targets)
+        parts = loss.components(logits, targets, soft_cldice_iterations)
         return {
             "cross_entropy": float(parts["cross_entropy"].item()),
             "multiclass_dice_loss": float(parts["dice"].item()),
@@ -137,7 +140,11 @@ def loss_component_metrics(
         cldice = soft_cldice_score(
             logits,
             targets,
-            iterations=int(config.get("iterations", 3)),
+            iterations=(
+                int(config.get("iterations", 3))
+                if soft_cldice_iterations is None
+                else soft_cldice_iterations
+            ),
             smooth=float(config.get("cldice_smooth", config.get("smooth", 1.0))),
         )
         metrics["soft_cldice_score"] = float(cldice.item())

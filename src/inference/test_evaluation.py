@@ -39,6 +39,22 @@ from src.utils.io import ensure_dir, save_csv, save_json, save_mask_image
 
 Predictor = Callable[[torch.nn.Module, Path, dict, torch.device], np.ndarray]
 
+
+def _test_evaluation_config(config: dict) -> dict:
+    """Return a config copy using 50% patch overlap for test prediction."""
+    patching_config = dict(config["patching"])
+    patch_size = int(patching_config["patch_size"])
+    if patch_size < 2 or patch_size % 2:
+        raise ValueError(
+            "Test evaluation requires an even patching.patch_size of at least 2 "
+            "to use a 50% stride."
+        )
+    patching_config["stride"] = patch_size // 2
+    evaluation_config = dict(config)
+    evaluation_config["patching"] = patching_config
+    return evaluation_config
+
+
 _BINARY_OVERLAY_COLORS = {
     "Ground truth only": np.array([50, 130, 255], dtype=np.uint8),
     "Prediction only": np.array([255, 135, 30], dtype=np.uint8),
@@ -72,8 +88,11 @@ def default_config_path(checkpoint_path: Path) -> Path | None:
 
 def resolve_test_records(config: dict) -> list[OriginalImageRecord]:
     split_cfg = config.get("split", {})
-    if str(split_cfg.get("mode", "csv")).lower() != "csv":
-        raise ValueError("Test evaluation requires split.mode: csv.")
+    split_mode = str(split_cfg.get("mode", "csv")).lower()
+    if split_mode not in {"csv", "csv_kfold"}:
+        raise ValueError(
+            "Test evaluation requires split.mode: csv or csv_kfold."
+        )
     multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
     if multiclass:
         pairs, diagnostics = discover_image_mask_sets(
@@ -321,6 +340,7 @@ def run_test_evaluation(
         model = build_model(config["model"]).to(device)
         load_checkpoint(checkpoint_path, model, map_location=device)
 
+    evaluation_config = _test_evaluation_config(config)
     multiclass = str(config.get("segmentation", {}).get("mode", "binary")).lower() == "multiclass"
     inference_threshold = float(config.get("inference", {}).get("threshold", 0.5))
     mask_threshold = int(config["patching"]["mask_threshold"])
@@ -331,7 +351,7 @@ def run_test_evaluation(
     threshold_rows: list[dict] = []
     metric_device = device if device.type == "cuda" else torch.device("cpu")
     for record in tqdm(records, desc="Test evaluation"):
-        probabilities = predictor(model, record.image_path, config, device)
+        probabilities = predictor(model, record.image_path, evaluation_config, device)
         with Image.open(record.image_path) as image:
             image_array = np.array(image.convert("RGB"))
         if multiclass:

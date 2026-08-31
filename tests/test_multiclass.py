@@ -348,7 +348,7 @@ class MulticlassPipelineTests(unittest.TestCase):
             probabilities = np.eye(3, dtype=np.float32)[target].transpose(2, 0, 1)
             config = {
                 "segmentation": {"mode": "multiclass"},
-                "patching": {"mask_threshold": 127},
+                "patching": {"patch_size": 4, "stride": 4, "mask_threshold": 127},
                 "inference": {"decision": "argmax", "save_probabilities": True},
                 "join_masks": {"enabled": True, "masks_dir": str(root), "merge_with_loci": True},
                 "test_evaluation": {"threshold_sweep": False},
@@ -402,7 +402,7 @@ class MulticlassPipelineTests(unittest.TestCase):
             probabilities = np.eye(3, dtype=np.float32)[prediction].transpose(2, 0, 1)
             config = {
                 "segmentation": {"mode": "multiclass"},
-                "patching": {"mask_threshold": 127},
+                "patching": {"patch_size": 4, "stride": 4, "mask_threshold": 127},
                 "inference": {"decision": "argmax", "save_probabilities": False},
                 "join_masks": {
                     "enabled": False,

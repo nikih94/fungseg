@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import unittest
 
+import numpy as np
 import torch
+from skimage.morphology import skeletonize
 
 from src.engine.trainer import Trainer
 from src.losses.combined import MulticlassCEDiceLociCLDiceLoss
 from src.losses.factory import build_loss
 from src.metrics.segmentation import (
     cldice_score_from_masks,
+    hard_skeletonize_masks,
     multiclass_metrics_from_masks,
     precision_score_from_masks,
     recall_score_from_masks,
@@ -18,6 +21,25 @@ from src.utils.config import config_for_persistence
 
 
 class MetricAndLossRegressionTests(unittest.TestCase):
+    def test_hard_skeletonizer_matches_skimage_zhang_for_batched_masks(self) -> None:
+        branch = np.zeros((64, 64), dtype=bool)
+        branch[8:56, 29:35] = True
+        branch[28:36, 8:56] = True
+        loop = np.zeros_like(branch)
+        loop[8:56, 8:14] = True
+        loop[8:14, 8:56] = True
+        loop[50:56, 8:56] = True
+        loop[8:56, 50:56] = True
+        masks = np.stack([branch, loop], axis=0)
+
+        actual = hard_skeletonize_masks(torch.from_numpy(masks)).squeeze(1).numpy()
+        expected = np.stack(
+            [skeletonize(mask, method="zhang") for mask in masks],
+            axis=0,
+        )
+
+        np.testing.assert_array_equal(actual, expected)
+
     def test_cldice_harmonic_mean_penalizes_disjoint_skeletons(self) -> None:
         target = torch.zeros(1, 1, 32, 160)
         prediction = torch.zeros_like(target)
@@ -33,7 +55,7 @@ class MetricAndLossRegressionTests(unittest.TestCase):
         self.assertLess(hard_score, 1e-4)
         self.assertAlmostEqual(cldice_score_from_masks(target, target), 1.0, places=6)
 
-    def test_hard_cldice_skeletonizes_thick_masks_to_convergence(self) -> None:
+    def test_hard_cldice_skeletonizes_thick_masks_with_zhang(self) -> None:
         target = torch.zeros(1, 64, 64)
         prediction = torch.zeros_like(target)
         target[:, :16, :16] = 1.0

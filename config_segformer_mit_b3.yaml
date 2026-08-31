@@ -35,6 +35,9 @@ patching:
     random_offset:
       enabled: true
       max_fraction_of_patch: 0.5
+    background_only:
+      enabled: true
+      percentage_of_foreground: 5.0
     scaled_context:
       enabled: true
       probability: 0.25
@@ -110,6 +113,7 @@ loss:
   dice_weight: 0.5
   soft_cldice_weight: 0.2
   iterations: 10
+  iterations_csv: null
   smooth: 1.0e-6
   cldice_smooth: 1.0
 

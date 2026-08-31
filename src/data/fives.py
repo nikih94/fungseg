@@ -126,6 +126,8 @@ class FivesPatchDataset(SegmentationPatchDataset):
         *,
         segmentation_mode: str = "binary",
         target_weight_builder: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        soft_cldice_iterations: dict[str, int] | None = None,
+        default_soft_cldice_iterations: int = 0,
     ) -> None:
         super().__init__(
             records=records,
@@ -133,6 +135,8 @@ class FivesPatchDataset(SegmentationPatchDataset):
             transforms=transforms,
             segmentation_mode="binary",
             target_weight_builder=target_weight_builder,
+            soft_cldice_iterations=soft_cldice_iterations,
+            default_soft_cldice_iterations=default_soft_cldice_iterations,
         )
         self.output_segmentation_mode = str(segmentation_mode).lower()
 

@@ -155,6 +155,30 @@ def make_csv_train_val_test_split(
         val_sources=val_sources,
         test_sources=test_sources,
     )
+def make_csv_kfold_splits(
+    source_ids: Iterable[str],
+    csv_path: str | Path,
+    n_splits: int,
+    shuffle_groups: bool,
+    random_state: int | None,
+) -> list[SplitDefinition]:
+    """Build seeded CV folds from CSV train/val sources with a fixed test set."""
+    csv_split = make_csv_train_val_test_split(source_ids, csv_path)
+    cv_sources = csv_split.train_sources + csv_split.val_sources
+    grouped_splits = make_grouped_kfold_splits(
+        cv_sources,
+        n_splits=n_splits,
+        shuffle_groups=shuffle_groups,
+        random_state=random_state,
+    )
+    return [
+        SplitDefinition(
+            train_sources=train_sources,
+            val_sources=val_sources,
+            test_sources=list(csv_split.test_sources),
+        )
+        for train_sources, val_sources in grouped_splits
+    ]
 
 
 def make_manual_train_val_split(

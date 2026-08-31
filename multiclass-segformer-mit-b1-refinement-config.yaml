@@ -40,6 +40,9 @@ patching:
     random_offset:
       enabled: true
       max_fraction_of_patch: 0.4
+    background_only:
+      enabled: true
+      percentage_of_foreground: 5.0
     scaled_context:
       enabled: true
       probability: 0.4
@@ -59,7 +62,7 @@ patching:
 validation:
   fast:
     foreground_only: true
-    overlap: 0
+    overlap: 512
   full_image:
     enabled: false
     interval_epochs: 1
@@ -131,6 +134,7 @@ loss:
   dice_weight: 0.4
   loci_cldice_weight: 0.35
   iterations: 30
+  iterations_csv: null
   smooth: 1.0e-6
   cldice_smooth: 1.0
 

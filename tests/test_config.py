@@ -23,6 +23,32 @@ class ConfigTests(unittest.TestCase):
                 "evaluation_enabled": True,
             },
         )
+        self.assertEqual(config["split"]["mode"], "csv_kfold")
+        self.assertEqual(persisted["split"]["mode"], "csv_kfold")
+        self.assertEqual(persisted["split"]["csv_path"], "data/image_splits.csv")
+        self.assertEqual(persisted["cv"]["n_splits"], 5)
+        self.assertEqual(persisted["cv"]["random_state"], 42)
+        self.assertGreaterEqual(persisted["validation"]["start_epoch"], 1)
+        self.assertLessEqual(
+            persisted["validation"]["start_epoch"],
+            persisted["train"]["epochs"],
+        )
+        self.assertGreater(
+            persisted["validation"]["full_image"]["batch_size"], 0
+        )
+        self.assertEqual(config["train"]["monitor"], "val_dice_cldice_per_image")
+        self.assertEqual(
+            config["scheduler"]["monitor"],
+            "val_dice_cldice_per_image",
+        )
+        self.assertEqual(
+            config["validation"]["full_image"]["monitor"],
+            {"dice_weight": 0.6, "cldice_weight": 0.4},
+        )
+        self.assertFalse(config["train"]["best_interval_checkpoint"]["enabled"])
+        self.assertFalse(config["train"]["save_last_checkpoint"])
+        self.assertFalse(config["qualitative_evaluation"]["enabled"])
+
 
     def test_b2_refinement_config_persists_only_its_model_options(self) -> None:
         config = load_config("multiclass-segformer-mit-b2-refinement-config.yaml")
@@ -138,6 +164,7 @@ class ConfigTests(unittest.TestCase):
                 "dice_weight",
                 "loci_cldice_weight",
                 "iterations",
+                "iterations_csv",
                 "smooth",
                 "cldice_smooth",
             },
@@ -172,6 +199,7 @@ class ConfigTests(unittest.TestCase):
             persisted["validation"]["full_image"],
             {
                 "enabled": False,
+                "batch_size": 1,
                 "interval_epochs": 1,
                 "selection": "smallest_area",
                 "max_images": 3,
@@ -187,6 +215,60 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "max_images must be positive"):
+                load_config(config_path)
+
+    def test_full_image_validation_batch_size_must_be_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                "validation:\n  full_image:\n    batch_size: 0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "batch_size must be positive"):
+                load_config(config_path)
+
+    def test_validation_start_epoch_must_not_exceed_training_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                "validation:\n  start_epoch: 3\ntrain:\n  epochs: 2\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must not exceed train.epochs"):
+                load_config(config_path)
+
+    def test_checked_in_configs_enable_background_patches(self) -> None:
+        config_paths = (
+            "config.yaml",
+            "config_segformer_mit_b3.yaml",
+            "multiclass-config.yaml",
+            "multiclass-segformer-config.yaml",
+            "multiclass-segformer-mit-b1-refinement-config.yaml",
+            "multiclass-segformer-mit-b2-refinement-config.yaml",
+            "multiclass-segformer-mit-b3-geometry-config.yaml",
+        )
+        for config_path in config_paths:
+            with self.subTest(config=config_path):
+                background_config = load_config(config_path)["patching"]["train"][
+                    "background_only"
+                ]
+                self.assertTrue(background_config["enabled"])
+                percentage = background_config["percentage_of_foreground"]
+                self.assertGreaterEqual(percentage, 0.0)
+                self.assertLessEqual(percentage, 100.0)
+
+    def test_background_patch_percentage_must_be_in_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                "patching:\n"
+                "  train:\n"
+                "    background_only:\n"
+                "      enabled: true\n"
+                "      percentage_of_foreground: 101\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "between 0 and 100"):
                 load_config(config_path)
 
     def test_validation_section_is_persisted_with_patch_monitor(self) -> None:

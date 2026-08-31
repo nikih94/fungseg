@@ -11,6 +11,7 @@ from src.patching import PatchRecord
 
 def patch_distribution(records: list[PatchRecord]) -> dict[str, Any]:
     by_source = Counter(record.source_id for record in records)
+    background_only_count = sum(record.is_background_only for record in records)
     by_scale_label = Counter(record.scale_label for record in records)
     by_resolution_bucket = Counter(record.resolution_bucket for record in records)
     by_bucket_source = Counter(
@@ -18,6 +19,7 @@ def patch_distribution(records: list[PatchRecord]) -> dict[str, Any]:
     )
     return {
         "total_patches": len(records),
+        "background_only_patches": background_only_count,
         "by_source": dict(sorted(by_source.items())),
         "by_scale_label": dict(sorted(by_scale_label.items())),
         "by_resolution_bucket": dict(sorted(by_resolution_bucket.items())),

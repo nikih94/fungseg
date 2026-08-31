@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, Iterable
@@ -30,6 +31,8 @@ class PatchRecord:
     scale: float = 1.0
     scaled_width: int = 0
     scaled_height: int = 0
+    foreground_pixels: int = 0
+    is_background_only: bool = False
     resolution_bucket: str = "normal"
     scale_label: str = "normal"
     source_crop_size: int | None = None
@@ -361,6 +364,86 @@ def _filter_contained_patch_records(
     return [record for index, record in enumerate(records) if index not in removed_indices]
 
 
+def _background_only_config(phase_config: dict[str, Any]) -> tuple[bool, float]:
+    config = phase_config.get("background_only", {})
+    if not isinstance(config, dict):
+        raise ValueError("patching.train.background_only must be a mapping.")
+    enabled = bool(config.get("enabled", False))
+    percentage = float(config.get("percentage_of_foreground", 0.0))
+    if not 0.0 <= percentage <= 100.0:
+        raise ValueError(
+            "patching.train.background_only.percentage_of_foreground must be "
+            "between 0 and 100."
+        )
+    return enabled, percentage
+
+
+def _background_selection_rng(
+    base_seed: int,
+    epoch: int,
+    source_id: str,
+) -> np.random.Generator:
+    payload = f"{int(base_seed)}:{int(epoch)}:{source_id}".encode("utf-8")
+    seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+    return np.random.default_rng(seed)
+
+
+def _retain_source_patch_records(
+    candidates: list[PatchRecord],
+    phase_config: dict[str, Any],
+    *,
+    filter_empty_patches: bool,
+    min_foreground_pixels: int,
+    base_seed: int,
+    epoch: int,
+    source_id: str,
+) -> list[PatchRecord]:
+    if not filter_empty_patches:
+        return _filter_contained_patch_records(candidates, phase_config)
+
+    foreground_records = [
+        record
+        for record in candidates
+        if record.foreground_pixels >= min_foreground_pixels
+    ]
+    retained_foreground = _filter_contained_patch_records(
+        foreground_records,
+        phase_config,
+    )
+
+    background_enabled, percentage = _background_only_config(phase_config)
+    background_pool = [
+        record for record in candidates if record.is_background_only
+    ]
+    quota = (
+        min(
+            len(background_pool),
+            max(
+                1,
+                int(math.ceil(len(retained_foreground) * percentage / 100.0)),
+            ),
+        )
+        if background_enabled and background_pool
+        else 0
+    )
+    selected_background: list[PatchRecord] = []
+    if quota:
+        selection_rng = _background_selection_rng(base_seed, epoch, source_id)
+        selected_indices = selection_rng.choice(
+            len(background_pool),
+            size=quota,
+            replace=False,
+        )
+        selected_background = [
+            background_pool[int(index)] for index in selected_indices
+        ]
+
+    retained_ids = {
+        id(record) for record in retained_foreground + selected_background
+    }
+    return [record for record in candidates if id(record) in retained_ids]
+
+
 def build_patch_records(
     original_records: Iterable[OriginalImageRecord],
     patching_config: dict[str, Any],
@@ -423,9 +506,6 @@ def build_patch_records(
                 foreground_pixels = int(np.logical_or.reduce(
                     [patch > mask_threshold for patch in mask_patches]
                 ).sum())
-                if filter_empty_patches and foreground_pixels < min_foreground_pixels:
-                    continue
-
                 scale_label = "scaled_context" if scale > 1.0 else "normal"
                 source_patch_records.append(
                     PatchRecord(
@@ -442,11 +522,21 @@ def build_patch_records(
                         scale_label=scale_label,
                         source_crop_size=int(round(patch_size * scale)),
                         mask_paths=record.mask_paths,
+                        foreground_pixels=foreground_pixels,
+                        is_background_only=foreground_pixels == 0,
                     )
                 )
 
         patch_records.extend(
-            _filter_contained_patch_records(source_patch_records, phase_cfg)
+            _retain_source_patch_records(
+                source_patch_records,
+                phase_cfg,
+                filter_empty_patches=filter_empty_patches,
+                min_foreground_pixels=min_foreground_pixels,
+                base_seed=base_seed,
+                epoch=epoch,
+                source_id=record.source_id,
+            )
         )
 
     return patch_records
