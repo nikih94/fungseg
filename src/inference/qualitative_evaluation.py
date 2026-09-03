@@ -446,7 +446,12 @@ def _cross_fold_checkpoint_entries(checkpoints: list[CheckpointEntry]) -> list[C
             selected.append(sorted(global_best, key=lambda entry: entry.checkpoint)[0])
             continue
 
-        best_named = [entry for entry in entries if entry.checkpoint == "best.pt"]
+        best_named = [
+            entry
+            for preferred_name in ("best_current.pt", "best.pt")
+            for entry in entries
+            if entry.checkpoint == preferred_name
+        ]
         if best_named:
             selected.append(best_named[0])
             continue

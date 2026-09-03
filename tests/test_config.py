@@ -39,12 +39,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["train"]["monitor"], "val_dice_cldice_per_image")
         self.assertEqual(
             config["scheduler"]["monitor"],
-            "val_dice_cldice_per_image",
+            "val_loss",
         )
-        self.assertEqual(
-            config["validation"]["full_image"]["monitor"],
-            {"dice_weight": 0.6, "cldice_weight": 0.4},
-        )
+        self.assertEqual(config["scheduler"]["mode"], "min")
         self.assertFalse(config["train"]["best_interval_checkpoint"]["enabled"])
         self.assertFalse(config["train"]["save_last_checkpoint"])
         self.assertFalse(config["qualitative_evaluation"]["enabled"])
@@ -198,12 +195,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             persisted["validation"]["full_image"],
             {
-                "enabled": False,
+                "enabled": True,
                 "batch_size": 1,
                 "interval_epochs": 1,
                 "selection": "smallest_area",
                 "max_images": 3,
-                "monitor": {"dice_weight": 0.5, "cldice_weight": 0.5},
+                "soft_cldice_foreground_only": True,
+                "monitor": {"dice_weight": 0.7, "cldice_weight": 0.3},
             },
         )
 
@@ -271,14 +269,13 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "between 0 and 100"):
                 load_config(config_path)
 
-    def test_validation_section_is_persisted_with_patch_monitor(self) -> None:
-        config = load_config("config.yaml")
-        config["train"]["monitor"] = "val_dice_per_patch"
-        config["scheduler"] = {"name": "none"}
+    def test_validation_section_omits_legacy_fast_config(self) -> None:
+        config = load_config("multiclass-config.yaml")
 
         persisted = config_for_persistence(config)
 
-        self.assertNotIn("full_image_monitor", persisted["train"])
+        self.assertNotIn("fast", config["validation"])
+        self.assertNotIn("fast", persisted["validation"])
         self.assertIn("full_image", persisted["validation"])
 
     def test_persisted_binary_config_removes_multiclass_defaults(self) -> None:

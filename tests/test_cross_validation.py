@@ -11,7 +11,10 @@ from src.data.folds import (
     make_grouped_kfold_splits,
 )
 from src.train import (
+    build_checkpoint_test_comparison,
     build_cross_fold_test_summary,
+    checkpoint_selection_from_history,
+    persist_checkpoint_test_comparison,
     persist_cross_fold_test_summary,
     split_manifest_rows,
 )
@@ -126,6 +129,58 @@ class CrossValidationTests(unittest.TestCase):
             self.assertTrue((output_dir / "summary.csv").is_file())
             self.assertTrue((output_dir / "summary.json").is_file())
         self.assertEqual(persisted, summary)
+
+    def test_checkpoint_test_comparison_is_side_by_side_and_cross_fold(self) -> None:
+        results = []
+        for fold, current_dice, loss_dice in ((0, 0.8, 0.7), (1, 0.6, 0.9)):
+            for checkpoint_name, monitor, value in (
+                ("best_current.pt", "val_dice_cldice_per_image", current_dice),
+                ("best_val_loss.pt", "val_loss", loss_dice),
+            ):
+                results.append({
+                    "fold": fold,
+                    "checkpoint_name": checkpoint_name,
+                    "selection_monitor": monitor,
+                    "selection_mode": "min" if monitor == "val_loss" else "max",
+                    "selection_epoch": fold + 2,
+                    "selection_value": value,
+                    "checkpoint": f"fold_{fold}/{checkpoint_name}",
+                    "output_dir": f"test-evaluation/fold_{fold}/{Path(checkpoint_name).stem}",
+                    "num_test_images": 2,
+                    "num_join_images": 1,
+                    "threshold": "argmax",
+                    "mean_dice": value,
+                    "mean_dice_join": None if fold == 0 else value - 0.1,
+                })
+
+        rows, summary_rows = build_checkpoint_test_comparison(results)
+
+        self.assertEqual(len(rows), 4)
+        summaries = {row["checkpoint_name"]: row for row in summary_rows}
+        self.assertAlmostEqual(summaries["best_current.pt"]["mean_dice"], 0.7)
+        self.assertAlmostEqual(summaries["best_current.pt"]["mean_dice_std"], 0.1)
+        self.assertEqual(
+            summaries["best_val_loss.pt"]["mean_dice_join_num_folds"],
+            1,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persisted = persist_checkpoint_test_comparison(tmpdir, results, total_folds=2)
+            output_dir = Path(tmpdir)
+            self.assertEqual(persisted, summary_rows)
+            self.assertTrue((output_dir / "checkpoint_comparison.csv").is_file())
+            self.assertTrue((output_dir / "monitor_comparison_summary.csv").is_file())
+            self.assertTrue((output_dir / "fold_0" / "checkpoint_comparison.csv").is_file())
+            self.assertTrue((output_dir / "fold_1" / "checkpoint_comparison.csv").is_file())
+
+    def test_checkpoint_selection_uses_monitor_direction_and_first_tie(self) -> None:
+        history = [
+            {"epoch": 1, "score": 0.4, "loss": 0.7},
+            {"epoch": 2, "score": 0.8, "loss": 0.2},
+            {"epoch": 3, "score": 0.8, "loss": 0.4},
+        ]
+
+        self.assertEqual(checkpoint_selection_from_history(history, "score", "max"), (2, 0.8))
+        self.assertEqual(checkpoint_selection_from_history(history, "loss", "min"), (2, 0.2))
 
     def test_split_manifest_rows_include_train_and_val_sources(self) -> None:
         rows = split_manifest_rows(

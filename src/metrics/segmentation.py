@@ -287,7 +287,7 @@ def cldice_score_from_masks(
 
 
 def multiclass_predictions(logits: torch.Tensor) -> torch.Tensor:
-    return torch.softmax(logits, dim=1).argmax(dim=1)
+    return logits.argmax(dim=1)
 
 
 def multiclass_metrics_from_masks(
@@ -297,6 +297,7 @@ def multiclass_metrics_from_masks(
     smooth: float = 1e-6,
     *,
     loci_target_skeleton: torch.Tensor | None = None,
+    include_cldice: bool = True,
 ) -> dict[str, float]:
     """Return per-class and foreground-macro metrics for class-index masks."""
     classes = class_names or {"loci": 1, "inoculum": 2}
@@ -330,12 +331,13 @@ def multiclass_metrics_from_masks(
 
     metrics["dice_macro_foreground"] = macro_present(dice_values, valid_values)
     metrics["iou_macro_foreground"] = macro_present(iou_values, valid_values)
-    loci_id = classes.get("loci", 1)
-    metrics["cldice_loci"] = cldice_score_from_masks(
-        (predictions == loci_id).float(),
-        (targets == loci_id).float(),
-        target_skeleton=loci_target_skeleton,
-    )
+    if include_cldice:
+        loci_id = classes.get("loci", 1)
+        metrics["cldice_loci"] = cldice_score_from_masks(
+            (predictions == loci_id).float(),
+            (targets == loci_id).float(),
+            target_skeleton=loci_target_skeleton,
+        )
     return metrics
 
 

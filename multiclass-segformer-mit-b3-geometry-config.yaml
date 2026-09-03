@@ -26,6 +26,8 @@ data:
   pin_memory: true
   batch_size: 8 # DEFAULT - 8, for segformer on 1024 use 4
   image_size: null
+  train_patch_cache:
+    enabled: false
 
 patching:
   patch_size: 512 #512
@@ -60,17 +62,11 @@ patching:
       enabled: false
 
 validation:
-  fast:
-    foreground_only: true
-    overlap: 256
   full_image:
-    enabled: false
+    enabled: true
     interval_epochs: 1
     selection: smallest_area
     max_images: 3
-    monitor:
-      dice_weight: 0.5
-      cldice_weight: 0.5
 
 
 augmentations:
@@ -150,13 +146,13 @@ optimizer:
 
 scheduler:
   name: reduce_on_plateau
-  mode: max
+  mode: min
   factor: 0.5
   patience: 7
   min_lr:
     encoder: 1.0e-7
     decoder: 1.0e-6
-  monitor: val_dice_per_patch
+  monitor: val_loss
 
 
 
@@ -164,7 +160,7 @@ train:
   epochs: 60
   mixed_precision: true
   grad_clip: 1.0
-  monitor: val_dice_per_patch
+  monitor: val_dice_cldice_per_image
   monitor_mode: max
   best_interval_checkpoint:
     enabled: true
@@ -173,6 +169,7 @@ train:
   seed: 42
   device: auto
   use_tqdm: true
+  compute_hard_cldice_metrics: false
 
 inference:
   decision: argmax

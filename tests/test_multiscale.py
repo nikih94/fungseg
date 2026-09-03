@@ -307,7 +307,12 @@ class DynamicPatchingTests(unittest.TestCase):
                     "masks_dir": str(masks_dir),
                     "outputs_dir": str(root / "outputs"),
                 },
-                "data": {"image_extensions": [".tif"], "num_workers": 0, "batch_size": 1},
+                "data": {
+                    "image_extensions": [".tif"],
+                    "num_workers": 0,
+                    "batch_size": 1,
+                    "train_patch_cache": {"enabled": False},
+                },
                 "patching": patching_config,
                 "train": {"seed": 7},
             }

@@ -168,7 +168,7 @@ class GeometryAwareLossTests(unittest.TestCase):
             scheduler=None,
             device=torch.device("cpu"),
             train_config={
-                "monitor": "val_dice_per_patch",
+                "monitor": "val_dice_cldice_per_image",
                 "use_tqdm": False,
                 "mixed_precision": False,
             },
@@ -176,9 +176,14 @@ class GeometryAwareLossTests(unittest.TestCase):
             logger=None,
             fold_dir=Path("unused"),
             data_config={},
+            val_original_records=[object()],
             segmentation_config={
                 "mode": "multiclass",
                 "classes": {"background": 0, "loci": 1, "inoculum": 2},
+            },
+            validation_config={
+                "start_epoch": 1,
+                "full_image": {"enabled": True, "interval_epochs": 1},
             },
         )
         batch = {

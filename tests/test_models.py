@@ -195,12 +195,13 @@ class ModelFactoryTests(unittest.TestCase):
         self.assertEqual(
             config["validation"]["full_image"],
             {
-                "enabled": False,
+                "enabled": True,
                 "batch_size": 1,
                 "interval_epochs": 1,
                 "selection": "smallest_area",
                 "max_images": 3,
-                "monitor": {"dice_weight": 0.5, "cldice_weight": 0.5},
+                "soft_cldice_foreground_only": True,
+                "monitor": {"dice_weight": 0.7, "cldice_weight": 0.3},
             },
         )
 
@@ -223,10 +224,9 @@ class ModelFactoryTests(unittest.TestCase):
         self.assertEqual(config["model"]["encoder_name"], "mit_b5")
         self.assertEqual(config["model"]["num_classes"], 3)
         self.assertGreater(int(config["train"]["epochs"]), 0)
-        self.assertEqual(
-            config["scheduler"]["monitor"],
-            config["train"]["monitor"],
-        )
+        self.assertEqual(config["scheduler"]["monitor"], "val_loss")
+        self.assertEqual(config["scheduler"]["mode"], "min")
+        self.assertEqual(config["train"]["monitor"], "val_dice_cldice_per_image")
         self.assertEqual(
             set(config["scheduler"]["min_lr"]),
             {"encoder", "decoder"},

@@ -21,11 +21,11 @@ When documentation and implementation disagree, inspect the code, active YAML co
 ├── PATCHING_DESCRIPTION.md           # detailed patch-generation behavior
 ├── FIVES_REMOVAL.md                  # removal checklist for optional FIVES training support
 ├── config.yaml                       # current binary experiment
-├── multiclass-config.yaml            # multiclass U-Net++/ResNet34 experiment
+├── multiclass-config.yaml            # multiclass U-Net++/ResNet50 experiment
 ├── multiclass-segformer-mit-b1-refinement-config.yaml # multiclass MiT-B1 refinement experiment
 ├── multiclass-segformer-mit-b2-refinement-config.yaml # multiclass MiT-B2 refinement experiment
 ├── multiclass-segformer-config.yaml  # multiclass SegFormer MiT-B5 experiment
-├── multiclass-segformer-mit-b3-geometry-config.yaml # multiclass MiT-B3 geometry-loss experiment
+├── multiclass-segformer-mit-b3-geometry-config.yaml # obsolete MiT-B3 geometry-loss compatibility experiment
 ├── config_segformer_mit_b3.yaml      # binary SegFormer MiT-B3 experiment
 ├── requirements.txt                  # runtime dependencies
 ├── data/                             # local datasets and split metadata
@@ -36,6 +36,8 @@ When documentation and implementation disagree, inspect the code, active YAML co
 │   ├── benchmark_cldice.py           # Reference Zhang CPU/CUDA diagnostic benchmark
 │   ├── benchmark_cldice_patches.py   # Batched foreground-patch hard-clDice benchmark
 │   ├── data/soft_cldice_iterations.py # Per-mask training-iteration CSV mapping
+│   ├── data/patch_cache.py           # Run-level static fungal patch memmap cache
+│   ├── utils/run_resume.py           # Atomic fold-resume state and cleanup helpers
 │   ├── inference/                    # inference, recursive prediction, and evaluation workflows
 │   ├── models/segformer_refinement.py # MiT-B1/B2 full-resolution refinement model
 │   └── ...                           # data, engine, models, patching, metrics, and utilities
@@ -104,7 +106,7 @@ Do not commit private datasets, large archives, checkpoints, or generated masks 
 - `src/models/`: model factory, SegFormer full-resolution refinement, output normalization, and decoder normalization helpers.
 - `src/losses/`: binary and multiclass loss implementations plus the loss factory.
 - `src/metrics/`: segmentation metrics and loss-component diagnostics.
-- `src/engine/`: training/validation loop, stitched full-image validation, checkpointing, metric export, and TensorBoard logging.
+- `src/engine/`: training/validation loop, single-pass stitched full-image validation with patch loss, checkpointing, metric export, and TensorBoard logging.
 - `src/optim/` and `src/schedulers/`: configurable optimizer and scheduler factories.
 - `src/utils/`: config merging/compatibility, checkpoint I/O, serialization, logging, and reproducibility helpers.
 
@@ -115,7 +117,7 @@ Keep responsibilities within these boundaries. Add behavior to the appropriate p
 1. Configuration is the source of truth. Add new user-tunable behavior to YAML and `src/utils/config.py` defaults rather than hard-coding it in an entrypoint.
 2. Preserve source-image grouping. Any new sampler, patch transform, or validation path must retain source IDs and prevent data leakage.
 3. Keep binary and multiclass semantics explicit. Binary models use one sigmoid output and thresholding; multiclass models use three class logits, softmax, and argmax. Do not silently apply binary threshold logic to multiclass outputs.
-4. Preserve deterministic geometry. Fast patch validation must cover image edges according to its configured overlap; stitched full-image validation, test evaluation, and inference must cover edges and average overlapping predictions consistently.
+4. Preserve deterministic geometry. Stitched full-image validation, test evaluation, and inference must cover edges and average overlapping predictions consistently.
 5. Use the existing factories for models, losses, optimizers, and schedulers. When adding a supported option, update the relevant factory, configuration example, tests, and docs together.
 6. Treat each checked-in experiment YAML as an independent source of truth. Tests may enforce shared pipeline semantics such as multiclass class IDs, output shape, and monitor availability, but must not require tunable patching, augmentation, loss, optimizer, scheduler, or training values to match another experiment. Architecture guides document option behavior; exact experiment values belong in the active YAML.
 7. Keep masks and predictions shape-safe. Check image/mask dimensions at discovery or evaluation boundaries and preserve class IDs or binary encoding when saving outputs.

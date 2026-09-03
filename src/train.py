@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import json
 import statistics
 from copy import deepcopy
 from datetime import datetime
@@ -10,7 +12,12 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
-from src.data.dataset import SegmentationPatchDataset, get_train_transforms, get_val_transforms
+from src.data.dataset import SegmentationPatchDataset, get_train_transforms
+from src.data.patch_cache import (
+    CachedSegmentationPatchDataset,
+    build_epoch_training_crop_records,
+    build_static_patch_cache,
+)
 from src.data.discovery import discover_image_mask_pairs, discover_image_mask_sets
 from src.data.fives import FivesPatchDataset, load_fives_training_records
 from src.data.folds import (
@@ -22,7 +29,7 @@ from src.data.folds import (
 )
 from src.data.sampling import patch_distribution
 from src.data.soft_cldice_iterations import map_training_iterations_to_sources
-from src.engine.trainer import Trainer
+from src.engine.trainer import Trainer, best_checkpoint_specs
 from src.losses.factory import build_loss
 from src.losses.geometry import build_geometry_weight_map_builder
 from src.models.factory import build_model
@@ -33,6 +40,10 @@ from src.utils.config import config_for_persistence, load_config, resolve_mask_d
 from src.utils.io import ensure_dir, save_csv, save_json, save_yaml
 from src.utils.logging import setup_logger
 from src.utils.seed import set_seed
+from src.utils.run_resume import (
+    append_resume_history, atomic_json, clean_incomplete_folds,
+    contiguous_completed_folds, read_csv_rows, validate_completed_fold,
+)
 
 
 TORCH_SHARING_STRATEGY = "file_system"
@@ -160,9 +171,117 @@ def persist_cross_fold_test_summary(
     return payload
 
 
+def build_checkpoint_test_comparison(
+    checkpoint_results: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Build per-checkpoint rows and cross-fold monitor summaries."""
+    metric_names = sorted({
+        key
+        for result in checkpoint_results
+        for key, value in result.items()
+        if key.startswith("mean_")
+        and value is not None
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    })
+    rows = [
+        {
+            "fold": int(result["fold"]),
+            "checkpoint_name": result["checkpoint_name"],
+            "selection_monitor": result["selection_monitor"],
+            "selection_mode": result["selection_mode"],
+            "selection_epoch": int(result["selection_epoch"]),
+            "selection_value": float(result["selection_value"]),
+            "evaluation_id": result.get("evaluation_id"),
+            "canonical_evaluated_checkpoint": result.get(
+                "canonical_evaluated_checkpoint", result.get("checkpoint")
+            ),
+            "shared_evaluation": result.get("shared_evaluation", False),
+            "matching_checkpoint_names": result.get(
+                "matching_checkpoint_names", result["checkpoint_name"]
+            ),
+            "checkpoint": result["checkpoint"],
+            "output_dir": result["output_dir"],
+            "num_test_images": int(result["num_test_images"]),
+            "num_join_images": result.get("num_join_images"),
+            "threshold": result["threshold"],
+            **{metric_name: result.get(metric_name) for metric_name in metric_names},
+        }
+        for result in checkpoint_results
+    ]
+
+    summary_rows: list[dict] = []
+    checkpoint_names = list(dict.fromkeys(
+        result["checkpoint_name"] for result in checkpoint_results
+    ))
+    for checkpoint_name in checkpoint_names:
+        selected = [
+            result
+            for result in checkpoint_results
+            if result["checkpoint_name"] == checkpoint_name
+        ]
+        summary_row = {
+            "checkpoint_name": checkpoint_name,
+            "selection_monitor": selected[0]["selection_monitor"],
+            "selection_mode": selected[0]["selection_mode"],
+            "num_folds": len(selected),
+        }
+        for metric_name in metric_names:
+            values = [
+                float(result[metric_name])
+                for result in selected
+                if result.get(metric_name) is not None
+            ]
+            summary_row[metric_name] = (statistics.mean(values) if values else None)
+            summary_row[f"{metric_name}_std"] = (
+                statistics.pstdev(values) if len(values) > 1 else (0.0 if values else None)
+            )
+            summary_row[f"{metric_name}_num_folds"] = len(values)
+        summary_rows.append(summary_row)
+    return rows, summary_rows
+
+
+def persist_checkpoint_test_comparison(
+    output_dir: str | Path,
+    checkpoint_results: list[dict],
+    total_folds: int,
+    *,
+    persist_per_fold: bool = True,
+) -> list[dict]:
+    output_dir = ensure_dir(output_dir)
+    rows, summary_rows = build_checkpoint_test_comparison(checkpoint_results)
+    save_csv(output_dir / "checkpoint_comparison.csv", rows)
+    save_csv(output_dir / "monitor_comparison_summary.csv", summary_rows)
+    if total_folds > 1 and persist_per_fold:
+        for fold in sorted({int(row["fold"]) for row in rows}):
+            save_csv(
+                output_dir / f"fold_{fold}" / "checkpoint_comparison.csv",
+                [row for row in rows if int(row["fold"]) == fold],
+            )
+    return summary_rows
+
+
+def checkpoint_selection_from_history(
+    history: list[dict],
+    monitor: str,
+    mode: str,
+) -> tuple[int, float]:
+    candidates = [row for row in history if monitor in row]
+    if not candidates:
+        raise RuntimeError(f"No validation history is available for {monitor}.")
+    selected = (
+        max(candidates, key=lambda row: row[monitor])
+        if mode == "max"
+        else min(candidates, key=lambda row: row[monitor])
+    )
+    return int(selected["epoch"]), float(selected[monitor])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train fungi segmentation with grouped cross-validation.")
-    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--config", help="Path to the YAML config file (default: config.yaml).")
+    source.add_argument("--resume-run", help="Existing run directory; its saved config.yaml is authoritative.")
     return parser.parse_args()
 
 
@@ -231,23 +350,6 @@ def build_splits(config: dict, original_records: list) -> tuple[list[SplitDefini
         f"Unsupported split mode: {split_mode}. Expected 'csv', 'csv_kfold', "
         "'train_val', or 'kfold'."
     )
-
-
-def build_fast_validation_patching_config(
-    patching_config: dict,
-    validation_config: dict,
-) -> dict:
-    """Build deterministic fast-validation settings with 50% patch overlap."""
-    fast_config = validation_config.get("fast", {})
-    patch_size = int(patching_config["patch_size"])
-    config = deepcopy(patching_config)
-    overlap = patch_size // 2
-    config["overlap"] = overlap
-    config["stride"] = overlap
-    config["filter_empty_patches"] = bool(
-        fast_config.get("foreground_only", True)
-    )
-    return config
 
 
 def build_full_image_validation_patching_config(patching_config: dict) -> dict:
@@ -438,12 +540,11 @@ def log_fold_summary(
     val_originals: list,
     test_originals: list,
     train_patch_records: list,
-    val_patch_records: list,
     test_patch_records: list,
 ) -> None:
     split_label = "Fold" if split_mode == "kfold" else "Split"
     logger.info(
-        "%s %s/%s | train_images=%s | val_images=%s | test_images=%s | train_patches=%s | val_patches=%s | test_patches=%s",
+        "%s %s/%s | train_images=%s | val_images=%s | test_images=%s | train_patches=%s | test_patches=%s",
         split_label,
         fold_index + 1,
         total_folds,
@@ -451,7 +552,6 @@ def log_fold_summary(
         len(val_originals),
         len(test_originals),
         len(train_patch_records),
-        len(val_patch_records),
         len(test_patch_records),
     )
     # logger.info(
@@ -464,7 +564,11 @@ def log_fold_summary(
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
+    resume_run = Path(args.resume_run).resolve() if args.resume_run else None
+    config_path = resume_run / "config.yaml" if resume_run else Path(args.config or "config.yaml")
+    if resume_run is not None and not config_path.is_file():
+        raise FileNotFoundError(f"Resume run has no saved config: {config_path}")
+    config = load_config(config_path)
     training_date = datetime.now().astimezone().date().isoformat()
 
     set_seed(int(config["train"]["seed"]))
@@ -472,13 +576,14 @@ def main() -> None:
 
     project_name = config["project"]["name"]
     runs_root = ensure_dir(Path(config["paths"]["runs_dir"]))
-    run_dir = create_run_dir(runs_root, project_name)
+    run_dir = resume_run if resume_run is not None else create_run_dir(runs_root, project_name)
     outputs_root = ensure_dir(Path(config["paths"]["outputs_dir"]) / project_name)
     logger = setup_logger("train", run_dir / "logs")
-    save_yaml(
-        run_dir / "config.yaml",
-        config_for_persistence(config, training_date=training_date),
-    )
+    if resume_run is None:
+        save_yaml(
+            run_dir / "config.yaml",
+            config_for_persistence(config, training_date=training_date),
+        )
     sharing_strategy = configure_torch_multiprocessing()
     logger.info("Using device: %s", device)
     logger.info("Run directory: %s", run_dir)
@@ -552,8 +657,16 @@ def main() -> None:
     fives_patch_records = load_fives_training_records(config)
     splits, split_mode = build_splits(config, original_records)
     manifest_rows = split_manifest_rows(splits)
-    save_csv(run_dir / "split_manifest.csv", manifest_rows)
-    save_json(run_dir / "split_manifest.json", {"splits": manifest_rows})
+    if resume_run is not None:
+        manifest_path = run_dir / "split_manifest.json"
+        if not manifest_path.is_file():
+            raise RuntimeError(f"Cannot resume without split manifest: {manifest_path}")
+        saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8")).get("splits", [])
+        if saved_manifest != manifest_rows:
+            raise RuntimeError("Saved split manifest does not match rediscovered data and recomputed splits.")
+    else:
+        save_csv(run_dir / "split_manifest.csv", manifest_rows)
+        save_json(run_dir / "split_manifest.json", {"splits": manifest_rows})
     log_run_summary(
         logger,
         config,
@@ -585,6 +698,8 @@ def main() -> None:
 
     fold_results = []
     fold_test_results: list[dict] = []
+    checkpoint_test_results: list[dict] = []
+    checkpoint_comparison_summary: list[dict] = []
     cross_fold_test_summary: dict | None = None
     all_epoch_rows: list[dict[str, float]] = []
     data_cfg = config["data"]
@@ -596,16 +711,147 @@ def main() -> None:
     full_image_validation_patching_cfg = build_full_image_validation_patching_config(
         patching_cfg
     )
-    fast_validation_patching_cfg = build_fast_validation_patching_config(
-        patching_cfg,
-        validation_cfg,
-    )
     augmentations_cfg = config.get("augmentations", {})
     target_weight_builder = build_geometry_weight_map_builder(config["loss"])
     total_folds = len(splits)
+    completed_folds: list[int] = []
+    first_incomplete = 0
+    if resume_run is not None:
+        existing_fold_rows = read_csv_rows(run_dir / "fold_metrics.csv")
+        completed_folds = contiguous_completed_folds(existing_fold_rows, total_folds)
+        test_required = bool(config.get("test_evaluation", {}).get("enabled", True))
+        for completed_fold in completed_folds:
+            validate_completed_fold(run_dir, completed_fold, test_required)
+        first_incomplete = len(completed_folds)
+        removed = clean_incomplete_folds(run_dir, first_incomplete, total_folds)
+        # Preserve only completed-fold rows in run-level incremental artifacts.
+        save_csv(run_dir / "fold_metrics.csv", [row for row in existing_fold_rows if int(row["fold"]) < first_incomplete])
+        existing_epoch_rows = read_csv_rows(run_dir / "epoch_metrics.csv")
+        save_csv(run_dir / "epoch_metrics.csv", [row for row in existing_epoch_rows if int(row["fold"]) < first_incomplete])
+        comparison_path = run_dir / "test-evaluation" / "checkpoint_comparison.csv"
+        old_comparisons = read_csv_rows(comparison_path)
+        if old_comparisons:
+            save_csv(comparison_path, [row for row in old_comparisons if int(row["fold"]) < first_incomplete])
+        append_resume_history(run_dir, {
+            "first_incomplete_fold": first_incomplete,
+            "completed_folds": completed_folds,
+            "removed_partial_artifacts": removed,
+            "note": "Incomplete fold restarts at epoch 1 with current code and saved config.",
+        })
+        if first_incomplete >= total_folds:
+            atomic_json(run_dir / "run_state.json", {
+                "total_folds": total_folds, "completed_folds": completed_folds,
+                "active_fold": None, "attempt_count": 1, "status": "complete",
+            })
+            logger.info("All %s folds are already complete; nothing to resume.", total_folds)
+            return
+    state_path = run_dir / "run_state.json"
+    previous_attempts = 0
+    if state_path.is_file():
+        previous_attempts = int(json.loads(state_path.read_text(encoding="utf-8")).get("attempt_count", 0))
+    attempt_count = previous_attempts + 1
+    atomic_json(state_path, {
+        "total_folds": total_folds, "completed_folds": completed_folds,
+        "active_fold": first_incomplete if first_incomplete < total_folds else None,
+        "attempt_count": attempt_count, "status": "running",
+    })
+
+    if resume_run is not None:
+        # Reconstruct aggregation state without changing completed fold artifacts.
+        for row in read_csv_rows(run_dir / "fold_metrics.csv"):
+            converted = {}
+            for key, value in row.items():
+                try:
+                    converted[key] = float(value) if key != "fold" and value != "" else (int(value) if key == "fold" else None)
+                except (TypeError, ValueError):
+                    converted[key] = value
+            fold_results.append(converted)
+        all_epoch_rows.extend(read_csv_rows(run_dir / "epoch_metrics.csv"))
+        for raw_row in read_csv_rows(run_dir / "test-evaluation" / "checkpoint_comparison.csv"):
+            row = dict(raw_row)
+            for key in ("fold", "selection_epoch", "num_test_images", "num_join_images"):
+                if row.get(key) not in (None, ""):
+                    row[key] = int(row[key])
+            for key, value in list(row.items()):
+                if (key == "selection_value" or key.startswith("mean_")) and value not in (None, ""):
+                    row[key] = float(value)
+            checkpoint_test_results.append(row)
+        for row in checkpoint_test_results:
+            if row.get("checkpoint_name") != "best_current.pt":
+                continue
+            converted = {
+                key: value for key, value in row.items()
+                if key.startswith("mean_") or key in {
+                    "fold", "checkpoint", "output_dir", "threshold",
+                    "num_test_images", "num_join_images",
+                }
+            }
+            fold_test_results.append(converted)
+        if checkpoint_test_results:
+            checkpoint_comparison_summary = persist_checkpoint_test_comparison(
+                run_dir / "test-evaluation", checkpoint_test_results, total_folds,
+                persist_per_fold=False,
+            )
+        if fold_test_results and total_folds > 1:
+            cross_fold_test_summary = persist_cross_fold_test_summary(
+                run_dir / "test-evaluation", fold_test_results
+            )
+
+    cache_enabled = bool(data_cfg.get("train_patch_cache", {}).get("enabled", True))
+    static_iteration_cfg = config["loss"].get("static_patch_iterations", {})
+    compute_static_iterations = (
+        cache_enabled
+        and soft_cldice_iterations is None
+        and str(config["loss"]["name"]).lower() in SOFT_CLDICE_LOSS_NAMES
+        and bool(static_iteration_cfg.get("enabled", True))
+    )
+    static_cache = None
+    if cache_enabled:
+        training_source_ids = {
+            source_id for split in splits for source_id in split.train_sources
+        }
+        cache_originals = [
+            record for record in original_records
+            if record.source_id in training_source_ids
+        ]
+        static_cache = build_static_patch_cache(
+            cache_originals,
+            run_dir,
+            patching_cfg,
+            segmentation_mode=segmentation_mode,
+            merge_join_masks=merge_join_masks,
+            compute_soft_cldice_iterations=compute_static_iterations,
+            iteration_margin=int(static_iteration_cfg.get("margin_iterations", 10)),
+            iteration_round_up_to=int(static_iteration_cfg.get("round_up_to", 10)),
+        )
+        atexit.register(static_cache.cleanup)
+        iteration_values = [
+            record.soft_cldice_iterations for record in static_cache.records
+            if record.soft_cldice_iterations is not None
+        ]
+        logger.info(
+            "Static training cache ready | regions=%s | region_size=%sx%s | "
+            "sources=%s | soft_cldice_iterations=%s",
+            len(static_cache.records),
+            int(patching_cfg["patch_size"]) + int(patching_cfg["overlap"]),
+            int(patching_cfg["patch_size"]) + int(patching_cfg["overlap"]),
+            len(cache_originals),
+            (
+                f"{min(iteration_values)}-{max(iteration_values)}"
+                if iteration_values else "fixed-or-csv"
+            ),
+        )
 
     for fold_index, split in enumerate(splits):
+        if fold_index in completed_folds:
+            logger.info("Skipping completed fold %s", fold_index)
+            continue
+        atomic_json(state_path, {
+            "total_folds": total_folds, "completed_folds": completed_folds,
+            "active_fold": fold_index, "attempt_count": attempt_count, "status": "running",
+        })
         logger.info("Preparing fold %s", fold_index)
+        set_seed(int(config["train"]["seed"]) + fold_index)
         fold_dir = ensure_dir(run_dir / f"fold_{fold_index}")
         tensorboard_dir = ensure_dir(fold_dir / "tensorboard")
         train_sources = split.train_sources
@@ -616,31 +862,30 @@ def main() -> None:
         val_originals = [record for record in original_records if record.source_id in set(val_sources)]
         test_originals = [record for record in original_records if record.source_id in set(test_sources)]
         full_image_enabled = bool(validation_cfg["full_image"]["enabled"])
-        full_image_val_originals = (
-            select_full_image_validation_records(val_originals, validation_cfg)
-            if full_image_enabled
-            else []
+        full_image_val_originals = select_full_image_validation_records(
+            val_originals, validation_cfg
         )
 
-        train_patch_records = build_patch_records(
-            train_originals,
-            patching_cfg,
-            phase="train",
-            epoch=1,
-            base_seed=int(config["train"]["seed"]),
-        )
-        combined_train_patch_records = train_patch_records + fives_patch_records
-        val_patch_records = build_patch_records(
-            val_originals,
-            fast_validation_patching_cfg,
-            phase="validation",
-        )
-        if not val_patch_records:
-            raise ValueError(
-                "Fast validation produced no patches. Lower "
-                "patching.min_foreground_pixels or set "
-                "validation.fast.foreground_only: false."
+        if static_cache is not None:
+            train_patch_records = build_epoch_training_crop_records(
+                static_cache,
+                train_sources,
+                patching_cfg,
+                epoch=1,
+                base_seed=int(config["train"]["seed"]),
+                fold_index=fold_index,
+                segmentation_mode=segmentation_mode,
+                merge_join_masks=merge_join_masks,
             )
+        else:
+            train_patch_records = build_patch_records(
+                train_originals,
+                patching_cfg,
+                phase="train",
+                epoch=1,
+                base_seed=int(config["train"]["seed"]),
+            )
+        combined_train_patch_records = train_patch_records + fives_patch_records
         test_patch_records = build_patch_records(
             test_originals,
             patching_cfg,
@@ -655,15 +900,7 @@ def main() -> None:
             val_originals=val_originals,
             test_originals=test_originals,
             train_patch_records=combined_train_patch_records,
-            val_patch_records=val_patch_records,
             test_patch_records=test_patch_records,
-        )
-        logger.info(
-            "Fast validation foreground_only=%s | effective_overlap=%s | stride=%s | patches=%s",
-            validation_cfg["fast"]["foreground_only"],
-            fast_validation_patching_cfg["overlap"],
-            fast_validation_patching_cfg["stride"],
-            len(val_patch_records),
         )
         logger.info(
             "Validation start_epoch=%s | full_image_enabled=%s | full_image_batch_size=%s | selection=%s | images=%s/%s | sources=%s",
@@ -701,33 +938,46 @@ def main() -> None:
                 segmentation_mode=segmentation_mode,
                 target_weight_builder=target_weight_builder,
                 soft_cldice_iterations=(
-                    {} if soft_cldice_iterations is not None else None
+                    {}
+                    if soft_cldice_iterations is not None or compute_static_iterations
+                    else None
                 ),
                 default_soft_cldice_iterations=int(config["loss"]["iterations"]),
             )
             if fives_patch_records
             else None
         )
-        val_dataset = SegmentationPatchDataset(
-            records=val_patch_records,
-            mask_threshold=int(patching_cfg["mask_threshold"]),
-            transforms=get_val_transforms(
-                data_cfg.get("image_size"),
-                augmentations_config=augmentations_cfg,
-            ),
-            image_resampling=str(patching_cfg.get("image_resampling", "lanczos")),
-            mask_resampling=str(patching_cfg.get("mask_resampling", "foreground_preserving")),
-            segmentation_mode=segmentation_mode,
-            target_weight_builder=target_weight_builder,
-            merge_join_masks=merge_join_masks,
-            soft_cldice_iterations=soft_cldice_iterations,
-            default_soft_cldice_iterations=int(config["loss"]["iterations"]),
-        )
 
+        fold_static_records = (
+            [
+                record for record in static_cache.records
+                if record.source_id in set(train_sources)
+            ]
+            if static_cache is not None
+            else []
+        )
+        fold_iteration_values = [
+            record.soft_cldice_iterations for record in fold_static_records
+            if record.soft_cldice_iterations is not None
+        ]
         patch_diagnostics = {
             "train": patch_distribution(combined_train_patch_records),
+            "static_cache": {
+                "enabled": static_cache is not None,
+                "regions": len(fold_static_records),
+                "cache_size": (
+                    int(patching_cfg["patch_size"]) + int(patching_cfg["overlap"])
+                    if static_cache is not None else None
+                ),
+                "automatic_soft_cldice_iterations": compute_static_iterations,
+                "minimum_soft_cldice_iterations": (
+                    min(fold_iteration_values) if fold_iteration_values else None
+                ),
+                "maximum_soft_cldice_iterations": (
+                    max(fold_iteration_values) if fold_iteration_values else None
+                ),
+            },
             "fives": patch_distribution(fives_patch_records),
-            "val": patch_distribution(val_patch_records),
             "test": patch_distribution(test_patch_records),
             "full_image_validation": {
                 "enabled": full_image_enabled,
@@ -750,16 +1000,40 @@ def main() -> None:
         save_json(fold_dir / "patch_distribution.json", patch_diagnostics)
 
         def make_train_loader_for_epoch(epoch: int) -> DataLoader:
-            epoch_records = build_patch_records(
-                train_originals,
-                patching_cfg,
-                phase="train",
-                epoch=epoch,
-                base_seed=int(config["train"]["seed"]),
-            )
-            train_dataset.set_records(epoch_records)
+            if static_cache is not None:
+                epoch_records = build_epoch_training_crop_records(
+                    static_cache,
+                    train_sources,
+                    patching_cfg,
+                    epoch=epoch,
+                    base_seed=int(config["train"]["seed"]),
+                    fold_index=fold_index,
+                    segmentation_mode=segmentation_mode,
+                    merge_join_masks=merge_join_masks,
+                )
+                fungal_epoch_dataset = CachedSegmentationPatchDataset(
+                    epoch_records,
+                    static_cache,
+                    train_transforms,
+                    segmentation_mode,
+                    int(patching_cfg["mask_threshold"]),
+                    merge_join_masks,
+                    target_weight_builder,
+                    soft_cldice_iterations,
+                    int(config["loss"]["iterations"]),
+                )
+            else:
+                epoch_records = build_patch_records(
+                    train_originals,
+                    patching_cfg,
+                    phase="train",
+                    epoch=epoch,
+                    base_seed=int(config["train"]["seed"]),
+                )
+                train_dataset.set_records(epoch_records)
+                fungal_epoch_dataset = train_dataset
             return make_loader(
-                combine_training_datasets(train_dataset, fives_dataset),
+                combine_training_datasets(fungal_epoch_dataset, fives_dataset),
                 batch_size=int(data_cfg["batch_size"]),
                 num_workers=int(data_cfg["num_workers"]),
                 pin_memory=bool(data_cfg["pin_memory"]),
@@ -772,19 +1046,6 @@ def main() -> None:
                 ),
             )
 
-        val_loader = make_loader(
-            val_dataset,
-            batch_size=int(data_cfg["batch_size"]),
-            num_workers=int(data_cfg["num_workers"]),
-            pin_memory=bool(data_cfg["pin_memory"]),
-            shuffle=False,
-            persistent_workers=bool(data_cfg.get("persistent_workers", False)),
-            prefetch_factor=(
-                int(data_cfg["prefetch_factor"])
-                if data_cfg.get("prefetch_factor") is not None
-                else None
-            ),
-        )
 
         model = build_model(config["model"]).to(device)
         loss_fn = build_loss(config["loss"])
@@ -817,11 +1078,13 @@ def main() -> None:
             segmentation_config=config.get("segmentation", {}),
             join_masks_config=join_masks_cfg,
             validation_config=validation_cfg,
+            target_weight_builder=target_weight_builder,
+            soft_cldice_iterations=soft_cldice_iterations,
+            default_soft_cldice_iterations=int(config["loss"]["iterations"]),
             epoch_metrics_callback=persist_run_epoch_metrics,
         )
         fold_result = trainer.fit(
             None,
-            val_loader,
             epochs=int(config["train"]["epochs"]),
             train_loader_factory=make_train_loader_for_epoch,
         )
@@ -829,37 +1092,68 @@ def main() -> None:
         if test_originals and bool(config.get("test_evaluation", {}).get("enabled", True)):
             from src.inference.test_evaluation import run_test_evaluation
 
-            best_checkpoint_path = fold_dir / "best.pt"
-            evaluation_dir = run_dir / "test-evaluation"
-            if total_folds > 1:
-                evaluation_dir = evaluation_dir / f"fold_{fold_index}"
-            test_result = run_test_evaluation(
-                best_checkpoint_path,
-                config,
-                evaluation_dir,
-                device,
+            evaluation_root = run_dir / "test-evaluation"
+            fold_evaluation_root = (
+                evaluation_root / f"fold_{fold_index}"
+                if total_folds > 1
+                else evaluation_root
             )
-            fold_result.update({
-                "test_dice_per_image": test_result["mean_dice"],
-                "test_iou_per_image": test_result["mean_iou"],
-            })
-            if total_folds > 1:
-                fold_test_results.append({"fold": fold_index, **test_result})
-                cross_fold_test_summary = persist_cross_fold_test_summary(
-                    run_dir / "test-evaluation",
-                    fold_test_results,
+            selections: list[dict] = []
+            for checkpoint_name, monitor, mode, _ in best_checkpoint_specs(segmentation_mode):
+                checkpoint_path = fold_dir / checkpoint_name
+                if not checkpoint_path.is_file():
+                    raise RuntimeError(f"Expected validation checkpoint was not saved: {checkpoint_path}")
+                selected_epoch, selected_value = checkpoint_selection_from_history(
+                    fold_result["history"], monitor, mode
                 )
-            logger.info(
-                "Fold %s test evaluation - test_dice_per_image=%.4f test_iou_per_image=%.4f output=%s",
-                fold_index,
-                test_result["mean_dice"],
-                test_result["mean_iou"],
-                evaluation_dir,
-            )
+                selections.append({
+                    "checkpoint_name": checkpoint_name, "checkpoint_path": checkpoint_path,
+                    "selection_monitor": monitor, "selection_mode": mode,
+                    "selection_epoch": selected_epoch, "selection_value": selected_value,
+                })
+
+            by_epoch: dict[int, list[dict]] = {}
+            for selection in selections:
+                by_epoch.setdefault(selection["selection_epoch"], []).append(selection)
+            for selected_epoch, matching in by_epoch.items():
+                canonical = matching[0]
+                evaluation_id = f"fold_{fold_index}_epoch_{selected_epoch}"
+                evaluation_dir = fold_evaluation_root / f"epoch_{selected_epoch}"
+                test_result = run_test_evaluation(
+                    canonical["checkpoint_path"], config, evaluation_dir, device
+                )
+                matching_names = [item["checkpoint_name"] for item in matching]
+                for selection in matching:
+                    comparison_result = {
+                        "fold": fold_index,
+                        **{key: value for key, value in selection.items() if key != "checkpoint_path"},
+                        "evaluation_id": evaluation_id,
+                        "canonical_evaluated_checkpoint": str(canonical["checkpoint_path"]),
+                        "shared_evaluation": len(matching) > 1,
+                        "matching_checkpoint_names": ";".join(matching_names),
+                        **test_result,
+                    }
+                    checkpoint_test_results.append(comparison_result)
+                    if selection["checkpoint_name"] == "best_current.pt":
+                        fold_result.update({
+                            "test_dice_per_image": test_result["mean_dice"],
+                            "test_iou_per_image": test_result["mean_iou"],
+                        })
+                        if total_folds > 1:
+                            fold_test_results.append({"fold": fold_index, **test_result})
+                            cross_fold_test_summary = persist_cross_fold_test_summary(
+                                evaluation_root, fold_test_results
+                            )
+                checkpoint_comparison_summary = persist_checkpoint_test_comparison(
+                    evaluation_root, checkpoint_test_results, total_folds
+                )
+                logger.info(
+                    "Fold %s epoch %s test evaluation shared by %s - output=%s",
+                    fold_index, selected_epoch, ", ".join(matching_names), evaluation_dir,
+                )
         fold_result["fold"] = fold_index
         fold_result["num_train_patches"] = len(combined_train_patch_records)
         fold_result["num_train_fives_patches"] = len(fives_patch_records)
-        fold_result["num_val_patches"] = len(val_patch_records)
         fold_result["num_test_patches"] = len(test_patch_records)
         fold_result["num_train_normal_patches"] = sum(
             1 for record in combined_train_patch_records if record.scale_label == "normal"
@@ -867,29 +1161,21 @@ def main() -> None:
         fold_result["num_train_scaled_context_patches"] = sum(
             1 for record in combined_train_patch_records if record.scale_label == "scaled_context"
         )
-        fold_result["num_val_normal_patches"] = sum(
-            1 for record in val_patch_records if record.scale_label == "normal"
-        )
         fold_result["num_test_normal_patches"] = sum(
             1 for record in test_patch_records if record.scale_label == "normal"
         )
         fold_results.append(fold_result)
         save_csv(
             run_dir / "fold_metrics.csv",
-            [
-                {key: value for key, value in item.items() if key != "history"}
-                for item in fold_results
-            ],
+            [{key: value for key, value in item.items() if key != "history"} for item in fold_results],
         )
+        completed_folds.append(fold_index)
+        atomic_json(state_path, {
+            "total_folds": total_folds, "completed_folds": completed_folds,
+            "active_fold": None, "attempt_count": attempt_count,
+            "status": "complete" if len(completed_folds) == total_folds else "running",
+        })
 
-    val_dice_per_patch_values = [float(item["val_dice_per_patch"]) for item in fold_results]
-    val_iou_per_patch_values = [float(item["val_iou_per_patch"]) for item in fold_results]
-    val_dice_macro_resolution_values = [
-        float(item["val_dice_macro_resolution"]) for item in fold_results if item.get("val_dice_macro_resolution") is not None
-    ]
-    val_iou_macro_resolution_values = [
-        float(item["val_iou_macro_resolution"]) for item in fold_results if item.get("val_iou_macro_resolution") is not None
-    ]
     val_dice_per_image_mean, val_dice_per_image_std = _collect_optional_metric(
         [item.get("val_dice_per_image") for item in fold_results]
     )
@@ -927,30 +1213,7 @@ def main() -> None:
         **segmentation_summary_metadata(config, mask_dir),
         "folds": fold_results,
         "test_evaluation": cross_fold_test_summary,
-        "mean_dice_per_patch": statistics.mean(val_dice_per_patch_values),
-        "std_dice_per_patch": (
-            statistics.pstdev(val_dice_per_patch_values) if len(val_dice_per_patch_values) > 1 else 0.0
-        ),
-        "mean_iou_per_patch": statistics.mean(val_iou_per_patch_values),
-        "std_iou_per_patch": (
-            statistics.pstdev(val_iou_per_patch_values) if len(val_iou_per_patch_values) > 1 else 0.0
-        ),
-        "mean_dice_macro_resolution": (
-            statistics.mean(val_dice_macro_resolution_values) if val_dice_macro_resolution_values else None
-        ),
-        "std_dice_macro_resolution": (
-            statistics.pstdev(val_dice_macro_resolution_values)
-            if len(val_dice_macro_resolution_values) > 1
-            else 0.0
-        ),
-        "mean_iou_macro_resolution": (
-            statistics.mean(val_iou_macro_resolution_values) if val_iou_macro_resolution_values else None
-        ),
-        "std_iou_macro_resolution": (
-            statistics.pstdev(val_iou_macro_resolution_values)
-            if len(val_iou_macro_resolution_values) > 1
-            else 0.0
-        ),
+        "checkpoint_test_comparison": checkpoint_comparison_summary,
         "mean_dice_per_image": val_dice_per_image_mean,
         "std_dice_per_image": val_dice_per_image_std,
         "mean_iou_per_image": val_iou_per_image_mean,
@@ -977,6 +1240,14 @@ def main() -> None:
     save_csv(run_dir / "fold_metrics.csv", [{key: value for key, value in item.items() if key != "history"} for item in fold_results])
     save_csv(run_dir / "epoch_metrics.csv", all_epoch_rows)
     save_json(outputs_root / "cv_summary.json", summary)
+    atomic_json(state_path, {
+        "total_folds": total_folds, "completed_folds": completed_folds,
+        "active_fold": None, "attempt_count": attempt_count, "status": "complete",
+    })
+    if static_cache is not None:
+        static_cache.cleanup()
+        atexit.unregister(static_cache.cleanup)
+
     logger.info("Saved cross-validation summary to %s", run_dir / "cv_summary.json")
 
     qualitative_cfg = config.get("qualitative_evaluation", {})

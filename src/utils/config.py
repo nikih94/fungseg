@@ -40,6 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pin_memory": True,
         "batch_size": 8,
         "image_size": None,
+        "train_patch_cache": {"enabled": True},
     },
     "patching": {
         "patch_size": 512,
@@ -60,7 +61,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "percentage_of_foreground": 5.0,
             },
             "scaled_context": {
-                "enabled": True,
+                "enabled": False,
                 "probability": 0.25,
                 "max_scale": 2.0,
                 "beta_alpha": 1.0,
@@ -79,19 +80,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "validation": {
         "start_epoch": 1,
-        "fast": {
-            "foreground_only": True,
-            "overlap": 256,
-        },
         "full_image": {
             "enabled": True,
             "batch_size": 1,
             "interval_epochs": 1,
             "selection": "all",
             "max_images": None,
+            "soft_cldice_foreground_only": True,
             "monitor": {
-                "dice_weight": 0.5,
-                "cldice_weight": 0.5,
+                "dice_weight": 0.7,
+                "cldice_weight": 0.3,
             },
         },
     },
@@ -161,17 +159,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "soft_cldice_weight": 0.1,
         "iterations": 5,
         "iterations_csv": None,
+        "static_patch_iterations": {
+            "enabled": True,
+            "margin_iterations": 10,
+            "round_up_to": 10,
+        },
         "smooth": 1e-6,
         "cldice_smooth": 1.0,
     },
     "optimizer": {"name": "adamw", "lr": 1e-4, "weight_decay": 1e-4},
     "scheduler": {
         "name": "reduce_on_plateau",
-        "mode": "max",
+        "mode": "min",
         "factor": 0.5,
         "patience": 7,
         "min_lr": 1.0e-6,
-        "monitor": "val_dice_cldice_per_image",
+        "monitor": "val_loss",
     },
     "train": {
         "epochs": 50,
@@ -188,6 +191,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seed": 42,
         "device": "auto",
         "use_tqdm": True,
+        "compute_hard_cldice_metrics": False,
     },
     "inference": {"threshold": 0.5, "save_probabilities": False},
     "test_evaluation": {
@@ -222,7 +226,6 @@ def _normalize_validation_config(
     config: dict[str, Any],
     loaded: dict[str, Any],
 ) -> None:
-    patching = config["patching"]
     train = config["train"]
     loaded_validation = loaded.get("validation")
     if loaded_validation is not None and not isinstance(loaded_validation, dict):
@@ -237,12 +240,6 @@ def _normalize_validation_config(
             raise ValueError("train.full_image_monitor must be a mapping.")
         config["validation"] = {
             "start_epoch": 1,
-            "fast": {
-                "foreground_only": bool(
-                    patching.get("filter_empty_patches", True)
-                ),
-                "overlap": int(patching.get("overlap", 0)),
-            },
             "full_image": {
                 "enabled": bool(train.get("enable_per_image_validation", True)),
                 "batch_size": 1,
@@ -252,17 +249,14 @@ def _normalize_validation_config(
                 "selection": legacy_selection.get("selection", "all"),
                 "max_images": legacy_selection.get("max_images"),
                 "monitor": {
-                    "dice_weight": legacy_monitor.get("dice_weight", 0.5),
-                    "cldice_weight": legacy_monitor.get("cldice_weight", 0.5),
+                    "dice_weight": legacy_monitor.get("dice_weight", 0.7),
+                    "cldice_weight": legacy_monitor.get("cldice_weight", 0.3),
                 },
             },
         }
 
     validation = config["validation"]
-    fast = validation.get("fast", {})
     full_image = validation.get("full_image", {})
-    if not isinstance(fast, dict):
-        raise ValueError("validation.fast must be a mapping.")
     if not isinstance(full_image, dict):
         raise ValueError("validation.full_image must be a mapping.")
 
@@ -272,10 +266,6 @@ def _normalize_validation_config(
     if start_epoch > int(train["epochs"]):
         raise ValueError("validation.start_epoch must not exceed train.epochs.")
     validation["start_epoch"] = start_epoch
-
-    patch_size = int(patching["patch_size"])
-    fast["foreground_only"] = bool(fast.get("foreground_only", True))
-    fast["overlap"] = patch_size // 2
 
     interval_epochs = int(full_image.get("interval_epochs", 1))
     if interval_epochs <= 0:
@@ -298,23 +288,25 @@ def _normalize_validation_config(
     monitor = full_image.get("monitor", {})
     if not isinstance(monitor, dict):
         raise ValueError("validation.full_image.monitor must be a mapping.")
-    dice_weight = float(monitor.get("dice_weight", 0.5))
-    cldice_weight = float(monitor.get("cldice_weight", 0.5))
+    dice_weight = float(monitor.get("dice_weight", 0.7))
+    cldice_weight = float(monitor.get("cldice_weight", 0.3))
     if dice_weight < 0.0 or cldice_weight < 0.0 or dice_weight + cldice_weight <= 0.0:
         raise ValueError(
-            "validation.full_image.monitor weights must be non-negative and have "
-            "a positive sum."
+            "validation.full_image.monitor weights must be non-negative and have a positive sum."
         )
     full_image["enabled"] = bool(full_image.get("enabled", True))
     full_image["batch_size"] = batch_size
     full_image["interval_epochs"] = interval_epochs
     full_image["selection"] = selection
     full_image["max_images"] = None if max_images is None else int(max_images)
+    full_image["soft_cldice_foreground_only"] = bool(
+        full_image.get("soft_cldice_foreground_only", True)
+    )
     full_image["monitor"] = {
         "dice_weight": dice_weight,
         "cldice_weight": cldice_weight,
     }
-    validation["fast"] = fast
+    validation.pop("fast", None)
     validation["full_image"] = full_image
 
     for legacy_key in (
@@ -396,6 +388,50 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         patching_cfg.get("stride")
         or (int(patching_cfg["patch_size"]) - int(patching_cfg["overlap"]))
     )
+    patch_size = int(patching_cfg["patch_size"])
+    overlap = int(patching_cfg["overlap"])
+    stride = int(patching_cfg["stride"])
+    if patch_size <= 0 or stride <= 0:
+        raise ValueError("patching.patch_size and patching.stride must be positive.")
+    if overlap < 0:
+        raise ValueError("patching.overlap must be non-negative.")
+    cache_cfg = config["data"].get("train_patch_cache", {})
+    if not isinstance(cache_cfg, dict):
+        raise ValueError("data.train_patch_cache must be a mapping.")
+    cache_cfg["enabled"] = bool(cache_cfg.get("enabled", True))
+    config["data"]["train_patch_cache"] = cache_cfg
+    train_patching_cfg = patching_cfg.get("train", {})
+    random_offset_cfg = train_patching_cfg.get("random_offset", {})
+    scaled_context_cfg = train_patching_cfg.get("scaled_context", {})
+    if cache_cfg["enabled"] and bool(scaled_context_cfg.get("enabled", False)):
+        raise ValueError(
+            "Static training patch caching is incompatible with "
+            "patching.train.scaled_context.enabled: true."
+        )
+    if (
+        cache_cfg["enabled"]
+        and bool(random_offset_cfg.get("enabled", False))
+        and overlap <= 0
+    ):
+        raise ValueError(
+            "Cached training random offsets require patching.overlap to be positive."
+        )
+    static_iteration_cfg = config["loss"].get("static_patch_iterations", {})
+    if not isinstance(static_iteration_cfg, dict):
+        raise ValueError("loss.static_patch_iterations must be a mapping.")
+    margin_iterations = int(static_iteration_cfg.get("margin_iterations", 10))
+    round_up_to = int(static_iteration_cfg.get("round_up_to", 10))
+    if margin_iterations < 0:
+        raise ValueError(
+            "loss.static_patch_iterations.margin_iterations must be non-negative."
+        )
+    if round_up_to <= 0:
+        raise ValueError("loss.static_patch_iterations.round_up_to must be positive.")
+    config["loss"]["static_patch_iterations"] = {
+        "enabled": bool(static_iteration_cfg.get("enabled", True)),
+        "margin_iterations": margin_iterations,
+        "round_up_to": round_up_to,
+    }
     background_only_cfg = patching_cfg.get("train", {}).get(
         "background_only", {}
     )
@@ -502,36 +538,36 @@ def config_for_persistence(
         "bce_dice": {"bce_weight", "dice_weight", "smooth"},
         "bce_dice_cldice": {
             "bce_weight", "dice_weight", "soft_cldice_weight", "iterations",
-            "iterations_csv", "smooth", "cldice_smooth",
+            "iterations_csv", "static_patch_iterations", "smooth", "cldice_smooth",
         },
         "bce_dice_soft_cldice": {
             "bce_weight", "dice_weight", "soft_cldice_weight", "iterations",
-            "iterations_csv", "smooth", "cldice_smooth",
+            "iterations_csv", "static_patch_iterations", "smooth", "cldice_smooth",
         },
         "bcedicecldice": {
             "bce_weight", "dice_weight", "soft_cldice_weight", "iterations",
-            "iterations_csv", "smooth", "cldice_smooth",
+            "iterations_csv", "static_patch_iterations", "smooth", "cldice_smooth",
         },
         "multiclass_ce_dice_loci_cldice": {
             "cross_entropy_weight", "dice_weight", "loci_cldice_weight",
-            "iterations", "iterations_csv", "smooth", "cldice_smooth",
+            "iterations", "iterations_csv", "static_patch_iterations", "smooth", "cldice_smooth",
         },
         "multiclass_geometry_ce_dice_loci_cldice": {
             "geometry_aware_ce_weight", "dice_weight", "soft_cldice_weight",
-            "geometry_aware_ce", "iterations", "iterations_csv", "smooth",
-            "cldice_smooth",
+            "geometry_aware_ce", "iterations", "iterations_csv", "static_patch_iterations",
+            "smooth", "cldice_smooth",
         },
         "tversky": {"alpha", "beta", "smooth"},
-        "cldice": {"iterations", "iterations_csv", "cldice_smooth"},
-        "soft_cldice": {"iterations", "iterations_csv", "cldice_smooth"},
-        "softcldice": {"iterations", "iterations_csv", "cldice_smooth"},
+        "cldice": {"iterations", "iterations_csv", "static_patch_iterations", "cldice_smooth"},
+        "soft_cldice": {"iterations", "iterations_csv", "static_patch_iterations", "cldice_smooth"},
+        "softcldice": {"iterations", "iterations_csv", "static_patch_iterations", "cldice_smooth"},
         "tversky_soft_cldice": {
             "alpha", "beta", "tversky_weight", "soft_cldice_weight",
-            "iterations", "iterations_csv", "smooth", "cldice_smooth",
+            "iterations", "iterations_csv", "static_patch_iterations", "smooth", "cldice_smooth",
         },
         "tversky_softcldice": {
             "alpha", "beta", "tversky_weight", "soft_cldice_weight",
-            "iterations", "iterations_csv", "smooth", "cldice_smooth",
+            "iterations", "iterations_csv", "static_patch_iterations", "smooth", "cldice_smooth",
         },
     }
     if loss_name in loss_keys_by_name:
@@ -541,6 +577,12 @@ def config_for_persistence(
             known_loss_keys,
             loss_keys_by_name[loss_name],
         )
+
+    cache_enabled = bool(
+        persisted.get("data", {}).get("train_patch_cache", {}).get("enabled", True)
+    )
+    if not cache_enabled or loss.get("iterations_csv"):
+        loss.pop("static_patch_iterations", None)
 
     scheduler = persisted.get("scheduler", {})
     scheduler_name = str(scheduler.get("name", "")).lower()

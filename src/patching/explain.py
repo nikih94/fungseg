@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
@@ -10,6 +11,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from src.data.discovery import discover_image_mask_pairs
+from src.data.patch_cache import (
+    build_epoch_training_crop_records,
+    build_static_patch_cache,
+)
 from src.data.folds import SplitDefinition, make_csv_train_val_test_split
 from src.patching.core import (
     OriginalImageRecord,
@@ -316,6 +321,7 @@ def _draw_overlay(
     output_path: Path,
     epoch: int,
     seed: int,
+    static_records: list | None = None,
 ) -> None:
     image = Image.open(record.image_path).convert("RGB")
     scaled_count = sum(1 for item in records if item.scale_label == "scaled_context")
@@ -341,6 +347,20 @@ def _draw_overlay(
     draw.text((478, 39), "scaled source crop", fill=(0, 0, 0), font=font)
     draw.rectangle((10, 64, 30, 84), outline=(31, 119, 180), width=3)
     draw.text((38, 67), "background-only patch", fill=(0, 0, 0), font=font)
+    if static_records:
+        draw.rectangle((230, 64, 250, 84), outline=(127, 127, 127), width=2)
+        draw.text((258, 67), "static cache region", fill=(0, 0, 0), font=font)
+        for static in static_records:
+            draw.rectangle(
+                (
+                    static.cache_x,
+                    static.cache_y + header_height,
+                    min(record.width, static.cache_x + static.cache_size),
+                    min(record.height, static.cache_y + static.cache_size) + header_height,
+                ),
+                outline=(127, 127, 127),
+                width=1,
+            )
 
     for patch_record in records:
         if patch_record.is_background_only:
@@ -394,27 +414,50 @@ def main() -> None:
     split = _csv_split_definition(config, original_records)
     patching_config = config["patching"]
     seed = int(config["train"]["seed"])
-    candidates = build_patch_records(
-        original_records,
-        _candidate_config(patching_config),
-        phase="train",
-        epoch=int(args.epoch),
-        base_seed=seed,
-    )
-    pre_containment = build_patch_records(
-        original_records,
-        _without_containment_config(patching_config),
-        phase="train",
-        epoch=int(args.epoch),
-        base_seed=seed,
-    )
-    kept = build_patch_records(
-        original_records,
-        patching_config,
-        phase="train",
-        epoch=int(args.epoch),
-        base_seed=seed,
-    )
+    static_records = []
+    if bool(config.get("data", {}).get("train_patch_cache", {}).get("enabled", True)):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            cache = build_static_patch_cache(
+                original_records,
+                temporary_dir,
+                patching_config,
+                segmentation_mode="binary",
+                merge_join_masks=False,
+                compute_soft_cldice_iterations=False,
+                iteration_margin=10,
+                iteration_round_up_to=10,
+            )
+            static_records = list(cache.records)
+            source_ids = [record.source_id for record in original_records]
+            candidates = build_epoch_training_crop_records(
+                cache, source_ids, _candidate_config(patching_config),
+                epoch=int(args.epoch), base_seed=seed, fold_index=0,
+                segmentation_mode="binary", merge_join_masks=False,
+            )
+            pre_containment = build_epoch_training_crop_records(
+                cache, source_ids, _without_containment_config(patching_config),
+                epoch=int(args.epoch), base_seed=seed, fold_index=0,
+                segmentation_mode="binary", merge_join_masks=False,
+            )
+            kept = build_epoch_training_crop_records(
+                cache, source_ids, patching_config,
+                epoch=int(args.epoch), base_seed=seed, fold_index=0,
+                segmentation_mode="binary", merge_join_masks=False,
+            )
+            cache.cleanup()
+    else:
+        candidates = build_patch_records(
+            original_records, _candidate_config(patching_config), phase="train",
+            epoch=int(args.epoch), base_seed=seed,
+        )
+        pre_containment = build_patch_records(
+            original_records, _without_containment_config(patching_config),
+            phase="train", epoch=int(args.epoch), base_seed=seed,
+        )
+        kept = build_patch_records(
+            original_records, patching_config, phase="train",
+            epoch=int(args.epoch), base_seed=seed,
+        )
     _print_summary(
         original_records,
         candidates,
@@ -425,6 +468,11 @@ def main() -> None:
         seed,
         split=split,
     )
+    if static_records:
+        print(
+            f"Static cache regions: {len(static_records)} | "
+            f"cache_size={static_records[0].cache_size}"
+        )
 
     if args.image:
         target = str(config.get("segmentation", {}).get("target", "legacy"))
@@ -432,7 +480,13 @@ def main() -> None:
         image_records = [record for record in kept if record.source_id == image_record.source_id]
         output_dir = ensure_dir(Path(config["paths"]["outputs_dir"]) / config["project"]["name"] / "patching_explain")
         output_path = output_dir / f"{Path(image_record.source_id).stem}_{target}_epoch_{int(args.epoch):03d}_patches.png"
-        _draw_overlay(image_record, image_records, output_path, int(args.epoch), seed)
+        _draw_overlay(
+            image_record, image_records, output_path, int(args.epoch), seed,
+            static_records=[
+                record for record in static_records
+                if record.source_id == image_record.source_id
+            ],
+        )
         print(f"Overlay saved to: {output_path}")
 
     if diagnostics["missing_masks"]:

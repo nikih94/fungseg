@@ -1,4 +1,5 @@
 mask_filename,mask_stem,width,height,foreground_pixels,required_iterations
+IN123 B MEA 48h x500 2.png,IN123 B MEA 48h x500 2,10606,8572,13654234,135
 IN123 E 2%A 48h x500 1.png,IN123 E 2%A 48h x500 1,6105,4001,146001,31
 IN123 E 2%A 48h x500 2.png,IN123 E 2%A 48h x500 2,6053,4866,1077110,48
 IN123 G SNA 48h x500 2.png,IN123 G SNA 48h x500 2,6030,4809,335960,34
