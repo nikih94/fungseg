@@ -15,6 +15,10 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.data.dataset import compose_multiclass_mask, get_val_transforms
+from src.data.patch_cache import (
+    StaticValidationPatchCache,
+    non_overlapping_patch_positions,
+)
 from src.metrics.segmentation import (
     cldice_score_from_masks,
     dice_score,
@@ -35,23 +39,21 @@ from src.utils.checkpoint import save_checkpoint
 from src.utils.io import save_csv, save_json
 
 
-def best_checkpoint_specs(segmentation_mode: str) -> list[tuple[str, str, str, str]]:
-    """Return validation-only checkpoint specifications."""
-    specs = [
-        ("best_current.pt", "val_dice_cldice_per_image", "max", "global_best"),
-        ("best_dice.pt", "val_dice_per_image", "max", "best_dice"),
-    ]
-    if str(segmentation_mode).lower() == "multiclass":
+def best_checkpoint_specs(
+    checkpointing_config: dict[str, Any],
+) -> list[tuple[str, str, str, str]]:
+    """Return enabled config-driven validation checkpoint specifications."""
+    specs = []
+    for name, definition in checkpointing_config["selections"].items():
+        if not bool(definition.get("enabled", True)):
+            continue
         specs.append((
-            "best_low_cldice.pt", "val_dice_low_cldice_per_image", "max",
-            "best_low_cldice",
-        ))
-    specs.append(("best_val_loss.pt", "val_loss", "min", "best_val_loss"))
-    if str(segmentation_mode).lower() == "multiclass":
-        specs.append((
-            "best_inoculum_compensated.pt",
-            "val_inoculum_compensated_per_image", "max",
-            "best_inoculum_compensated",
+            str(definition["filename"]),
+            str(definition["monitor"]),
+            str(definition["mode"]),
+            "global_best"
+            if str(name) == str(checkpointing_config["primary"])
+            else str(name),
         ))
     return specs
 
@@ -105,9 +107,11 @@ class Trainer:
         segmentation_config: dict[str, Any] | None = None,
         join_masks_config: dict[str, Any] | None = None,
         validation_config: dict[str, Any] | None = None,
+        checkpointing_config: dict[str, Any] | None = None,
         target_weight_builder: Callable[[torch.Tensor], torch.Tensor] | None = None,
         soft_cldice_iterations: dict[str, int] | None = None,
         default_soft_cldice_iterations: int = 0,
+        validation_patch_cache: StaticValidationPatchCache | None = None,
         epoch_metrics_callback: Callable[[dict[str, float]], None] | None = None,
     ) -> None:
         self.model = model
@@ -136,9 +140,28 @@ class Trainer:
                 }
             }
         self.validation_config = validation_config
+        self.checkpointing_config = checkpointing_config or {
+            "primary": "current",
+            "save_last": bool(train_config.get("save_last_checkpoint", True)),
+            "interval": train_config.get(
+                "best_interval_checkpoint",
+                {"enabled": False, "interval_epochs": 10},
+            ),
+            "selections": {
+                "current": {
+                    "enabled": True,
+                    "filename": "best_current.pt",
+                    "monitor": train_config.get(
+                        "monitor", "val_dice_cldice_per_image"
+                    ),
+                    "mode": train_config.get("monitor_mode", "max"),
+                }
+            },
+        }
         self.target_weight_builder = target_weight_builder
         self.soft_cldice_iterations = soft_cldice_iterations
         self.default_soft_cldice_iterations = int(default_soft_cldice_iterations)
+        self.validation_patch_cache = validation_patch_cache
         self.epoch_metrics_callback = epoch_metrics_callback
         self._full_image_target_skeleton_cache: dict[str, torch.Tensor] = {}
         self.segmentation_mode = str(self.segmentation_config.get("mode", "binary")).lower()
@@ -147,12 +170,21 @@ class Trainer:
                 "classes", {"background": 0, "loci": 1, "inoculum": 2}
             ).items() if name != "background"
         }
-        self.monitor = self._normalize_metric_name(train_config.get("monitor", "val_dice_cldice_per_image"))
-        self.monitor_mode = train_config.get("monitor_mode", "max")
-        interval_checkpoint_config = train_config.get("best_interval_checkpoint", {})
-        self.best_interval_checkpoint_enabled = bool(interval_checkpoint_config.get("enabled", False))
-        self.best_interval_checkpoint_epochs = max(1, int(interval_checkpoint_config.get("interval_epochs", 10)))
-        self.save_last_checkpoint = bool(train_config.get("save_last_checkpoint", True))
+        primary_name = str(self.checkpointing_config["primary"])
+        primary = self.checkpointing_config["selections"][primary_name]
+        self.monitor = self._normalize_metric_name(str(primary["monitor"]))
+        self.monitor_mode = str(primary["mode"])
+        interval_checkpoint_config = self.checkpointing_config.get("interval", {})
+        self.best_interval_checkpoint_enabled = bool(
+            interval_checkpoint_config.get("enabled", False)
+        )
+        self.best_interval_checkpoint_epochs = max(
+            1, int(interval_checkpoint_config.get("interval_epochs", 10))
+        )
+        self.save_last_checkpoint = bool(
+            self.checkpointing_config.get("save_last", True)
+        )
+        self.checkpoint_specs = best_checkpoint_specs(self.checkpointing_config)
         self.threshold = float(train_config.get("threshold", 0.5))
         self.use_tqdm = bool(train_config.get("use_tqdm", True))
         self.compute_hard_cldice_metrics = bool(
@@ -173,18 +205,11 @@ class Trainer:
             1,
             int(full_image_config.get("interval_epochs", 1)),
         )
-        full_image_monitor = full_image_config.get("monitor", {})
-        if not isinstance(full_image_monitor, dict):
-            raise ValueError("validation.full_image.monitor must be a mapping.")
-        dice_weight = float(full_image_monitor.get("dice_weight", 0.7))
-        cldice_weight = float(full_image_monitor.get("cldice_weight", 0.3))
-        if dice_weight < 0.0 or cldice_weight < 0.0 or dice_weight + cldice_weight <= 0.0:
-            raise ValueError(
-                "validation.full_image.monitor weights must be non-negative and have a positive sum."
-            )
-        weight_sum = dice_weight + cldice_weight
-        self.full_image_dice_weight = dice_weight / weight_sum
-        self.full_image_cldice_weight = cldice_weight / weight_sum
+        self.composite_metrics = full_image_config.get("composite_metrics", {
+            "dice_cldice_per_image": {
+                "weights": {"dice_per_image": 0.7, "cldice_per_image": 0.3}
+            }
+        })
         self.scheduler_monitor = self._normalize_metric_name(
             train_config.get("scheduler_monitor", self.monitor)
         )
@@ -196,13 +221,17 @@ class Trainer:
             "val_dice_per_image",
             "val_iou_per_image",
             "val_cldice_per_image",
-            "val_dice_cldice_per_image",
-            "val_dice_low_cldice_per_image",
-            "val_inoculum_compensated_per_image",
             "val_cldice_loci_per_image",
+            "val_dice_loci_per_image",
+            "val_dice_inoculum_per_image",
             "val_dice_macro_foreground_per_image",
             "val_iou_macro_foreground_per_image",
+            *{f"val_{name}" for name in self.composite_metrics},
         }
+        monitored_metrics.update(
+            self._normalize_metric_name(monitor)
+            for _, monitor, _, _ in self.checkpoint_specs
+        )
         unsupported_monitors = monitored_metrics - supported_validation_monitors
         if unsupported_monitors:
             raise ValueError(
@@ -238,7 +267,7 @@ class Trainer:
         history: list[dict[str, float]] = []
         epoch_rows: list[dict[str, float]] = []
         checkpoint_manifest: dict[str, dict[str, Any]] = {}
-        checkpoint_specs = best_checkpoint_specs(self.segmentation_mode)
+        checkpoint_specs = self.checkpoint_specs
         best_checkpoint_values = {
             filename: (-math.inf if mode == "max" else math.inf)
             for filename, _, mode, _ in checkpoint_specs
@@ -409,6 +438,11 @@ class Trainer:
         finally:
             shutdown_dataloader(train_loader)
             cleanup_dataloader_cache(train_loader)
+            validation_patch_cache = getattr(
+                self, "validation_patch_cache", None
+            )
+            if validation_patch_cache is not None:
+                validation_patch_cache.cleanup()
 
         self._persist_training_progress(
             best_metric=best_metric,
@@ -702,8 +736,17 @@ class Trainer:
         num_images = 0
         compute_patch_loss = stage == "val"
         total_patch_loss = 0.0
+        total_patch_components: dict[str, float] = {}
         num_loss_patches = 0
         records = self.val_original_records if original_records is None else original_records
+        validation_patch_cache = (
+            getattr(self, "validation_patch_cache", None)
+            if original_records is None and stage == "val"
+            else None
+        )
+        cached_images = cached_targets = None
+        if validation_patch_cache is not None:
+            cached_images, cached_targets = validation_patch_cache.arrays()
 
         iterator = records
         if self.use_tqdm:
@@ -716,38 +759,83 @@ class Trainer:
         self.model.eval()
         with torch.no_grad():
             for record in iterator:
-                with Image.open(record.image_path) as image:
-                    image_array = np.array(image.convert("RGB"))
-                if self.segmentation_mode == "multiclass":
-                    if not record.mask_paths:
-                        raise ValueError("Multiclass full-image evaluation requires named masks.")
-                    with Image.open(record.mask_paths["loci"]) as mask:
-                        loci_array = np.array(mask.convert("L"), dtype=np.uint8)
-                    with Image.open(record.mask_paths["inoculum"]) as mask:
-                        inoculum_array = np.array(mask.convert("L"), dtype=np.uint8)
-                    join_array = None
-                    if "join" in record.mask_paths:
-                        with Image.open(record.mask_paths["join"]) as mask:
-                            join_array = np.array(mask.convert("L"), dtype=np.uint8)
-                    mask_array, _ = compose_multiclass_mask(
-                        loci_array,
-                        inoculum_array,
-                        mask_threshold,
-                        join_mask=join_array,
-                        merge_join_masks=getattr(self, "merge_join_masks", False),
+                cached_patch_records = None
+                if validation_patch_cache is not None:
+                    mask_array = np.array(
+                        validation_patch_cache.full_target(record.source_id),
+                        copy=True,
                     )
+                    join_array = validation_patch_cache.full_join_mask(
+                        record.source_id
+                    )
+                    if join_array is not None:
+                        join_array = np.array(join_array, copy=True)
                     height, width = mask_array.shape
-                    probability_sum = np.zeros((3, height, width), dtype=np.float32)
+                    cached_patch_records = (
+                        validation_patch_cache.records_for_source(
+                            record.source_id
+                        )
+                    )
+                    positions = [
+                        (patch.x, patch.y) for patch in cached_patch_records
+                    ]
+                    loss_xs = loss_ys = set()
                 else:
-                    with Image.open(record.mask_path) as mask:
-                        mask_array = np.array(mask.convert("L"), dtype=np.uint8)
+                    with Image.open(record.image_path) as image:
+                        image_array = np.array(image.convert("RGB"))
+                    if self.segmentation_mode == "multiclass":
+                        if not record.mask_paths:
+                            raise ValueError(
+                                "Multiclass full-image evaluation requires named masks."
+                            )
+                        with Image.open(record.mask_paths["loci"]) as mask:
+                            loci_array = np.array(mask.convert("L"), dtype=np.uint8)
+                        with Image.open(record.mask_paths["inoculum"]) as mask:
+                            inoculum_array = np.array(
+                                mask.convert("L"), dtype=np.uint8
+                            )
+                        join_array = None
+                        if "join" in record.mask_paths:
+                            with Image.open(record.mask_paths["join"]) as mask:
+                                join_array = np.array(
+                                    mask.convert("L"), dtype=np.uint8
+                                )
+                        mask_array, _ = compose_multiclass_mask(
+                            loci_array,
+                            inoculum_array,
+                            mask_threshold,
+                            join_mask=join_array,
+                            merge_join_masks=getattr(
+                                self, "merge_join_masks", False
+                            ),
+                        )
+                    else:
+                        with Image.open(record.mask_path) as mask:
+                            mask_array = np.array(
+                                mask.convert("L"), dtype=np.uint8
+                            )
                     height, width = mask_array.shape
-                    probability_sum = np.zeros((height, width), dtype=np.float32)
-                probability_count = np.zeros((height, width), dtype=np.float32)
-                xs = _compute_positions(width, patch_size, stride)
-                ys = _compute_positions(height, patch_size, stride)
+                    xs = _compute_positions(width, patch_size, stride)
+                    ys = _compute_positions(height, patch_size, stride)
+                    positions = [(x, y) for y in ys for x in xs]
+                    loss_xs = set(
+                        non_overlapping_patch_positions(width, patch_size)
+                    )
+                    loss_ys = set(
+                        non_overlapping_patch_positions(height, patch_size)
+                    )
 
-                positions = [(x, y) for y in ys for x in xs]
+                if self.segmentation_mode == "multiclass":
+                    probability_sum = np.zeros(
+                        (3, height, width), dtype=np.float32
+                    )
+                else:
+                    probability_sum = np.zeros(
+                        (height, width), dtype=np.float32
+                    )
+                probability_count = np.zeros(
+                    (height, width), dtype=np.float32
+                )
                 full_image_batch_size = int(
                     getattr(self, "full_image_batch_size", 1)
                 )
@@ -761,29 +849,58 @@ class Trainer:
                     ]
                     batch_tensors = []
                     batch_targets = []
+                    batch_loss_indices: list[int] = []
                     batch_geometry_weights = []
-                    for x, y in batch_positions:
-                        image_patch = crop_and_pad_array(
-                            image_array, x, y, patch_size
-                        )
-                        if compute_patch_loss:
-                            target_patch = crop_and_pad_array(
-                                mask_array, x, y, patch_size
+                    batch_iteration_values: list[int | None] = []
+                    batch_cached_records = (
+                        None
+                        if cached_patch_records is None
+                        else cached_patch_records[
+                            batch_start : batch_start
+                            + len(batch_positions)
+                        ]
+                    )
+                    for position_index, (x, y) in enumerate(batch_positions):
+                        target_patch = None
+                        iteration_value = None
+                        if batch_cached_records is not None:
+                            cached_record = batch_cached_records[position_index]
+                            assert cached_images is not None
+                            assert cached_targets is not None
+                            image_patch = np.array(
+                                cached_images[cached_record.cache_index],
+                                copy=True,
                             )
-                            if self.segmentation_mode != "multiclass":
-                                target_patch = (
-                                    target_patch > mask_threshold
-                                ).astype(np.float32)
+                            if cached_record.loss_target_index is not None:
+                                target_patch = np.array(
+                                    cached_targets[cached_record.loss_target_index],
+                                    copy=True,
+                                )
+                                iteration_value = (
+                                    cached_record.soft_cldice_iterations
+                                )
                         else:
-                            target_patch = np.zeros(
-                                (patch_size, patch_size), dtype=np.float32
+                            image_patch = crop_and_pad_array(
+                                image_array, x, y, patch_size
                             )
+                            if (
+                                compute_patch_loss
+                                and x in loss_xs
+                                and y in loss_ys
+                            ):
+                                target_patch = crop_and_pad_array(
+                                    mask_array, x, y, patch_size
+                                )
+                                if self.segmentation_mode != "multiclass":
+                                    target_patch = (
+                                        target_patch > mask_threshold
+                                    ).astype(np.float32)
                         transformed = self.val_patch_transforms(
                             image=image_patch,
-                            mask=target_patch,
+                            **({"mask": target_patch} if target_patch is not None else {}),
                         )
                         batch_tensors.append(transformed["image"])
-                        if compute_patch_loss:
+                        if target_patch is not None:
                             target_tensor = transformed["mask"]
                             if self.segmentation_mode == "multiclass":
                                 if target_tensor.ndim == 3:
@@ -795,7 +912,9 @@ class Trainer:
                                 else:
                                     target_tensor = target_tensor[:1]
                                 target_tensor = target_tensor.float()
+                            batch_loss_indices.append(position_index)
                             batch_targets.append(target_tensor)
+                            batch_iteration_values.append(iteration_value)
                             target_weight_builder = getattr(
                                 self, "target_weight_builder", None
                             )
@@ -807,12 +926,13 @@ class Trainer:
                         self.device, non_blocking=True
                     )
                     loss_kwargs = {}
-                    if compute_patch_loss:
+                    has_loss_samples = compute_patch_loss and bool(batch_targets)
+                    if has_loss_samples:
                         target_tensor = torch.stack(batch_targets, dim=0).to(
                             self.device, non_blocking=True
                         )
                     if (
-                        compute_patch_loss
+                        has_loss_samples
                         and getattr(self, "soft_cldice_foreground_only", True)
                         and (
                             hasattr(self.loss_fn, "forward_with_components")
@@ -826,14 +946,14 @@ class Trainer:
                         loss_kwargs["soft_cldice_sample_mask"] = foreground.reshape(
                             foreground.shape[0], -1
                         ).any(dim=1)
-                    if batch_geometry_weights:
+                    if has_loss_samples and batch_geometry_weights:
                         loss_kwargs["geometry_weights"] = torch.stack(
                             batch_geometry_weights, dim=0
                         ).to(self.device, non_blocking=True)
                     iteration_map = getattr(
                         self, "soft_cldice_iterations", None
                     )
-                    if compute_patch_loss and iteration_map is not None:
+                    if has_loss_samples and iteration_map is not None:
                         iteration_count = int(
                             iteration_map.get(
                                 record.source_id,
@@ -845,8 +965,21 @@ class Trainer:
                             )
                         )
                         loss_kwargs["soft_cldice_iterations"] = torch.full(
-                            (len(batch_positions),),
+                            (len(batch_targets),),
                             iteration_count,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                    elif (
+                        has_loss_samples
+                        and batch_iteration_values
+                        and all(
+                            value is not None
+                            for value in batch_iteration_values
+                        )
+                    ):
+                        loss_kwargs["soft_cldice_iterations"] = torch.tensor(
+                            batch_iteration_values,
                             dtype=torch.long,
                             device=self.device,
                         )
@@ -858,32 +991,51 @@ class Trainer:
                         enabled=self.use_amp,
                     ):
                         logits = extract_logits(self.model(image_tensor))
-                        if compute_patch_loss:
+                        computed_parts = None
+                        if has_loss_samples:
+                            loss_logits = logits[batch_loss_indices]
                             forward_with_components = getattr(
                                 self.loss_fn, "forward_with_components", None
                             )
                             if callable(forward_with_components):
-                                loss, _ = forward_with_components(
-                                    logits, target_tensor, **loss_kwargs
+                                loss, computed_parts = forward_with_components(
+                                    loss_logits, target_tensor, **loss_kwargs
                                 )
                             else:
-                                loss = self.loss_fn(logits, target_tensor, **loss_kwargs)
+                                loss = self.loss_fn(
+                                    loss_logits, target_tensor, **loss_kwargs
+                                )
                         probabilities = (
                             torch.softmax(logits, dim=1)
                             if self.segmentation_mode == "multiclass"
                             else torch.sigmoid(logits)
                         )
 
-                    if compute_patch_loss:
+                    if has_loss_samples:
                         if not bool(torch.isfinite(loss).item()):
                             raise FloatingPointError(
                                 f"Fold {self.fold_index} epoch {epoch} {stage} "
                                 f"full-image batch produced non-finite loss: "
                                 f"{loss.item()}."
                             )
-                        batch_size = len(batch_positions)
-                        total_patch_loss += float(loss.item()) * batch_size
-                        num_loss_patches += batch_size
+                        loss_batch_size = len(batch_targets)
+                        total_patch_loss += float(loss.item()) * loss_batch_size
+                        num_loss_patches += loss_batch_size
+                        if computed_parts is not None:
+                            component_names = {
+                                "cross_entropy": "cross_entropy",
+                                "geometry_aware_ce": "geometry_aware_cross_entropy",
+                                "dice": "multiclass_dice_loss",
+                                "loci_cldice": "loci_soft_cldice_loss",
+                            }
+                            for name, value in computed_parts.items():
+                                if name not in component_names:
+                                    continue
+                                output_name = component_names[name]
+                                total_patch_components[output_name] = (
+                                    total_patch_components.get(output_name, 0.0)
+                                    + float(value.detach().item()) * loss_batch_size
+                                )
 
                     if probabilities.shape[-2:] != (patch_size, patch_size):
                         probabilities = F.interpolate(
@@ -959,7 +1111,9 @@ class Trainer:
                         (averaged_probabilities >= self.threshold).astype(np.float32)
                     )
                     target_mask = torch.from_numpy(
-                        (mask_array > mask_threshold).astype(np.float32)
+                        mask_array.astype(np.float32)
+                        if validation_patch_cache is not None
+                        else (mask_array > mask_threshold).astype(np.float32)
                     )
                     image_dice = dice_score_from_masks(prediction_mask, target_mask)
                     image_iou = iou_score_from_masks(prediction_mask, target_mask)
@@ -981,10 +1135,14 @@ class Trainer:
                 if self.use_tqdm:
                     mean_dice = total_dice / max(num_images, 1)
                     mean_cldice = total_cldice / max(num_images, 1)
+                    progress_metrics = {
+                        "dice_per_image": mean_dice,
+                        "cldice_per_image": mean_cldice,
+                    }
                     iterator.set_postfix(
                         dice=f"{mean_dice:.4f}",
                         cldice=f"{mean_cldice:.4f}",
-                        score=f"{self._combined_full_image_score(mean_dice, mean_cldice):.4f}",
+                        score=f"{self._composite_score('dice_cldice_per_image', progress_metrics):.4f}",
                     )
 
         divisor = max(num_images, 1)
@@ -995,25 +1153,21 @@ class Trainer:
             f"{stage}_dice_per_image": mean_dice,
             f"{stage}_iou_per_image": mean_iou,
             f"{stage}_cldice_per_image": mean_cldice,
-            f"{stage}_dice_cldice_per_image": self._combined_full_image_score(
-                mean_dice, mean_cldice
-            ),
         }
         if compute_patch_loss:
-            result[f"{stage}_loss"] = total_patch_loss / max(num_loss_patches, 1)
+            if num_loss_patches == 0:
+                raise RuntimeError(
+                    "Full-image validation found no non-overlapping loss patches."
+                )
+            result[f"{stage}_loss"] = total_patch_loss / num_loss_patches
+            result[f"{stage}_loss_patch_count"] = num_loss_patches
+            for component_name, total in total_patch_components.items():
+                result[f"{stage}_{component_name}"] = total / num_loss_patches
         if self.segmentation_mode == "multiclass":
             mean_dice_loci = total_dice_loci / divisor
             mean_dice_inoculum = total_dice_inoculum / divisor
             result[f"{stage}_dice_loci_per_image"] = mean_dice_loci
             result[f"{stage}_dice_inoculum_per_image"] = mean_dice_inoculum
-            result[f"{stage}_dice_low_cldice_per_image"] = (
-                0.9 * mean_dice + 0.1 * mean_cldice
-            )
-            result[f"{stage}_inoculum_compensated_per_image"] = (
-                0.3 * mean_dice_loci
-                + 0.5 * mean_dice_inoculum
-                + 0.2 * mean_cldice
-            )
             result[f"{stage}_dice_macro_foreground_per_image"] = (
                 total_dice_macro_foreground / divisor
             )
@@ -1028,6 +1182,16 @@ class Trainer:
             )
         elif str(self.segmentation_config.get("target", "")).lower() == "loci":
             result[f"{stage}_cldice_loci_per_image"] = mean_cldice
+
+        base_metrics = {
+            key.removeprefix(f"{stage}_"): float(value)
+            for key, value in result.items()
+            if key.startswith(f"{stage}_") and isinstance(value, (int, float))
+        }
+        for name in self._configured_composite_metrics():
+            result[f"{stage}_{name}"] = self._composite_score(
+                name, base_metrics
+            )
         return result
 
     def _cached_full_image_target_skeleton(
@@ -1042,10 +1206,76 @@ class Trainer:
             cache[cache_key] = hard_skeletonize_masks(target_mask).cpu()
         return cache[cache_key]
 
+    def _configured_composite_metrics(self) -> dict[str, dict[str, Any]]:
+        configured = getattr(self, "composite_metrics", None)
+        if configured:
+            return configured
+        defaults: dict[str, dict[str, Any]] = {
+            "dice_cldice_per_image": {
+                "weights": {
+                    "dice_per_image": float(
+                        getattr(self, "full_image_dice_weight", 0.7)
+                    ),
+                    "cldice_per_image": float(
+                        getattr(self, "full_image_cldice_weight", 0.3)
+                    ),
+                }
+            }
+        }
+        if getattr(self, "segmentation_mode", "binary") == "multiclass":
+            defaults.update({
+                "dice_low_cldice_per_image": {
+                    "weights": {
+                        "dice_per_image": 0.9,
+                        "cldice_per_image": 0.1,
+                    }
+                },
+                "inoculum_compensated_per_image": {
+                    "weights": {
+                        "dice_loci_per_image": 0.3,
+                        "dice_inoculum_per_image": 0.5,
+                        "cldice_per_image": 0.2,
+                    }
+                },
+            })
+        return defaults
+
+    def _composite_score(
+        self, name: str, base_metrics: dict[str, float]
+    ) -> float:
+        definition = self._configured_composite_metrics().get(name)
+        if definition is None:
+            if name == "dice_cldice_per_image":
+                dice_weight = float(
+                    getattr(self, "full_image_dice_weight", 0.7)
+                )
+                cldice_weight = float(
+                    getattr(self, "full_image_cldice_weight", 0.3)
+                )
+                definition = {
+                    "weights": {
+                        "dice_per_image": dice_weight,
+                        "cldice_per_image": cldice_weight,
+                    }
+                }
+            else:
+                raise KeyError(f"Unknown composite validation metric: {name}")
+        missing = set(definition["weights"]) - set(base_metrics)
+        if missing:
+            raise ValueError(
+                f"Composite validation metric {name!r} requires unavailable "
+                f"metrics: {', '.join(sorted(missing))}."
+            )
+        return sum(
+            float(weight) * float(base_metrics[metric])
+            for metric, weight in definition["weights"].items()
+        )
+
     def _combined_full_image_score(self, dice: float, cldice: float) -> float:
-        return (
-            self.full_image_dice_weight * float(dice)
-            + self.full_image_cldice_weight * float(cldice)
+        """Compatibility wrapper for tests and older direct Trainer construction."""
+        return self._composite_score(
+            "dice_cldice_per_image",
+            {"dice_per_image": dice, "cldice_per_image": cldice},
         )
 
     def _should_run_validation(self, epoch: int) -> bool:

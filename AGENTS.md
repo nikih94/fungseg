@@ -22,6 +22,7 @@ When documentation and implementation disagree, inspect the code, active YAML co
 ├── FIVES_REMOVAL.md                  # removal checklist for optional FIVES training support
 ├── config.yaml                       # current binary experiment
 ├── multiclass-config.yaml            # multiclass U-Net++/ResNet50 experiment
+├── multiclass-config-1080.yaml       # related 1080-oriented multiclass experiment
 ├── multiclass-segformer-mit-b1-refinement-config.yaml # multiclass MiT-B1 refinement experiment
 ├── multiclass-segformer-mit-b2-refinement-config.yaml # multiclass MiT-B2 refinement experiment
 ├── multiclass-segformer-config.yaml  # multiclass SegFormer MiT-B5 experiment
@@ -36,7 +37,7 @@ When documentation and implementation disagree, inspect the code, active YAML co
 │   ├── benchmark_cldice.py           # Reference Zhang CPU/CUDA diagnostic benchmark
 │   ├── benchmark_cldice_patches.py   # Batched foreground-patch hard-clDice benchmark
 │   ├── data/soft_cldice_iterations.py # Per-mask training-iteration CSV mapping
-│   ├── data/patch_cache.py           # Run-level static fungal patch memmap cache
+│   ├── data/patch_cache.py           # Run-level training and fold-local validation caches
 │   ├── utils/run_resume.py           # Atomic fold-resume state and cleanup helpers
 │   ├── inference/                    # inference, recursive prediction, and evaluation workflows
 │   ├── models/segformer_refinement.py # MiT-B1/B2 full-resolution refinement model

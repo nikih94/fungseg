@@ -201,7 +201,23 @@ class ModelFactoryTests(unittest.TestCase):
                 "selection": "smallest_area",
                 "max_images": 3,
                 "soft_cldice_foreground_only": True,
-                "monitor": {"dice_weight": 0.7, "cldice_weight": 0.3},
+                "patch_cache": {"enabled": True},
+                "loss": {"patch_selection": "non_overlapping"},
+                "composite_metrics": {
+                    "dice_cldice_per_image": {
+                        "weights": {"dice_per_image": 0.7, "cldice_per_image": 0.3}
+                    },
+                    "dice_low_cldice_per_image": {
+                        "weights": {"dice_per_image": 0.9, "cldice_per_image": 0.1}
+                    },
+                    "inoculum_compensated_per_image": {
+                        "weights": {
+                            "dice_loci_per_image": 0.3,
+                            "dice_inoculum_per_image": 0.5,
+                            "cldice_per_image": 0.2,
+                        }
+                    },
+                },
             },
         )
 
@@ -224,9 +240,14 @@ class ModelFactoryTests(unittest.TestCase):
         self.assertEqual(config["model"]["encoder_name"], "mit_b5")
         self.assertEqual(config["model"]["num_classes"], 3)
         self.assertGreater(int(config["train"]["epochs"]), 0)
-        self.assertEqual(config["scheduler"]["monitor"], "val_loss")
-        self.assertEqual(config["scheduler"]["mode"], "min")
-        self.assertEqual(config["train"]["monitor"], "val_dice_cldice_per_image")
+        self.assertEqual(
+            config["scheduler"]["monitor"], "val_dice_cldice_per_image"
+        )
+        self.assertEqual(config["scheduler"]["mode"], "max")
+        self.assertEqual(
+            config["checkpointing"]["selections"]["current"]["monitor"],
+            "val_dice_cldice_per_image",
+        )
         self.assertEqual(
             set(config["scheduler"]["min_lr"]),
             {"encoder", "decoder"},

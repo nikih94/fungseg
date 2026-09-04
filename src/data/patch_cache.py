@@ -62,6 +62,39 @@ class CachedTrainingCropRecord:
     source_crop_size: int | None = None
 
 
+@dataclass(frozen=True)
+class StaticValidationPatchRecord:
+    """One deterministic model-size patch in a fold-local validation cache."""
+
+    cache_index: int
+    source_id: str
+    x: int
+    y: int
+    patch_size: int
+    valid_width: int
+    valid_height: int
+    loss_target_index: int | None = None
+    soft_cldice_iterations: int | None = None
+
+
+def non_overlapping_patch_positions(length: int, patch_size: int) -> list[int]:
+    """Return strict disjoint starts that are already present in the half-stride grid."""
+    if length <= patch_size:
+        return [0]
+    return list(range(0, length - patch_size + 1, patch_size))
+
+
+@dataclass(frozen=True)
+class StaticValidationSourceRecord:
+    """Full-source metadata retained for stitched validation metrics."""
+
+    source_index: int
+    source_id: str
+    width: int
+    height: int
+    has_join_mask: bool
+
+
 class StaticPatchCache:
     """Run-level cache metadata and ownership for static training regions."""
 
@@ -89,8 +122,75 @@ class StaticPatchCache:
         shutil.rmtree(self.cache_dir.parent, ignore_errors=True)
 
 
+class StaticValidationPatchCache:
+    """Fold-local cache for deterministic full-image validation patches."""
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        records: list[StaticValidationPatchRecord],
+        sources: list[StaticValidationSourceRecord],
+    ) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.records = records
+        self.sources = sources
+        self._images: np.ndarray | None = None
+        self._targets: np.ndarray | None = None
+        self._records_by_source: dict[str, list[StaticValidationPatchRecord]] = {}
+        self._sources_by_id = {source.source_id: source for source in sources}
+        for record in records:
+            self._records_by_source.setdefault(record.source_id, []).append(record)
+
+    def arrays(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._images is None:
+            self._images = np.load(self.cache_dir / "images.npy", mmap_mode="r")
+            self._targets = np.load(self.cache_dir / "targets.npy", mmap_mode="r")
+        assert self._targets is not None
+        return self._images, self._targets
+
+    def records_for_source(
+        self, source_id: str
+    ) -> list[StaticValidationPatchRecord]:
+        try:
+            return self._records_by_source[source_id]
+        except KeyError as error:
+            raise KeyError(
+                f"Validation cache has no source {source_id!r}."
+            ) from error
+
+    def full_target(self, source_id: str) -> np.ndarray:
+        source = self._sources_by_id[source_id]
+        return np.load(
+            self.cache_dir / "full_targets" / f"{source.source_index}.npy",
+            mmap_mode="r",
+        )
+
+    def full_join_mask(self, source_id: str) -> np.ndarray | None:
+        source = self._sources_by_id[source_id]
+        if not source.has_join_mask:
+            return None
+        return np.load(
+            self.cache_dir / "full_join_masks" / f"{source.source_index}.npy",
+            mmap_mode="r",
+        )
+
+    def close(self) -> None:
+        self._images = None
+        self._targets = None
+
+    def cleanup(self) -> None:
+        self.close()
+        shutil.rmtree(self.cache_dir.parent, ignore_errors=True)
+
+
 def remove_stale_patch_caches(run_dir: str | Path) -> None:
     root = Path(run_dir) / ".train_patch_cache"
+    if root.exists():
+        shutil.rmtree(root)
+
+
+def remove_stale_validation_patch_cache(fold_dir: str | Path) -> None:
+    root = Path(fold_dir) / ".validation_patch_cache"
     if root.exists():
         shutil.rmtree(root)
 
@@ -306,6 +406,200 @@ def build_static_patch_cache(
 
     completed_records.sort(key=lambda item: item.cache_index)
     return StaticPatchCache(ready, completed_records, mask_names)
+
+
+def build_static_validation_patch_cache(
+    original_records: Iterable[OriginalImageRecord],
+    fold_dir: str | Path,
+    patching_config: dict[str, Any],
+    *,
+    segmentation_mode: str,
+    merge_join_masks: bool,
+    compute_soft_cldice_iterations: bool,
+    iteration_margin: int,
+    iteration_round_up_to: int,
+) -> StaticValidationPatchCache:
+    """Cache one fold's deterministic full-image validation grid."""
+    originals = list(original_records)
+    if not originals:
+        raise ValueError("Cannot build an empty static validation patch cache.")
+
+    patch_size = int(patching_config["patch_size"])
+    stride = int(patching_config["stride"])
+    threshold = int(patching_config.get("mask_threshold", 127))
+    provisional: list[StaticValidationPatchRecord] = []
+    num_loss_targets = 0
+    for original in originals:
+        xs = _compute_positions(original.width, patch_size, stride)
+        ys = _compute_positions(original.height, patch_size, stride)
+        loss_xs = set(non_overlapping_patch_positions(original.width, patch_size))
+        loss_ys = set(non_overlapping_patch_positions(original.height, patch_size))
+        for y in ys:
+            for x in xs:
+                loss_target_index = None
+                if x in loss_xs and y in loss_ys:
+                    loss_target_index = num_loss_targets
+                    num_loss_targets += 1
+                provisional.append(
+                    StaticValidationPatchRecord(
+                        cache_index=len(provisional),
+                        source_id=original.source_id,
+                        x=x,
+                        y=y,
+                        patch_size=patch_size,
+                        valid_width=min(patch_size, original.width - x),
+                        valid_height=min(patch_size, original.height - y),
+                        loss_target_index=loss_target_index,
+                    )
+                )
+
+    root = Path(fold_dir) / ".validation_patch_cache"
+    remove_stale_validation_patch_cache(fold_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    full_target_bytes = sum(record.width * record.height for record in originals)
+    optional_join_bytes = sum(
+        record.width * record.height
+        for record in originals
+        if record.mask_paths and "join" in record.mask_paths
+    )
+    required_bytes = (
+        len(provisional) * patch_size * patch_size * 3
+        + num_loss_targets * patch_size * patch_size
+        + num_loss_targets * np.dtype(np.int64).itemsize
+        + full_target_bytes
+        + optional_join_bytes
+    )
+    free_bytes = shutil.disk_usage(root).free
+    if free_bytes < required_bytes * 1.1:
+        raise OSError(
+            "Insufficient free space for static validation patch cache: need "
+            f"about {required_bytes} bytes, have {free_bytes} bytes in {root}."
+        )
+
+    staging = root / f"staging-{uuid.uuid4().hex}"
+    ready = root / "ready"
+    staging.mkdir()
+    (staging / "full_targets").mkdir()
+    (staging / "full_join_masks").mkdir()
+    images = targets = iterations = None
+    completed_records: list[StaticValidationPatchRecord] = []
+    source_records: list[StaticValidationSourceRecord] = []
+    try:
+        images = open_memmap(
+            staging / "images.npy",
+            mode="w+",
+            dtype=np.uint8,
+            shape=(len(provisional), patch_size, patch_size, 3),
+        )
+        targets = open_memmap(
+            staging / "targets.npy",
+            mode="w+",
+            dtype=np.uint8,
+            shape=(num_loss_targets, patch_size, patch_size),
+        )
+        iterations = open_memmap(
+            staging / "soft_cldice_iterations.npy",
+            mode="w+",
+            dtype=np.int64,
+            shape=(num_loss_targets,),
+        )
+        iterations[:] = -1
+        by_source: dict[str, list[StaticValidationPatchRecord]] = {}
+        for record in provisional:
+            by_source.setdefault(record.source_id, []).append(record)
+
+        for source_index, original in enumerate(originals):
+            with Image.open(original.image_path) as handle:
+                source_image = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+            join_array: np.ndarray | None = None
+            if segmentation_mode == "multiclass":
+                if not original.mask_paths:
+                    raise ValueError(
+                        "Multiclass validation cache records require named masks."
+                    )
+                with Image.open(original.mask_paths["loci"]) as handle:
+                    loci = np.asarray(handle.convert("L"), dtype=np.uint8)
+                with Image.open(original.mask_paths["inoculum"]) as handle:
+                    inoculum = np.asarray(handle.convert("L"), dtype=np.uint8)
+                if "join" in original.mask_paths:
+                    with Image.open(original.mask_paths["join"]) as handle:
+                        join_array = np.asarray(handle.convert("L"), dtype=np.uint8)
+                source_target, _ = compose_multiclass_mask(
+                    loci,
+                    inoculum,
+                    threshold,
+                    join_mask=join_array,
+                    merge_join_masks=merge_join_masks,
+                )
+                source_target = source_target.astype(np.uint8, copy=False)
+            else:
+                with Image.open(original.mask_path) as handle:
+                    source_mask = np.asarray(handle.convert("L"), dtype=np.uint8)
+                source_target = (source_mask > threshold).astype(np.uint8)
+
+            np.save(
+                staging / "full_targets" / f"{source_index}.npy",
+                source_target,
+                allow_pickle=False,
+            )
+            if join_array is not None:
+                np.save(
+                    staging / "full_join_masks" / f"{source_index}.npy",
+                    join_array,
+                    allow_pickle=False,
+                )
+            source_records.append(
+                StaticValidationSourceRecord(
+                    source_index=source_index,
+                    source_id=original.source_id,
+                    width=original.width,
+                    height=original.height,
+                    has_join_mask=join_array is not None,
+                )
+            )
+
+            for record in by_source[original.source_id]:
+                image_patch = crop_and_pad_array(
+                    source_image, record.x, record.y, patch_size
+                )
+                images[record.cache_index] = image_patch
+                value: int | None = None
+                if record.loss_target_index is not None:
+                    target_patch = crop_and_pad_array(
+                        source_target, record.x, record.y, patch_size
+                    )
+                    targets[record.loss_target_index] = target_patch
+                    if compute_soft_cldice_iterations:
+                        effective_target = (
+                            target_patch == 1
+                            if segmentation_mode == "multiclass"
+                            else target_patch > 0
+                        )
+                        required = required_soft_skeleton_iterations(effective_target)
+                        value = _adjust_iterations(
+                            required, iteration_margin, iteration_round_up_to
+                        )
+                        iterations[record.loss_target_index] = value
+                completed_records.append(
+                    replace(record, soft_cldice_iterations=value)
+                )
+
+        images.flush()
+        targets.flush()
+        iterations.flush()
+        del images, targets, iterations
+        images = targets = iterations = None
+        (staging / "READY").touch()
+        staging.rename(ready)
+    except Exception:
+        del images, targets, iterations
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+
+    completed_records.sort(key=lambda item: item.cache_index)
+    return StaticValidationPatchCache(
+        ready, completed_records, source_records
+    )
 
 
 def _seeded_rng(*parts: object) -> np.random.Generator:

@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 
 import src.metrics.segmentation as segmentation_metrics
+from src.data.patch_cache import build_static_validation_patch_cache
 from src.engine.trainer import Trainer
 from src.metrics.segmentation import multiclass_metrics_from_masks
 from src.patching import OriginalImageRecord
@@ -79,6 +80,7 @@ class _BatchRecordingBCE(torch.nn.Module):
         super().__init__()
         self.batch_sizes: list[int] = []
         self.iteration_values: list[list[int] | None] = []
+        self.target_foreground_counts: list[list[int]] = []
 
     def forward(
         self,
@@ -87,6 +89,9 @@ class _BatchRecordingBCE(torch.nn.Module):
         soft_cldice_iterations: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.batch_sizes.append(int(targets.shape[0]))
+        self.target_foreground_counts.append(
+            targets.reshape(targets.shape[0], -1).sum(dim=1).int().tolist()
+        )
         self.iteration_values.append(
             None
             if soft_cldice_iterations is None
@@ -121,6 +126,12 @@ class _StubTrainer(Trainer):
         self.validation_metrics = validation_metrics
         self.validation_start_epoch = 1
         self.segmentation_mode = "multiclass"
+        self.checkpoint_specs = [
+            ("best_current.pt", "val_dice_cldice_per_image", "max", "global_best"),
+            ("best_dice.pt", "val_dice_per_image", "max", "dice"),
+            ("best_low_cldice.pt", "val_dice_low_cldice_per_image", "max", "low_cldice"),
+            ("best_inoculum_compensated.pt", "val_inoculum_compensated_per_image", "max", "inoculum_compensated"),
+        ]
         self.validation_epochs: list[int] = []
         self.epoch_metrics_callback = epoch_metrics_callback
 
@@ -173,11 +184,17 @@ class _StubTrainer(Trainer):
 
 class FullImageMonitorTests(unittest.TestCase):
     @staticmethod
-    def _raw_transform(*, image: np.ndarray, mask: np.ndarray) -> dict[str, torch.Tensor]:
-        image_tensor = torch.from_numpy(
-            np.ascontiguousarray(image.transpose(2, 0, 1))
-        ).float()
-        return {"image": image_tensor, "mask": torch.from_numpy(mask)}
+    def _raw_transform(
+        *, image: np.ndarray, mask: np.ndarray | None = None
+    ) -> dict[str, torch.Tensor]:
+        transformed = {
+            "image": torch.from_numpy(
+                np.ascontiguousarray(image.transpose(2, 0, 1))
+            ).float()
+        }
+        if mask is not None:
+            transformed["mask"] = torch.from_numpy(mask)
+        return transformed
 
     def test_multiclass_full_image_validation_uses_stitched_argmax_and_hard_cldice(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -251,21 +268,51 @@ class FullImageMonitorTests(unittest.TestCase):
                 trainer.loss_fn = single_patch_loss
                 trainer.full_image_batch_size = 1
                 single_patch_metrics = trainer._evaluate_full_images(epoch=1, epochs=1)
+
+                validation_cache = build_static_validation_patch_cache(
+                    [record],
+                    root,
+                    {"patch_size": 4, "stride": 2, "mask_threshold": 127},
+                    segmentation_mode="multiclass",
+                    merge_join_masks=False,
+                    compute_soft_cldice_iterations=True,
+                    iteration_margin=4,
+                    iteration_round_up_to=2,
+                )
+                cached_model = _BatchRecordingIdentity()
+                cached_loss = _BatchRecordingCrossEntropy()
+                trainer.model = cached_model
+                trainer.loss_fn = cached_loss
+                trainer.full_image_batch_size = 8
+                trainer.soft_cldice_iterations = None
+                trainer.validation_patch_cache = validation_cache
+                with patch("src.engine.trainer.Image.open") as image_open:
+                    cached_metrics = trainer._evaluate_full_images(
+                        epoch=1, epochs=1
+                    )
+                    image_open.assert_not_called()
                 skeletonize_call_count = skeletonize_mock.call_count
+                validation_cache.cleanup()
 
         self.assertEqual(batched_model.batch_sizes, [8, 1])
-        self.assertEqual(batched_loss.batch_sizes, batched_model.batch_sizes)
+        self.assertEqual(batched_loss.batch_sizes, [3, 1])
+        self.assertEqual(metrics["val_loss_patch_count"], 4)
         self.assertEqual(single_patch_model.batch_sizes, [1] * 9)
-        self.assertEqual(single_patch_loss.batch_sizes, single_patch_model.batch_sizes)
-        self.assertEqual(batched_loss.iteration_values, [[7] * 8, [7]])
+        self.assertEqual(single_patch_loss.batch_sizes, [1] * 4)
+        self.assertEqual(cached_model.batch_sizes, [8, 1])
+        self.assertEqual(cached_loss.batch_sizes, [3, 1])
+        self.assertEqual(cached_loss.iteration_values, [[4] * 3, [4]])
+        self.assertEqual(batched_loss.iteration_values, [[7] * 3, [7]])
         self.assertTrue(
             all(shape is not None for shape in batched_loss.geometry_weight_shapes)
         )
         self.assertEqual(metrics.keys(), single_patch_metrics.keys())
+        self.assertEqual(metrics.keys(), cached_metrics.keys())
         for metric_name, metric_value in metrics.items():
             if metric_value is not None:
                 self.assertAlmostEqual(metric_value, single_patch_metrics[metric_name])
-        self.assertEqual(skeletonize_call_count, 3)
+                self.assertAlmostEqual(metric_value, cached_metrics[metric_name])
+        self.assertEqual(skeletonize_call_count, 4)
 
         expected = multiclass_metrics_from_masks(
             torch.from_numpy(prediction.astype(np.int64)),
@@ -346,12 +393,63 @@ class FullImageMonitorTests(unittest.TestCase):
             metrics = trainer._evaluate_full_images(epoch=1, epochs=1)
 
         self.assertEqual(model.batch_sizes, [4, 4, 1])
-        self.assertEqual(loss.batch_sizes, model.batch_sizes)
-        self.assertEqual(loss.iteration_values, [[4] * 4, [4] * 4, [4]])
+        self.assertEqual(loss.batch_sizes, [2, 1, 1])
+        self.assertEqual(loss.iteration_values, [[4, 4], [4], [4]])
+        self.assertEqual(loss.target_foreground_counts, [[1, 1], [0], [0]])
+        self.assertEqual(metrics["val_loss_patch_count"], 4)
         self.assertTrue(math.isfinite(metrics["val_loss"]))
         self.assertEqual(metrics["val_dice_per_image"], 1.0)
         self.assertEqual(metrics["val_iou_per_image"], 1.0)
         self.assertEqual(metrics["val_cldice_per_image"], 1.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_root = Path(tmpdir)
+            cached_image_path = cache_root / "binary.png"
+            cached_mask_path = cache_root / "binary-mask.png"
+            Image.fromarray(image).save(cached_image_path)
+            Image.fromarray(target).save(cached_mask_path)
+            cached_record = OriginalImageRecord(
+                "binary.png",
+                cached_image_path,
+                cached_mask_path,
+                4,
+                4,
+            )
+            cache = build_static_validation_patch_cache(
+                [cached_record],
+                cache_root,
+                {"patch_size": 2, "stride": 1, "mask_threshold": 127},
+                segmentation_mode="binary",
+                merge_join_masks=False,
+                compute_soft_cldice_iterations=True,
+                iteration_margin=4,
+                iteration_round_up_to=2,
+            )
+            cached_model = _BatchRecordingFirstChannel()
+            cached_loss = _BatchRecordingBCE()
+            trainer.model = cached_model
+            trainer.loss_fn = cached_loss
+            trainer.val_original_records = [cached_record]
+            trainer.soft_cldice_iterations = None
+            trainer.validation_patch_cache = cache
+            with patch("src.engine.trainer.Image.open") as image_open:
+                cached_metrics = trainer._evaluate_full_images(
+                    epoch=1, epochs=1
+                )
+                image_open.assert_not_called()
+
+            self.assertEqual(cached_model.batch_sizes, [4, 4, 1])
+            self.assertEqual(
+                cached_loss.iteration_values,
+                [[4, 4], [4], [4]],
+            )
+            self.assertEqual(metrics.keys(), cached_metrics.keys())
+            for metric_name, metric_value in metrics.items():
+                if metric_value is not None:
+                    self.assertAlmostEqual(
+                        metric_value, cached_metrics[metric_name]
+                    )
+            cache.cleanup()
 
     def test_reduce_on_plateau_consumes_validation_loss(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor(1.0))
@@ -469,16 +567,22 @@ class FullImageMonitorTests(unittest.TestCase):
             with self.subTest(config=filename):
                 config = load_config(filename)
                 self.assertNotIn("fast", config["validation"])
-                train_monitor = str(config["train"]["monitor"])
+                primary_name = config["checkpointing"]["primary"]
+                primary = config["checkpointing"]["selections"][primary_name]
                 scheduler_monitor = str(config["scheduler"]["monitor"])
                 self.assertGreaterEqual(config["validation"]["start_epoch"], 1)
                 self.assertGreater(
                     config["validation"]["full_image"]["batch_size"], 0
                 )
-                self.assertEqual(scheduler_monitor, "val_loss")
-                self.assertEqual(config["scheduler"]["mode"], "min")
-                self.assertEqual(config["train"]["monitor_mode"], "max")
-                if train_monitor.endswith("_per_image"):
+                self.assertEqual(scheduler_monitor, "val_dice_cldice_per_image")
+                self.assertEqual(config["scheduler"]["mode"], "max")
+                self.assertEqual(primary["monitor"], scheduler_monitor)
+                self.assertEqual(primary["mode"], "max")
+                self.assertEqual(
+                    config["validation"]["full_image"]["loss"]["patch_selection"],
+                    "non_overlapping",
+                )
+                if scheduler_monitor.endswith("_per_image"):
                     self.assertTrue(config["validation"]["full_image"]["enabled"])
                     self.assertEqual(
                         config["validation"]["full_image"]["interval_epochs"],
@@ -520,6 +624,22 @@ class TrainerLifecycleRegressionTests(unittest.TestCase):
 
         self.assertEqual([item[:2] for item in observed], [(1, 1), (2, 2)])
         self.assertTrue(all(manifest_count >= 2 for _, _, manifest_count in observed))
+
+    def test_fit_cleans_validation_patch_cache(self) -> None:
+        class _CleanupRecorder:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def cleanup(self) -> None:
+                self.calls += 1
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = _StubTrainer(Path(tmpdir), scores=[0.9])
+            cache = _CleanupRecorder()
+            trainer.validation_patch_cache = cache
+            trainer.fit([object()], epochs=1)
+
+        self.assertEqual(cache.calls, 1)
 
     def test_validation_start_epoch_delays_metrics_scheduler_and_best_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -584,10 +704,9 @@ class TrainerLifecycleRegressionTests(unittest.TestCase):
                 "best_dice.pt",
                 "best_inoculum_compensated.pt",
                 "best_low_cldice.pt",
-                "best_val_loss.pt",
             ],
         )
-        self.assertEqual(len(manifest_rows), 5)
+        self.assertEqual(len(manifest_rows), 4)
         self.assertEqual(
             {row["checkpoint"] for row in manifest_rows},
             set(checkpoints),
@@ -634,7 +753,6 @@ class TrainerLifecycleRegressionTests(unittest.TestCase):
             "best_current.pt": 1,
             "best_dice.pt": 1,
             "best_low_cldice.pt": 2,
-            "best_val_loss.pt": 2,
             "best_inoculum_compensated.pt": 3,
         })
 

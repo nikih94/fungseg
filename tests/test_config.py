@@ -23,11 +23,10 @@ class ConfigTests(unittest.TestCase):
                 "evaluation_enabled": True,
             },
         )
-        self.assertEqual(config["split"]["mode"], "csv_kfold")
-        self.assertEqual(persisted["split"]["mode"], "csv_kfold")
+        self.assertEqual(config["split"]["mode"], "csv")
+        self.assertEqual(persisted["split"]["mode"], "csv")
         self.assertEqual(persisted["split"]["csv_path"], "data/image_splits.csv")
-        self.assertEqual(persisted["cv"]["n_splits"], 5)
-        self.assertEqual(persisted["cv"]["random_state"], 42)
+        self.assertNotIn("cv", persisted)
         self.assertGreaterEqual(persisted["validation"]["start_epoch"], 1)
         self.assertLessEqual(
             persisted["validation"]["start_epoch"],
@@ -36,14 +35,18 @@ class ConfigTests(unittest.TestCase):
         self.assertGreater(
             persisted["validation"]["full_image"]["batch_size"], 0
         )
-        self.assertEqual(config["train"]["monitor"], "val_dice_cldice_per_image")
         self.assertEqual(
             config["scheduler"]["monitor"],
-            "val_loss",
+            "val_dice_cldice_per_image",
         )
-        self.assertEqual(config["scheduler"]["mode"], "min")
-        self.assertFalse(config["train"]["best_interval_checkpoint"]["enabled"])
-        self.assertFalse(config["train"]["save_last_checkpoint"])
+        self.assertEqual(config["scheduler"]["mode"], "max")
+        self.assertEqual(config["scheduler"]["threshold"], 0.001)
+        self.assertEqual(config["scheduler"]["threshold_mode"], "abs")
+        self.assertFalse(config["checkpointing"]["interval"]["enabled"])
+        self.assertFalse(config["checkpointing"]["save_last"])
+        self.assertFalse(
+            config["checkpointing"]["selections"]["validation_loss"]["enabled"]
+        )
         self.assertFalse(config["qualitative_evaluation"]["enabled"])
 
 
@@ -162,6 +165,7 @@ class ConfigTests(unittest.TestCase):
                 "loci_cldice_weight",
                 "iterations",
                 "iterations_csv",
+                "static_patch_iterations",
                 "smooth",
                 "cldice_smooth",
             },
@@ -201,7 +205,23 @@ class ConfigTests(unittest.TestCase):
                 "selection": "smallest_area",
                 "max_images": 3,
                 "soft_cldice_foreground_only": True,
-                "monitor": {"dice_weight": 0.7, "cldice_weight": 0.3},
+                "patch_cache": {"enabled": True},
+                "loss": {"patch_selection": "non_overlapping"},
+                "composite_metrics": {
+                    "dice_cldice_per_image": {
+                        "weights": {"dice_per_image": 0.7, "cldice_per_image": 0.3}
+                    },
+                    "dice_low_cldice_per_image": {
+                        "weights": {"dice_per_image": 0.9, "cldice_per_image": 0.1}
+                    },
+                    "inoculum_compensated_per_image": {
+                        "weights": {
+                            "dice_loci_per_image": 0.3,
+                            "dice_inoculum_per_image": 0.5,
+                            "cldice_per_image": 0.2,
+                        }
+                    },
+                },
             },
         )
 

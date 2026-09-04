@@ -50,9 +50,14 @@ def validate_completed_fold(
     run_dir: Path,
     fold: int,
     test_required: bool,
+    required_checkpoint_names: list[str] | tuple[str, ...] = (
+        "best_current.pt",
+        "best_val_loss.pt",
+    ),
 ) -> None:
     fold_dir = run_dir / f"fold_{fold}"
-    required = [fold_dir / "metrics.json", fold_dir / "best_current.pt", fold_dir / "best_val_loss.pt"]
+    required = [fold_dir / "metrics.json"]
+    required.extend(fold_dir / name for name in required_checkpoint_names)
     missing = [str(path) for path in required if not path.is_file()]
     if test_required:
         comparison = run_dir / "test-evaluation" / "checkpoint_comparison.csv"

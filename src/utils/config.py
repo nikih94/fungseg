@@ -87,9 +87,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "selection": "all",
             "max_images": None,
             "soft_cldice_foreground_only": True,
-            "monitor": {
-                "dice_weight": 0.7,
-                "cldice_weight": 0.3,
+            "patch_cache": {"enabled": False},
+            "loss": {"patch_selection": "non_overlapping"},
+            "composite_metrics": {
+                "dice_cldice_per_image": {
+                    "weights": {
+                        "dice_per_image": 0.7,
+                        "cldice_per_image": 0.3,
+                    },
+                },
             },
         },
     },
@@ -170,23 +176,43 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "optimizer": {"name": "adamw", "lr": 1e-4, "weight_decay": 1e-4},
     "scheduler": {
         "name": "reduce_on_plateau",
-        "mode": "min",
+        "mode": "max",
         "factor": 0.5,
         "patience": 7,
+        "threshold": 0.001,
+        "threshold_mode": "abs",
         "min_lr": 1.0e-6,
-        "monitor": "val_loss",
+        "monitor": "val_dice_cldice_per_image",
+    },
+    "checkpointing": {
+        "primary": "current",
+        "save_last": True,
+        "interval": {"enabled": True, "interval_epochs": 10},
+        "selections": {
+            "current": {
+                "enabled": True,
+                "filename": "best_current.pt",
+                "monitor": "val_dice_cldice_per_image",
+                "mode": "max",
+            },
+            "dice": {
+                "enabled": True,
+                "filename": "best_dice.pt",
+                "monitor": "val_dice_per_image",
+                "mode": "max",
+            },
+            "validation_loss": {
+                "enabled": False,
+                "filename": "best_val_loss.pt",
+                "monitor": "val_loss",
+                "mode": "min",
+            },
+        },
     },
     "train": {
         "epochs": 50,
         "mixed_precision": True,
         "grad_clip": None,
-        "monitor": "val_dice_cldice_per_image",
-        "monitor_mode": "max",
-        "best_interval_checkpoint": {
-            "enabled": True,
-            "interval_epochs": 10,
-        },
-        "save_last_checkpoint": True,
         "threshold": 0.5,
         "seed": 42,
         "device": "auto",
@@ -248,9 +274,14 @@ def _normalize_validation_config(
                 ),
                 "selection": legacy_selection.get("selection", "all"),
                 "max_images": legacy_selection.get("max_images"),
-                "monitor": {
-                    "dice_weight": legacy_monitor.get("dice_weight", 0.7),
-                    "cldice_weight": legacy_monitor.get("cldice_weight", 0.3),
+                "loss": {"patch_selection": "non_overlapping"},
+                "composite_metrics": {
+                    "dice_cldice_per_image": {
+                        "weights": {
+                            "dice_per_image": legacy_monitor.get("dice_weight", 0.7),
+                            "cldice_per_image": legacy_monitor.get("cldice_weight", 0.3),
+                        },
+                    },
                 },
             },
         }
@@ -285,15 +316,82 @@ def _normalize_validation_config(
         raise ValueError(
             "validation.full_image.max_images is required for smallest_area selection."
         )
-    monitor = full_image.get("monitor", {})
-    if not isinstance(monitor, dict):
-        raise ValueError("validation.full_image.monitor must be a mapping.")
-    dice_weight = float(monitor.get("dice_weight", 0.7))
-    cldice_weight = float(monitor.get("cldice_weight", 0.3))
-    if dice_weight < 0.0 or cldice_weight < 0.0 or dice_weight + cldice_weight <= 0.0:
+    patch_cache = full_image.get("patch_cache", {})
+    if not isinstance(patch_cache, dict):
         raise ValueError(
-            "validation.full_image.monitor weights must be non-negative and have a positive sum."
+            "validation.full_image.patch_cache must be a mapping."
         )
+    loss = full_image.get("loss", {})
+    if not isinstance(loss, dict):
+        raise ValueError("validation.full_image.loss must be a mapping.")
+    patch_selection = str(
+        loss.get("patch_selection", "non_overlapping")
+    ).strip().lower()
+    if patch_selection != "non_overlapping":
+        raise ValueError(
+            "validation.full_image.loss.patch_selection must be "
+            "'non_overlapping'."
+        )
+
+    loaded_full_image = (
+        loaded_validation.get("full_image", {})
+        if isinstance(loaded_validation, dict)
+        else {}
+    )
+    if not isinstance(loaded_full_image, dict):
+        loaded_full_image = {}
+    legacy_monitor = loaded_full_image.get("monitor")
+    if "composite_metrics" not in loaded_full_image and isinstance(legacy_monitor, dict):
+        full_image["composite_metrics"] = {
+            "dice_cldice_per_image": {
+                "weights": {
+                    "dice_per_image": legacy_monitor.get("dice_weight", 0.7),
+                    "cldice_per_image": legacy_monitor.get("cldice_weight", 0.3),
+                },
+            },
+        }
+    composites = full_image.get("composite_metrics", {})
+    if not isinstance(composites, dict) or not composites:
+        raise ValueError(
+            "validation.full_image.composite_metrics must be a non-empty mapping."
+        )
+    if str(config["segmentation"].get("mode", "binary")).lower() == "multiclass":
+        composites.setdefault(
+            "dice_low_cldice_per_image",
+            {"weights": {"dice_per_image": 0.9, "cldice_per_image": 0.1}},
+        )
+        composites.setdefault(
+            "inoculum_compensated_per_image",
+            {
+                "weights": {
+                    "dice_loci_per_image": 0.3,
+                    "dice_inoculum_per_image": 0.5,
+                    "cldice_per_image": 0.2,
+                },
+            },
+        )
+    normalized_composites: dict[str, dict[str, dict[str, float]]] = {}
+    for name, definition in composites.items():
+        if not isinstance(definition, dict):
+            raise ValueError(
+                f"validation.full_image.composite_metrics.{name} must be a mapping."
+            )
+        weights = definition.get("weights", {})
+        if not isinstance(weights, dict) or not weights:
+            raise ValueError(
+                f"validation.full_image.composite_metrics.{name}.weights must "
+                "be a non-empty mapping."
+            )
+        normalized_weights = {
+            str(metric): float(weight) for metric, weight in weights.items()
+        }
+        if any(weight < 0.0 for weight in normalized_weights.values()):
+            raise ValueError(f"Composite metric {name!r} has a negative weight.")
+        if abs(sum(normalized_weights.values()) - 1.0) > 1e-6:
+            raise ValueError(
+                f"Composite metric {name!r} weights must sum to 1.0."
+            )
+        normalized_composites[str(name)] = {"weights": normalized_weights}
     full_image["enabled"] = bool(full_image.get("enabled", True))
     full_image["batch_size"] = batch_size
     full_image["interval_epochs"] = interval_epochs
@@ -302,10 +400,12 @@ def _normalize_validation_config(
     full_image["soft_cldice_foreground_only"] = bool(
         full_image.get("soft_cldice_foreground_only", True)
     )
-    full_image["monitor"] = {
-        "dice_weight": dice_weight,
-        "cldice_weight": cldice_weight,
+    full_image["patch_cache"] = {
+        "enabled": bool(patch_cache.get("enabled", False))
     }
+    full_image["loss"] = {"patch_selection": patch_selection}
+    full_image["composite_metrics"] = normalized_composites
+    full_image.pop("monitor", None)
     validation.pop("fast", None)
     validation["full_image"] = full_image
 
@@ -314,6 +414,128 @@ def _normalize_validation_config(
         "per_image_validation_interval",
         "full_image_validation",
         "full_image_monitor",
+    ):
+        train.pop(legacy_key, None)
+
+
+
+def _normalize_checkpointing_config(
+    config: dict[str, Any], loaded: dict[str, Any]
+) -> None:
+    train = config["train"]
+    loaded_checkpointing = loaded.get("checkpointing")
+    if loaded_checkpointing is not None and not isinstance(loaded_checkpointing, dict):
+        raise ValueError("checkpointing must be a mapping.")
+
+    if loaded_checkpointing is None:
+        selections: dict[str, dict[str, Any]] = {
+            "current": {
+                "enabled": True,
+                "filename": "best_current.pt",
+                "monitor": train.get("monitor", "val_dice_cldice_per_image"),
+                "mode": train.get("monitor_mode", "max"),
+            },
+            "dice": {
+                "enabled": True,
+                "filename": "best_dice.pt",
+                "monitor": "val_dice_per_image",
+                "mode": "max",
+            },
+            "validation_loss": {
+                "enabled": True,
+                "filename": "best_val_loss.pt",
+                "monitor": "val_loss",
+                "mode": "min",
+            },
+        }
+        if str(config["segmentation"].get("mode", "binary")).lower() == "multiclass":
+            selections.update({
+                "low_cldice": {
+                    "enabled": True,
+                    "filename": "best_low_cldice.pt",
+                    "monitor": "val_dice_low_cldice_per_image",
+                    "mode": "max",
+                },
+                "inoculum_compensated": {
+                    "enabled": True,
+                    "filename": "best_inoculum_compensated.pt",
+                    "monitor": "val_inoculum_compensated_per_image",
+                    "mode": "max",
+                },
+            })
+        legacy_interval = train.get("best_interval_checkpoint", {})
+        if not isinstance(legacy_interval, dict):
+            raise ValueError("train.best_interval_checkpoint must be a mapping.")
+        checkpointing = {
+            "primary": "current",
+            "save_last": bool(train.get("save_last_checkpoint", True)),
+            "interval": {
+                "enabled": bool(legacy_interval.get("enabled", True)),
+                "interval_epochs": int(legacy_interval.get("interval_epochs", 10)),
+            },
+            "selections": selections,
+        }
+    else:
+        checkpointing = deepcopy(loaded_checkpointing)
+        checkpointing.setdefault("primary", "current")
+        checkpointing.setdefault("save_last", True)
+        checkpointing.setdefault(
+            "interval", {"enabled": True, "interval_epochs": 10}
+        )
+
+    interval = checkpointing.get("interval", {})
+    if not isinstance(interval, dict):
+        raise ValueError("checkpointing.interval must be a mapping.")
+    interval_epochs = int(interval.get("interval_epochs", 10))
+    if interval_epochs <= 0:
+        raise ValueError("checkpointing.interval.interval_epochs must be positive.")
+    checkpointing["interval"] = {
+        "enabled": bool(interval.get("enabled", True)),
+        "interval_epochs": interval_epochs,
+    }
+
+    selections = checkpointing.get("selections", {})
+    if not isinstance(selections, dict) or not selections:
+        raise ValueError("checkpointing.selections must be a non-empty mapping.")
+    normalized_selections: dict[str, dict[str, Any]] = {}
+    filenames: set[str] = set()
+    for name, definition in selections.items():
+        if not isinstance(definition, dict):
+            raise ValueError(f"checkpointing.selections.{name} must be a mapping.")
+        filename = str(definition.get("filename", "")).strip()
+        if not filename or Path(filename).name != filename or not filename.endswith(".pt"):
+            raise ValueError(
+                f"checkpointing.selections.{name}.filename must be a .pt basename."
+            )
+        if filename in filenames:
+            raise ValueError(f"Duplicate checkpoint filename: {filename}")
+        filenames.add(filename)
+        mode = str(definition.get("mode", "max")).strip().lower()
+        if mode not in {"min", "max"}:
+            raise ValueError(
+                f"checkpointing.selections.{name}.mode must be 'min' or 'max'."
+            )
+        monitor = str(definition.get("monitor", "")).strip()
+        if not monitor:
+            raise ValueError(f"checkpointing.selections.{name}.monitor is required.")
+        normalized_selections[str(name)] = {
+            "enabled": bool(definition.get("enabled", True)),
+            "filename": filename,
+            "monitor": monitor,
+            "mode": mode,
+        }
+    primary = str(checkpointing.get("primary", "current"))
+    if primary not in normalized_selections:
+        raise ValueError("checkpointing.primary must name a configured selection.")
+    if not normalized_selections[primary]["enabled"]:
+        raise ValueError("checkpointing.primary selection must be enabled.")
+    checkpointing["primary"] = primary
+    checkpointing["save_last"] = bool(checkpointing.get("save_last", True))
+    checkpointing["selections"] = normalized_selections
+    config["checkpointing"] = checkpointing
+
+    for legacy_key in (
+        "monitor", "monitor_mode", "best_interval_checkpoint", "save_last_checkpoint"
     ):
         train.pop(legacy_key, None)
 
@@ -449,10 +671,8 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         background_only_cfg.get("enabled", False)
     )
     background_only_cfg["percentage_of_foreground"] = background_percentage
-    config["train"]["save_last_checkpoint"] = bool(
-        config["train"].get("save_last_checkpoint", True)
-    )
     _normalize_validation_config(config, loaded)
+    _normalize_checkpointing_config(config, loaded)
     _normalize_join_masks_config(config)
     return config
 
@@ -578,15 +798,28 @@ def config_for_persistence(
             loss_keys_by_name[loss_name],
         )
 
-    cache_enabled = bool(
-        persisted.get("data", {}).get("train_patch_cache", {}).get("enabled", True)
+    training_cache_enabled = bool(
+        persisted.get("data", {}).get("train_patch_cache", {}).get(
+            "enabled", True
+        )
     )
-    if not cache_enabled or loss.get("iterations_csv"):
+    validation_cache_enabled = bool(
+        persisted.get("validation", {})
+        .get("full_image", {})
+        .get("patch_cache", {})
+        .get("enabled", False)
+    )
+    if (
+        not training_cache_enabled
+        and not validation_cache_enabled
+    ) or loss.get("iterations_csv"):
         loss.pop("static_patch_iterations", None)
 
     scheduler = persisted.get("scheduler", {})
     scheduler_name = str(scheduler.get("name", "")).lower()
-    known_scheduler_keys = {"mode", "factor", "patience", "min_lr", "monitor"}
+    known_scheduler_keys = {
+        "mode", "factor", "patience", "threshold", "threshold_mode", "min_lr", "monitor"
+    }
     if scheduler_name != "reduce_on_plateau":
         _retain_known_relevant_keys(scheduler, known_scheduler_keys, set())
 

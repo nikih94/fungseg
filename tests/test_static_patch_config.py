@@ -11,6 +11,9 @@ class StaticPatchConfigTests(unittest.TestCase):
     def test_active_config_enables_static_iterations(self) -> None:
         config = load_config("multiclass-config.yaml")
         self.assertTrue(config["data"]["train_patch_cache"]["enabled"])
+        self.assertTrue(
+            config["validation"]["full_image"]["patch_cache"]["enabled"]
+        )
         self.assertIsNone(config["loss"]["iterations_csv"])
         self.assertEqual(
             config["loss"]["static_patch_iterations"],
@@ -22,6 +25,19 @@ class StaticPatchConfigTests(unittest.TestCase):
         )
         self.assertIn(
             "static_patch_iterations", config_for_persistence(config)["loss"]
+        )
+
+    def test_validation_cache_is_legacy_off_when_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                "project:\n  name: legacy\n",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+        self.assertFalse(
+            config["validation"]["full_image"]["patch_cache"]["enabled"]
         )
 
     def test_scaled_context_and_static_cache_are_rejected(self) -> None:

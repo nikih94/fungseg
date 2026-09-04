@@ -13,6 +13,7 @@ from src.data.patch_cache import (
     CachedSegmentationPatchDataset,
     build_epoch_training_crop_records,
     build_static_patch_cache,
+    build_static_validation_patch_cache,
 )
 from src.patching import OriginalImageRecord
 
@@ -234,6 +235,76 @@ class StaticPatchCacheTests(unittest.TestCase):
             )
             cache.cleanup()
 
+    def test_validation_cache_uses_exact_grid_and_adaptive_iterations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            yy, xx = np.indices((6, 6))
+            image = np.stack(
+                [
+                    xx.astype(np.uint8),
+                    yy.astype(np.uint8),
+                    np.full((6, 6), 9, dtype=np.uint8),
+                ],
+                axis=-1,
+            )
+            mask = np.zeros((6, 6), dtype=np.uint8)
+            mask[2:4, 1:5] = 255
+            image_path = root / "image.png"
+            mask_path = root / "mask.png"
+            Image.fromarray(image).save(image_path)
+            Image.fromarray(mask).save(mask_path)
+            original = OriginalImageRecord(
+                "image.png", image_path, mask_path, 6, 6
+            )
+            config = patching_config()
+            config["stride"] = 2
+
+            cache = build_static_validation_patch_cache(
+                [original],
+                root,
+                config,
+                segmentation_mode="binary",
+                merge_join_masks=False,
+                compute_soft_cldice_iterations=True,
+                iteration_margin=4,
+                iteration_round_up_to=2,
+            )
+
+            self.assertEqual(
+                [(item.x, item.y) for item in cache.records],
+                [(0, 0), (2, 0), (0, 2), (2, 2)],
+            )
+            images, targets = cache.arrays()
+            self.assertEqual(targets.shape, (1, 4, 4))
+            for record in cache.records:
+                np.testing.assert_array_equal(
+                    images[record.cache_index],
+                    image[
+                        record.y : record.y + 4,
+                        record.x : record.x + 4,
+                    ],
+                )
+                if record.loss_target_index is None:
+                    self.assertIsNone(record.soft_cldice_iterations)
+                    continue
+                np.testing.assert_array_equal(
+                    targets[record.loss_target_index],
+                    (
+                        mask[
+                            record.y : record.y + 4,
+                            record.x : record.x + 4,
+                        ]
+                        > 127
+                    ).astype(np.uint8),
+                )
+                self.assertGreaterEqual(record.soft_cldice_iterations, 4)
+                self.assertEqual(record.soft_cldice_iterations % 2, 0)
+            np.testing.assert_array_equal(
+                cache.full_target("image.png"), (mask > 127).astype(np.uint8)
+            )
+            cache.cleanup()
+            self.assertFalse((root / ".validation_patch_cache").exists())
+
     def test_multiclass_masks_share_crop_and_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -303,6 +374,24 @@ class StaticPatchCacheTests(unittest.TestCase):
             self.assertEqual(int(first["mask"][2, 2]), 2)
             self.assertEqual(first["overlap_pixels"], 4)
             cache.cleanup()
+
+            validation_cache = build_static_validation_patch_cache(
+                [original],
+                root,
+                config,
+                segmentation_mode="multiclass",
+                merge_join_masks=True,
+                compute_soft_cldice_iterations=True,
+                iteration_margin=4,
+                iteration_round_up_to=2,
+            )
+            full_target = validation_cache.full_target("image.png")
+            self.assertEqual(int(full_target[0, 3]), 1)
+            self.assertEqual(int(full_target[2, 2]), 2)
+            np.testing.assert_array_equal(
+                validation_cache.full_join_mask("image.png"), join
+            )
+            validation_cache.cleanup()
 
 
 if __name__ == "__main__":

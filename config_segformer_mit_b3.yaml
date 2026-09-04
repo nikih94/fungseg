@@ -56,6 +56,24 @@ patching:
     scaled_context:
       enabled: false
 
+validation:
+  start_epoch: 1
+  full_image:
+    enabled: true
+    patch_cache:
+      enabled: true
+    batch_size: 1
+    interval_epochs: 1
+    selection: all
+    max_images: null
+    loss:
+      patch_selection: non_overlapping
+    composite_metrics:
+      dice_cldice_per_image:
+        weights:
+          dice_per_image: 0.7
+          cldice_per_image: 0.3
+
 augmentations:
   normalize: # do not touch this
     mean: [0.485, 0.456, 0.406]
@@ -127,29 +145,44 @@ optimizer:
 
 scheduler:
   name: reduce_on_plateau
-  mode: min
+  mode: max
   factor: 0.5
   patience: 7
+  threshold: 0.001
+  threshold_mode: abs
   min_lr:
     encoder: 1.0e-7
     decoder: 1.0e-6
-  monitor: val_loss
+  monitor: val_dice_cldice_per_image
+
+checkpointing:
+  primary: current
+  save_last: true
+  interval:
+    enabled: true
+    interval_epochs: 10
+  selections:
+    current:
+      enabled: true
+      filename: best_current.pt
+      monitor: val_dice_cldice_per_image
+      mode: max
+    dice:
+      enabled: true
+      filename: best_dice.pt
+      monitor: val_dice_per_image
+      mode: max
+    validation_loss:
+      enabled: false
+      filename: best_val_loss.pt
+      monitor: val_loss
+      mode: min
 
 train:
   epochs: 120
   mixed_precision: true
   grad_clip: 1.0
-  monitor: val_dice_cldice_per_image
-  monitor_mode: max
-  full_image_monitor:
-    dice_weight: 0.7
-    cldice_weight: 0.3
-  best_interval_checkpoint:
-    enabled: true
-    interval_epochs: 10
   threshold: 0.5
-  enable_per_image_validation: true
-  per_image_validation_interval: 1
   seed: 42
   device: auto
   use_tqdm: true

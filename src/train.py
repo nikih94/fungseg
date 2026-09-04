@@ -4,6 +4,7 @@ import argparse
 import atexit
 import json
 import statistics
+import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from src.data.patch_cache import (
     CachedSegmentationPatchDataset,
     build_epoch_training_crop_records,
     build_static_patch_cache,
+    build_static_validation_patch_cache,
 )
 from src.data.discovery import discover_image_mask_pairs, discover_image_mask_sets
 from src.data.fives import FivesPatchDataset, load_fives_training_records
@@ -700,6 +702,12 @@ def main() -> None:
     fold_test_results: list[dict] = []
     checkpoint_test_results: list[dict] = []
     checkpoint_comparison_summary: list[dict] = []
+    configured_checkpoint_specs = best_checkpoint_specs(config["checkpointing"])
+    primary_checkpoint_name = str(
+        config["checkpointing"]["selections"][
+            config["checkpointing"]["primary"]
+        ]["filename"]
+    )
     cross_fold_test_summary: dict | None = None
     all_epoch_rows: list[dict[str, float]] = []
     data_cfg = config["data"]
@@ -721,7 +729,12 @@ def main() -> None:
         completed_folds = contiguous_completed_folds(existing_fold_rows, total_folds)
         test_required = bool(config.get("test_evaluation", {}).get("enabled", True))
         for completed_fold in completed_folds:
-            validate_completed_fold(run_dir, completed_fold, test_required)
+            validate_completed_fold(
+                run_dir,
+                completed_fold,
+                test_required,
+                [filename for filename, _, _, _ in configured_checkpoint_specs],
+            )
         first_incomplete = len(completed_folds)
         removed = clean_incomplete_folds(run_dir, first_incomplete, total_folds)
         # Preserve only completed-fold rows in run-level incremental artifacts.
@@ -777,7 +790,7 @@ def main() -> None:
                     row[key] = float(value)
             checkpoint_test_results.append(row)
         for row in checkpoint_test_results:
-            if row.get("checkpoint_name") != "best_current.pt":
+            if row.get("checkpoint_name") != primary_checkpoint_name:
                 continue
             converted = {
                 key: value for key, value in row.items()
@@ -865,6 +878,61 @@ def main() -> None:
         full_image_val_originals = select_full_image_validation_records(
             val_originals, validation_cfg
         )
+        validation_patch_cache_cfg = validation_cfg["full_image"].get(
+            "patch_cache", {}
+        )
+        validation_patch_cache_enabled = (
+            full_image_enabled
+            and bool(validation_patch_cache_cfg.get("enabled", False))
+        )
+        compute_validation_static_iterations = (
+            validation_patch_cache_enabled
+            and soft_cldice_iterations is None
+            and str(config["loss"]["name"]).lower() in SOFT_CLDICE_LOSS_NAMES
+            and bool(static_iteration_cfg.get("enabled", True))
+        )
+        validation_patch_cache = None
+        validation_iteration_values: list[int] = []
+        if validation_patch_cache_enabled:
+            cache_started = time.perf_counter()
+            validation_patch_cache = build_static_validation_patch_cache(
+                full_image_val_originals,
+                fold_dir,
+                full_image_validation_patching_cfg,
+                segmentation_mode=segmentation_mode,
+                merge_join_masks=merge_join_masks,
+                compute_soft_cldice_iterations=(
+                    compute_validation_static_iterations
+                ),
+                iteration_margin=int(
+                    static_iteration_cfg.get("margin_iterations", 10)
+                ),
+                iteration_round_up_to=int(
+                    static_iteration_cfg.get("round_up_to", 10)
+                ),
+            )
+            atexit.register(validation_patch_cache.cleanup)
+            validation_iteration_values = [
+                record.soft_cldice_iterations
+                for record in validation_patch_cache.records
+                if record.soft_cldice_iterations is not None
+            ]
+            logger.info(
+                "Static validation cache ready | fold=%s | patches=%s | "
+                "patch_size=%sx%s | sources=%s | build_seconds=%.3f | "
+                "soft_cldice_iterations=%s",
+                fold_index,
+                len(validation_patch_cache.records),
+                int(full_image_validation_patching_cfg["patch_size"]),
+                int(full_image_validation_patching_cfg["patch_size"]),
+                len(validation_patch_cache.sources),
+                time.perf_counter() - cache_started,
+                (
+                    f"{min(validation_iteration_values)}-"
+                    f"{max(validation_iteration_values)}"
+                    if validation_iteration_values else "fixed-or-csv"
+                ),
+            )
 
         if static_cache is not None:
             train_patch_records = build_epoch_training_crop_records(
@@ -986,6 +1054,24 @@ def main() -> None:
                 "interval_epochs": validation_cfg["full_image"]["interval_epochs"],
                 "selection": validation_cfg["full_image"]["selection"],
                 "max_images": validation_cfg["full_image"]["max_images"],
+                "patch_cache": {
+                    "enabled": validation_patch_cache is not None,
+                    "patches": (
+                        len(validation_patch_cache.records)
+                        if validation_patch_cache is not None else 0
+                    ),
+                    "automatic_soft_cldice_iterations": (
+                        compute_validation_static_iterations
+                    ),
+                    "minimum_soft_cldice_iterations": (
+                        min(validation_iteration_values)
+                        if validation_iteration_values else None
+                    ),
+                    "maximum_soft_cldice_iterations": (
+                        max(validation_iteration_values)
+                        if validation_iteration_values else None
+                    ),
+                },
                 "sources": [
                     {
                         "source_id": record.source_id,
@@ -1065,7 +1151,11 @@ def main() -> None:
             device=device,
             train_config={
                 **config["train"],
-                "scheduler_monitor": config["scheduler"].get("monitor", config["train"]["monitor"]),
+                "scheduler_monitor": config["scheduler"].get(
+                    "monitor", config["checkpointing"]["selections"][
+                        config["checkpointing"]["primary"]
+                    ]["monitor"]
+                ),
             },
             loss_config=config["loss"],
             logger=logger,
@@ -1078,9 +1168,11 @@ def main() -> None:
             segmentation_config=config.get("segmentation", {}),
             join_masks_config=join_masks_cfg,
             validation_config=validation_cfg,
+            checkpointing_config=config["checkpointing"],
             target_weight_builder=target_weight_builder,
             soft_cldice_iterations=soft_cldice_iterations,
             default_soft_cldice_iterations=int(config["loss"]["iterations"]),
+            validation_patch_cache=validation_patch_cache,
             epoch_metrics_callback=persist_run_epoch_metrics,
         )
         fold_result = trainer.fit(
@@ -1088,6 +1180,8 @@ def main() -> None:
             epochs=int(config["train"]["epochs"]),
             train_loader_factory=make_train_loader_for_epoch,
         )
+        if validation_patch_cache is not None:
+            atexit.unregister(validation_patch_cache.cleanup)
         writer.close()
         if test_originals and bool(config.get("test_evaluation", {}).get("enabled", True)):
             from src.inference.test_evaluation import run_test_evaluation
@@ -1099,7 +1193,7 @@ def main() -> None:
                 else evaluation_root
             )
             selections: list[dict] = []
-            for checkpoint_name, monitor, mode, _ in best_checkpoint_specs(segmentation_mode):
+            for checkpoint_name, monitor, mode, _ in configured_checkpoint_specs:
                 checkpoint_path = fold_dir / checkpoint_name
                 if not checkpoint_path.is_file():
                     raise RuntimeError(f"Expected validation checkpoint was not saved: {checkpoint_path}")
@@ -1134,7 +1228,7 @@ def main() -> None:
                         **test_result,
                     }
                     checkpoint_test_results.append(comparison_result)
-                    if selection["checkpoint_name"] == "best_current.pt":
+                    if selection["checkpoint_name"] == primary_checkpoint_name:
                         fold_result.update({
                             "test_dice_per_image": test_result["mean_dice"],
                             "test_iou_per_image": test_result["mean_iou"],

@@ -64,9 +64,27 @@ patching:
 validation:
   full_image:
     enabled: true
+    patch_cache:
+      enabled: true
     interval_epochs: 1
     selection: smallest_area
     max_images: 3
+    loss:
+      patch_selection: non_overlapping
+    composite_metrics:
+      dice_cldice_per_image:
+        weights:
+          dice_per_image: 0.7
+          cldice_per_image: 0.3
+      dice_low_cldice_per_image:
+        weights:
+          dice_per_image: 0.9
+          cldice_per_image: 0.1
+      inoculum_compensated_per_image:
+        weights:
+          dice_loci_per_image: 0.3
+          dice_inoculum_per_image: 0.5
+          cldice_per_image: 0.2
 
 
 augmentations:
@@ -146,25 +164,55 @@ optimizer:
 
 scheduler:
   name: reduce_on_plateau
-  mode: min
+  mode: max
   factor: 0.5
   patience: 7
+  threshold: 0.001
+  threshold_mode: abs
   min_lr:
     encoder: 1.0e-7
     decoder: 1.0e-6
-  monitor: val_loss
+  monitor: val_dice_cldice_per_image
 
 
+
+checkpointing:
+  primary: current
+  save_last: true
+  interval:
+    enabled: true
+    interval_epochs: 10
+  selections:
+    current:
+      enabled: true
+      filename: best_current.pt
+      monitor: val_dice_cldice_per_image
+      mode: max
+    dice:
+      enabled: true
+      filename: best_dice.pt
+      monitor: val_dice_per_image
+      mode: max
+    low_cldice:
+      enabled: true
+      filename: best_low_cldice.pt
+      monitor: val_dice_low_cldice_per_image
+      mode: max
+    inoculum_compensated:
+      enabled: true
+      filename: best_inoculum_compensated.pt
+      monitor: val_inoculum_compensated_per_image
+      mode: max
+    validation_loss:
+      enabled: false
+      filename: best_val_loss.pt
+      monitor: val_loss
+      mode: min
 
 train:
   epochs: 60
   mixed_precision: true
   grad_clip: 1.0
-  monitor: val_dice_cldice_per_image
-  monitor_mode: max
-  best_interval_checkpoint:
-    enabled: true
-    interval_epochs: 10
   threshold: 0.5
   seed: 42
   device: auto

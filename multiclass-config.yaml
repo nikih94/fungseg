@@ -26,18 +26,18 @@ join_masks:
 data:
   image_extensions: [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
   use_fives: false
-  num_workers: 8
+  num_workers: 16
   persistent_workers: false
-  prefetch_factor:  6
+  prefetch_factor:  4
   pin_memory: true
-  batch_size:  4
+  batch_size:  16
   image_size: null
   train_patch_cache:
     enabled: true
 
 patching:
-  patch_size: 512 #1024 #512
-  overlap:  256 #512 #256
+  patch_size: 512 # 1024 #512
+  overlap: 256 #512 #256
   stride:  384 #768 #384 #256
   filter_empty_patches: true
   mask_threshold: 127
@@ -71,13 +71,28 @@ validation:
   start_epoch: 1
   full_image:
     enabled: true
-    batch_size: 8
+    patch_cache:
+      enabled: true
+    batch_size: 16
     interval_epochs: 1
     selection: all
     max_images: null
-    monitor:
-      dice_weight: 0.7
-      cldice_weight: 0.3
+    loss:
+      patch_selection: non_overlapping
+    composite_metrics:
+      dice_cldice_per_image:
+        weights:
+          dice_per_image: 0.7
+          cldice_per_image: 0.3
+      dice_low_cldice_per_image:
+        weights:
+          dice_per_image: 0.9
+          cldice_per_image: 0.1
+      inoculum_compensated_per_image:
+        weights:
+          dice_loci_per_image: 0.3
+          dice_inoculum_per_image: 0.5
+          cldice_per_image: 0.2
     soft_cldice_foreground_only: true
 
 
@@ -120,7 +135,7 @@ cv:
   random_state: 42
 
 split:
-  mode: csv_kfold # csv, csv_kfold, train_val, or kfold
+  mode: csv #, csv_kfold, train_val, or kfold
   csv_path: data/image_splits.csv
   val_source_ids: []
 
@@ -156,26 +171,55 @@ optimizer:
 
 scheduler:
   name: reduce_on_plateau
-  mode: min
+  mode: max
   factor: 0.5
   patience: 7
+  threshold: 0.001
+  threshold_mode: abs
   min_lr:
     encoder: 1.0e-7
     decoder: 1.0e-6
-  monitor: val_loss
-
-
-
-train:
-  epochs: 50
-  mixed_precision: true
-  grad_clip: 1.0
   monitor: val_dice_cldice_per_image
-  monitor_mode: max
-  best_interval_checkpoint:
+
+
+
+checkpointing:
+  primary: current
+  save_last: false
+  interval:
     enabled: false
     interval_epochs: 10
-  save_last_checkpoint: false
+  selections:
+    current:
+      enabled: true
+      filename: best_current.pt
+      monitor: val_dice_cldice_per_image
+      mode: max
+    dice:
+      enabled: true
+      filename: best_dice.pt
+      monitor: val_dice_per_image
+      mode: max
+    low_cldice:
+      enabled: true
+      filename: best_low_cldice.pt
+      monitor: val_dice_low_cldice_per_image
+      mode: max
+    inoculum_compensated:
+      enabled: true
+      filename: best_inoculum_compensated.pt
+      monitor: val_inoculum_compensated_per_image
+      mode: max
+    validation_loss:
+      enabled: false
+      filename: best_val_loss.pt
+      monitor: val_loss
+      mode: min
+
+train:
+  epochs: 80
+  mixed_precision: true
+  grad_clip: 1.0
   threshold: 0.5
   seed: 42
   device: auto
